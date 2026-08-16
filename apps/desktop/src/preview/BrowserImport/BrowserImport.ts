@@ -73,11 +73,6 @@ const unavailableReason = Effect.fn("BrowserImport.unavailableReason")(function*
   context: BrowserImportPathContext,
 ): Effect.fn.Return<BrowserImportUnavailableReason | undefined, never, FileSystem.FileSystem> {
   if (!definition.platforms.includes(context.platform)) return "unsupportedPlatform";
-  // Chromium's key lives in an OS credential store, and only the macOS one is
-  // implemented; Firefox needs no key at all, so it works everywhere.
-  if (definition.engine === "chromium" && context.platform !== "darwin") {
-    return "unsupportedPlatform";
-  }
   if (!(yield* isSourceInstalled(definition, context))) return "notInstalled";
   if (yield* isSourceRunning(definition, context)) return "browserRunning";
   return undefined;
@@ -187,10 +182,8 @@ export const make = Effect.gen(function* BrowserImportMake() {
           )
         : readChromiumCookies({
             cookieDatabasePath: databasePath,
-            // Only reached on macOS: `unavailableReason` rejects Chromium
-            // elsewhere until those key stores are implemented.
-            keychainService: definition.keychainService ?? "",
-            keychainAccount: definition.keychainAccount ?? "",
+            keychainService: definition.keychainService,
+            keychainAccount: definition.keychainAccount,
             platform,
           });
 
