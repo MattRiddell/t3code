@@ -284,32 +284,29 @@ const decodeCookieCount = Schema.decodeUnknownEffect(Schema.Array(CookieCountRow
  */
 const countProfileCookies = Effect.fnUntraced(function* (
   definition: BrowserImportSourceDefinition,
-  paths: SourcePaths,
+  context: BrowserImportPathContext,
   directory: string,
 ): Effect.fn.Return<number | undefined, never> {
+  const databasePath = cookieDatabasePath(definition, context, directory);
+  if (databasePath === undefined) return undefined;
   return yield* Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const rows = yield* sql`select count(*) as count from cookies`;
     const [row] = yield* decodeCookieCount(rows);
     return row?.count;
   }).pipe(
-    Effect.provide(
-      NodeSqliteClient.layer({
-        filename: cookieDatabasePath(definition, paths, directory),
-        readonly: true,
-      }),
-    ),
+    Effect.provide(NodeSqliteClient.layer({ filename: databasePath, readonly: true })),
     Effect.orElseSucceed(() => undefined),
   );
 });
 
 const withCookieCounts = (
   definition: BrowserImportSourceDefinition,
-  paths: SourcePaths,
+  context: BrowserImportPathContext,
   profiles: ReadonlyArray<BrowserImportSourceProfile>,
 ) =>
   Effect.forEach(profiles, (profile) =>
-    countProfileCookies(definition, paths, profile.directory).pipe(
+    countProfileCookies(definition, context, profile.directory).pipe(
       Effect.map((cookieCount) =>
         cookieCount === undefined ? profile : { ...profile, cookieCount },
       ),
@@ -364,7 +361,7 @@ export const listSourceProfiles = Effect.fn("BrowserImportSources.listSourceProf
     ),
     Effect.orElseSucceed(() => [] as ReadonlyArray<BrowserImportSourceProfile>),
   );
-  if (declared.length > 0) return yield* withCookieCounts(definition, paths, declared);
+  if (declared.length > 0) return yield* withCookieCounts(definition, context, declared);
 
   // `Local State` is missing, unreadable or malformed. Scanning for directories
   // that hold a cookie database finds the profiles anyway.
@@ -378,7 +375,7 @@ export const listSourceProfiles = Effect.fn("BrowserImportSources.listSourceProf
   );
   return yield* withCookieCounts(
     definition,
-    paths,
+    context,
     found.filter((profile) => profile !== undefined),
   );
 });
