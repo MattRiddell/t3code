@@ -51,6 +51,25 @@ probes, respect the `enableProviderUpdateChecks` setting, and never fail a provi
 Codex and Claude drivers apply the classification to every snapshot with `applyModelManifest`;
 driver kinds absent from the manifest have no legacy concept.
 
+## Attachment access
+
+The server stores uploaded attachments in its attachment directory, outside the project workspace.
+`ProviderService` adds the absolute path of each attachment to the turn text, then passes every
+attachment to the provider adapter. Each adapter decides what its provider ingests natively:
+
+- Codex, Claude, Cursor, and Grok send images as native image inputs and skip generic files. For
+  these providers, generic files reach the agent only as file paths in the turn text.
+- OpenCode sends every attachment, images and generic files alike, as a native file part with its
+  real mime type.
+
+Claude receives the attachment directory as an allowed additional directory. Codex keeps its
+configured sandbox policy, so access depends on that policy and the selected runtime mode. OpenCode
+allows all paths in full-access mode and requests approval for directories outside the workspace in
+restricted modes. Cursor and Grok use their own provider permission rules.
+
+The server does not copy attachments into a project or bypass provider approval rules. If an agent
+cannot read an attachment, the user must approve the access or select a runtime mode that permits it.
+
 ## How provider work is requested
 
 Clients never call a provider directly. They dispatch orchestration commands over the RPC method
