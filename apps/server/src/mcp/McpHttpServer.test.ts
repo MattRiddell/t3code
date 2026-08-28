@@ -163,6 +163,7 @@ it.effect("registers annotated tools and preserves authenticated request context
       const events = yield* broker.connect({
         clientId: "mcp-test-client",
         environmentId,
+        capabilities: ["click-visible-only-v1"],
       });
       yield* Stream.runForEach(events, (event) => {
         if (event.type === "connected") return Effect.void;
@@ -173,34 +174,36 @@ it.effect("registers annotated tools and preserves authenticated request context
           requestId: event.request.requestId,
           ok: true,
           result:
-            event.request.operation === "snapshot"
-              ? {
-                  url: "http://example.test/",
-                  title: "Example",
-                  loading: false,
-                  visibleText: "Example",
-                  interactiveElements: [],
-                  accessibilityTree: {},
-                  consoleEntries: [],
-                  networkEntries: [],
-                  actionTimeline: [],
-                  screenshot: {
-                    mimeType: "image/png",
-                    data: Buffer.from("png").toString("base64"),
-                    width: 10,
-                    height: 5,
-                  },
-                }
-              : event.request.operation === "press"
-                ? undefined
-                : {
-                    available: true,
-                    visible: true,
-                    tabId,
+            event.request.operation === "click"
+              ? { _tag: "PreviewAutomationClickDispatched" }
+              : event.request.operation === "snapshot"
+                ? {
                     url: "http://example.test/",
                     title: "Example",
                     loading: false,
-                  },
+                    visibleText: "Example",
+                    interactiveElements: [],
+                    accessibilityTree: {},
+                    consoleEntries: [],
+                    networkEntries: [],
+                    actionTimeline: [],
+                    screenshot: {
+                      mimeType: "image/png",
+                      data: Buffer.from("png").toString("base64"),
+                      width: 10,
+                      height: 5,
+                    },
+                  }
+                : event.request.operation === "press"
+                  ? undefined
+                  : {
+                      available: true,
+                      visible: true,
+                      tabId,
+                      url: "http://example.test/",
+                      title: "Example",
+                      loading: false,
+                    },
         });
       }).pipe(Effect.forkScoped);
       yield* Effect.yieldNow;
