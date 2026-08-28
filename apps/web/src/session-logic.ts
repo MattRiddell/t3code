@@ -37,6 +37,7 @@ export const PROVIDER_OPTIONS: Array<{
 }> = [
   { value: ProviderDriverKind.make("codex"), label: "Codex", available: true },
   { value: ProviderDriverKind.make("claudeAgent"), label: "Claude", available: true },
+  { value: ProviderDriverKind.make("openrouter"), label: "OpenRouter", available: true },
   {
     value: ProviderDriverKind.make("opencode"),
     label: "OpenCode",
