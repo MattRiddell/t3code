@@ -18,9 +18,14 @@ export const verifyPreloadBundle = (source) => {
     throw new Error(`Desktop preload bundle is missing: ${missingSymbols.join(", ")}`);
   }
 
-  const runtimeImportPattern = /\brequire\(\s*(["'])([^"']+)\1\s*\)/g;
+  const triviaPattern = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`;
+  const runtimeImportPattern = new RegExp(
+    String.raw`\brequire${triviaPattern}\(${triviaPattern}(["'])([^"']+)\1${triviaPattern}\)`,
+    "g",
+  );
   const runtimeImports = [...source.matchAll(runtimeImportPattern)].map((match) => match[2]);
-  const runtimeRequireCount = [...source.matchAll(/\brequire\s*\(/g)].length;
+  const runtimeRequirePattern = new RegExp(String.raw`\brequire${triviaPattern}\(`, "g");
+  const runtimeRequireCount = [...source.matchAll(runtimeRequirePattern)].length;
 
   if (runtimeImports.length !== runtimeRequireCount) {
     throw new Error("Desktop preload bundle contains a dynamic require() call");

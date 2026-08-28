@@ -22,4 +22,11 @@ describe("desktop preload bundle verifier", () => {
       verifyPreloadBundle(`${validPreload}\nconst message = 'import /* comment */("module")';`),
     );
   });
+
+  it("rejects unsupported require calls with comments before the opening parenthesis", () => {
+    assert.throws(
+      () => verifyPreloadBundle(`${validPreload}\nrequire /* @__PURE__ */ ("node:fs");`),
+      /unsupported sandbox imports: node:fs/,
+    );
+  });
 });
