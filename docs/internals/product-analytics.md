@@ -1,8 +1,10 @@
 # Product analytics
 
 T3 Code sends anonymous product events from the server to PostHog. The server
-keeps the installation-scoped distinct ID, telemetry opt-out, event buffer, and
-batch delivery. Clients do not load the PostHog browser SDK.
+uses the first available hashed Codex account ID, hashed Claude user ID, or
+installation-scoped anonymous ID as the distinct ID. It also keeps the
+telemetry opt-out, event buffer, and batch delivery. Clients do not load the
+PostHog browser SDK.
 
 ## Client events
 
