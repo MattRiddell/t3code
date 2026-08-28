@@ -254,6 +254,37 @@ describe("browserSurfaceStore", () => {
     miniPlayerClickPresentation?.release();
   });
 
+  it("pins disjoint held surfaces when a later update would make them overlap", () => {
+    const firstTabId = "first-moving-browser-surface";
+    const secondTabId = "second-moving-browser-surface";
+    const firstRect = { x: 24, y: 80, width: 960, height: 720 };
+    const secondRect = { x: 1_100, y: 620, width: 360, height: 203 };
+    const overlappingRect = { x: 800, y: 620, width: 360, height: 203 };
+    const firstSurface = acquireBrowserSurface(firstTabId);
+    const secondSurface = acquireBrowserSurface(secondTabId);
+    firstSurface.present(firstRect, true);
+    secondSurface.present(secondRect, true);
+    const firstClickPresentation = acquireBrowserSurfaceClickPresentation(firstTabId);
+    const secondClickPresentation = acquireBrowserSurfaceClickPresentation(secondTabId);
+
+    secondSurface.present(overlappingRect, true);
+
+    expect(useBrowserSurfaceStore.getState().byTabId[firstTabId]?.rect).toEqual(firstRect);
+    expect(useBrowserSurfaceStore.getState().byTabId[secondTabId]).toMatchObject({
+      rect: secondRect,
+      automationClickPendingRect: overlappingRect,
+    });
+
+    firstClickPresentation?.release();
+    secondClickPresentation?.release();
+    expect(useBrowserSurfaceStore.getState().byTabId[secondTabId]).toMatchObject({
+      rect: overlappingRect,
+    });
+    expect(
+      useBrowserSurfaceStore.getState().byTabId[secondTabId]?.automationClickPendingRect,
+    ).toBeUndefined();
+  });
+
   it("clears fitted presentation state when its lease is released", () => {
     const tabId = "released-fitted-browser-surface";
     const fittedLease = acquireBrowserSurface(tabId, true);

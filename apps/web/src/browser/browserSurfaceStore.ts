@@ -12,6 +12,8 @@ export interface BrowserSurfacePresentation {
   readonly visible: boolean;
   /** Keeps a visible surface presented until a native automation click settles. */
   readonly automationClickHolds?: number;
+  /** Latest owner rect received while a click hold pins the presented rect. */
+  readonly automationClickPendingRect?: BrowserSurfaceRect;
   readonly content: BrowserSurfaceContentPresentation | null;
   readonly fittedSourceContent: BrowserSurfaceContentPresentation | null;
   readonly fitSourceContent: boolean;
@@ -74,6 +76,12 @@ const rectsOverlap = (left: BrowserSurfaceRect, right: BrowserSurfaceRect): bool
   left.y < right.y + right.height &&
   left.y + left.height > right.y;
 
+const optionalRectsEqual = (
+  left: BrowserSurfaceRect | undefined,
+  right: BrowserSurfaceRect | undefined,
+): boolean =>
+  left === undefined ? right === undefined : right !== undefined && rectEquals(left, right);
+
 export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) => ({
   byTabId: {},
   claim: (tabId, owner, fitSourceContent) =>
@@ -89,6 +97,9 @@ export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) =
             ...(current?.automationClickHolds
               ? { automationClickHolds: current.automationClickHolds }
               : {}),
+            ...(current?.automationClickPendingRect
+              ? { automationClickPendingRect: current.automationClickPendingRect }
+              : {}),
             content: current?.content ?? null,
             fittedSourceContent: fitSourceContent ? (current?.content ?? null) : null,
             fitSourceContent,
@@ -103,18 +114,30 @@ export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) =
     set((state) => {
       const current = state.byTabId[tabId];
       if (current?.owner !== owner) return state;
+      const hasClickHold = Boolean(current.automationClickHolds);
+      const presentedRect = hasClickHold ? (current.rect ?? rect) : rect;
+      const pendingRect = hasClickHold && !rectEquals(current.rect, rect) ? rect : undefined;
       if (
         current &&
         current.visible === visible &&
         current.cornerRadius === cornerRadius &&
-        rectEquals(current.rect, rect)
+        rectEquals(current.rect, presentedRect) &&
+        optionalRectsEqual(current.automationClickPendingRect, pendingRect)
       ) {
         return state;
       }
+      const { automationClickPendingRect: _pendingRect, ...withoutPendingRect } = current;
       return {
         byTabId: {
           ...state.byTabId,
-          [tabId]: { ...current, rect, visible, cornerRadius, updatedAt: Date.now() },
+          [tabId]: {
+            ...withoutPendingRect,
+            ...(pendingRect ? { automationClickPendingRect: pendingRect } : {}),
+            rect: presentedRect,
+            visible,
+            cornerRadius,
+            updatedAt: Date.now(),
+          },
         },
       };
     }),
@@ -252,12 +275,21 @@ export function acquireBrowserSurfaceClickPresentation(
         const current = state.byTabId[tabId];
         if (!current || (current.automationClickHolds ?? 0) === 0) return state;
         const nextHolds = Math.max(0, (current.automationClickHolds ?? 0) - 1);
-        const { automationClickHolds: _automationClickHolds, ...withoutClickHolds } = current;
+        const {
+          automationClickHolds: _automationClickHolds,
+          automationClickPendingRect,
+          ...withoutClickHolds
+        } = current;
         return {
           byTabId: {
             ...state.byTabId,
             [tabId]:
-              nextHolds === 0 ? withoutClickHolds : { ...current, automationClickHolds: nextHolds },
+              nextHolds === 0
+                ? {
+                    ...withoutClickHolds,
+                    ...(automationClickPendingRect ? { rect: automationClickPendingRect } : {}),
+                  }
+                : { ...current, automationClickHolds: nextHolds },
           },
         };
       });
