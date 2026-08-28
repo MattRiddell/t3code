@@ -45,7 +45,11 @@ const makeRuntime = Effect.gen(function* () {
             Effect.ignore,
           ),
         );
-        return { url: `http://127.0.0.1:${index}`, exitCode: Effect.never };
+        return {
+          url: `http://127.0.0.1:${index}`,
+          isRunning: Effect.succeed(true),
+          exitCode: Effect.never,
+        };
       }),
     connectToOpenCodeServer: unusedRuntimeMethod,
     runOpenCodeCommand: unusedRuntimeMethod,
@@ -115,7 +119,11 @@ it.effect("invalidates an exited process so the next borrower starts a new one",
           yield* Effect.addFinalizer(() =>
             Deferred.succeed(processClosed, undefined).pipe(Effect.ignore),
           );
-          return { url: `http://127.0.0.1:${index}`, exitCode: Deferred.await(exitCode) };
+          return {
+            url: `http://127.0.0.1:${index}`,
+            isRunning: Effect.succeed(true),
+            exitCode: Deferred.await(exitCode),
+          };
         }),
       connectToOpenCodeServer: unusedRuntimeMethod,
       runOpenCodeCommand: unusedRuntimeMethod,
@@ -141,6 +149,49 @@ it.effect("invalidates an exited process so the next borrower starts a new one",
   }),
 );
 
+it.effect("replaces a dead cached process before its exit watcher runs", () =>
+  Effect.gen(function* () {
+    const starts = yield* Ref.make(0);
+    const closes = yield* Ref.make(0);
+    const processRunning: Array<Ref.Ref<boolean>> = [];
+    const runtime: OpenCodeRuntimeShape = {
+      startOpenCodeServerProcess: () =>
+        Effect.gen(function* () {
+          const index = yield* Ref.updateAndGet(starts, (count) => count + 1);
+          const isRunning = yield* Ref.make(true);
+          processRunning.push(isRunning);
+          yield* Effect.addFinalizer(() => Ref.update(closes, (count) => count + 1));
+          return {
+            url: `http://127.0.0.1:${index}`,
+            isRunning: Ref.get(isRunning),
+            exitCode: Effect.never,
+          };
+        }),
+      connectToOpenCodeServer: unusedRuntimeMethod,
+      runOpenCodeCommand: unusedRuntimeMethod,
+      createOpenCodeSdkClient: () => ({}) as never,
+      loadOpenCodeInventory: unusedRuntimeMethod,
+      loadInventoryFromCli: unusedRuntimeMethod,
+    };
+
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const owner = yield* OpenCodeServerOwner.make({ binaryPath: "opencode" });
+        expect(yield* owner.withServer((server) => Effect.succeed(server.url))).toBe(
+          "http://127.0.0.1:1",
+        );
+        yield* Ref.set(processRunning[0]!, false);
+
+        expect(yield* owner.withServer((server) => Effect.succeed(server.url))).toBe(
+          "http://127.0.0.1:2",
+        );
+        expect(yield* Ref.get(starts)).toBe(2);
+        expect(yield* Ref.get(closes)).toBe(1);
+      }),
+    ).pipe(Effect.provideService(OpenCodeRuntime, runtime));
+  }),
+);
+
 it.effect("cleans up an interrupted startup and allows a retry", () =>
   Effect.gen(function* () {
     const starts = yield* Ref.make(0);
@@ -159,7 +210,11 @@ it.effect("cleans up an interrupted startup and allows a retry", () =>
             yield* Deferred.succeed(firstStartEntered, undefined);
             return yield* Effect.never;
           }
-          return { url: `http://127.0.0.1:${index}`, exitCode: Effect.never };
+          return {
+            url: `http://127.0.0.1:${index}`,
+            isRunning: Effect.succeed(true),
+            exitCode: Effect.never,
+          };
         }),
       connectToOpenCodeServer: unusedRuntimeMethod,
       runOpenCodeCommand: unusedRuntimeMethod,

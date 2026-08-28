@@ -84,8 +84,11 @@ export const make = Effect.fn("OpenCodeServerOwner.make")(function* (input: {
     Effect.gen(function* () {
       yield* cancelIdleClose();
       if (state.server !== null) {
-        state.borrowers += 1;
-        return state.server;
+        if (yield* state.server.isRunning) {
+          state.borrowers += 1;
+          return state.server;
+        }
+        yield* closeServer(state.server);
       }
 
       return yield* Effect.uninterruptibleMask((restore) =>

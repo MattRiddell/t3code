@@ -73,6 +73,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
       );
       return {
         url: "http://127.0.0.1:4301",
+        isRunning: Effect.succeed(true),
         exitCode: Effect.never,
       };
     }),

@@ -54,6 +54,7 @@ const DEFAULT_HOSTNAME = "127.0.0.1";
 const OPENCODE_SKILL_DISCOVERY_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 export interface OpenCodeServerProcess {
   readonly url: string;
+  readonly isRunning: Effect.Effect<boolean>;
   readonly exitCode: Effect.Effect<number, never>;
 }
 
@@ -647,6 +648,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
 
       return {
         url: readyOption.value,
+        isRunning: child.isRunning.pipe(Effect.orElseSucceed(() => false)),
         exitCode: child.exitCode.pipe(
           Effect.map(Number),
           Effect.orElseSucceed(() => 0),
