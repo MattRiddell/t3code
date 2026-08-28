@@ -171,6 +171,55 @@ describe("browserSurfaceStore", () => {
     expect(useBrowserSurfaceStore.getState().byTabId[tabId]?.automationClickHolds).toBeUndefined();
   });
 
+  it("keeps a switched-away click presentation until native dispatch releases it", () => {
+    const clickedTabId = "clicked-browser-surface";
+    const selectedTabId = "selected-browser-surface";
+    const rect = { x: 10, y: 20, width: 900, height: 640 };
+    const clickedSurface = acquireBrowserSurface(clickedTabId);
+    clickedSurface.present(rect, true);
+    const clickPresentation = acquireBrowserSurfaceClickPresentation(clickedTabId);
+
+    clickedSurface.present(rect, false);
+    const selectedSurface = acquireBrowserSurface(selectedTabId);
+    selectedSurface.present(rect, true);
+
+    expect(useBrowserSurfaceStore.getState().byTabId[clickedTabId]).toMatchObject({
+      visible: false,
+      automationClickHolds: 1,
+    });
+    expect(useBrowserSurfaceStore.getState().byTabId[selectedTabId]?.visible).toBe(true);
+
+    clickPresentation?.release();
+    expect(
+      useBrowserSurfaceStore.getState().byTabId[clickedTabId]?.automationClickHolds,
+    ).toBeUndefined();
+  });
+
+  it("rejects concurrent click presentation holds on different tabs", () => {
+    const firstTabId = "first-click-browser-surface";
+    const secondTabId = "second-click-browser-surface";
+    const rect = { x: 10, y: 20, width: 900, height: 640 };
+    const firstSurface = acquireBrowserSurface(firstTabId);
+    const secondSurface = acquireBrowserSurface(secondTabId);
+    firstSurface.present(rect, true);
+    secondSurface.present(rect, true);
+
+    const firstClickPresentation = acquireBrowserSurfaceClickPresentation(firstTabId);
+    const secondFirstTabClickPresentation = acquireBrowserSurfaceClickPresentation(firstTabId);
+    expect(firstClickPresentation).not.toBeNull();
+    expect(secondFirstTabClickPresentation).not.toBeNull();
+    expect(acquireBrowserSurfaceClickPresentation(secondTabId)).toBeNull();
+
+    firstClickPresentation?.release();
+    expect(acquireBrowserSurfaceClickPresentation(secondTabId)).toBeNull();
+    expect(useBrowserSurfaceStore.getState().byTabId[firstTabId]?.automationClickHolds).toBe(1);
+
+    secondFirstTabClickPresentation?.release();
+    const secondTabClickPresentation = acquireBrowserSurfaceClickPresentation(secondTabId);
+    expect(secondTabClickPresentation).not.toBeNull();
+    secondTabClickPresentation?.release();
+  });
+
   it("clears fitted presentation state when its lease is released", () => {
     const tabId = "released-fitted-browser-surface";
     const fittedLease = acquireBrowserSurface(tabId, true);

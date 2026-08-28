@@ -81,12 +81,17 @@ import { shouldRollbackPreviewViewport } from "./previewViewportRollback";
 
 const PREVIEW_PRESENTATION_SETTLE_TIMEOUT_MS = 500;
 
+const isPreviewPresentationConfirmed = (runtimeTabId: string): boolean =>
+  Boolean(
+    useBrowserSurfaceStore.getState().byTabId[runtimeTabId]?.visible &&
+    (!previewBridge?.setWebviewVisibility ||
+      findPreviewWebview(runtimeTabId)?.getAttribute("data-preview-main-visible") === "true"),
+  );
+
 const waitForPreviewPresentation = async (runtimeTabId: string): Promise<void> => {
   const deadline = Date.now() + PREVIEW_PRESENTATION_SETTLE_TIMEOUT_MS;
   while (Date.now() <= deadline) {
-    const visible = useBrowserSurfaceStore.getState().byTabId[runtimeTabId]?.visible;
-    const webview = findPreviewWebview(runtimeTabId);
-    if (visible && webview?.getAttribute("data-preview-main-visible") === "true") return;
+    if (isPreviewPresentationConfirmed(runtimeTabId)) return;
     await new Promise<void>((resolve) => window.setTimeout(resolve, 16));
   }
 };
@@ -226,12 +231,7 @@ const currentStatus = async (
   const state = readThreadPreviewState(threadRef);
   const { snapshot, tabId } = resolvePreviewAutomationTarget(state, requestedTabId);
   const runtimeTabId = tabId ? previewRuntimeTabId(threadRef, state.serverEpoch, tabId) : null;
-  const visible = runtimeTabId
-    ? Boolean(
-        useBrowserSurfaceStore.getState().byTabId[runtimeTabId]?.visible &&
-        findPreviewWebview(runtimeTabId)?.getAttribute("data-preview-main-visible") === "true",
-      )
-    : false;
+  const visible = runtimeTabId ? isPreviewPresentationConfirmed(runtimeTabId) : false;
   const viewportSetting = snapshot ? (snapshot.viewport ?? FILL_PREVIEW_VIEWPORT) : undefined;
   const viewport = runtimeTabId ? await readRenderedViewport(runtimeTabId).catch(() => null) : null;
   const viewportStatus = {
@@ -622,9 +622,8 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
               });
             }
             try {
-              const registration = readPreviewWebviewRegistration(
-                findPreviewWebview(ready.runtimeTabId),
-              );
+              const webview = findPreviewWebview(ready.runtimeTabId);
+              const registration = readPreviewWebviewRegistration(webview);
               const setWebviewVisibility = ready.bridge.setWebviewVisibility;
               if (!registration || !setWebviewVisibility) {
                 throw new PreviewAutomationTargetUnavailableError({
@@ -642,6 +641,15 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 registration.attachmentId,
                 true,
               );
+              if (
+                webview &&
+                findPreviewWebview(ready.runtimeTabId) === webview &&
+                readPreviewWebviewRegistration(webview)?.attachmentId ===
+                  registration.attachmentId &&
+                useBrowserSurfaceStore.getState().byTabId[ready.runtimeTabId]?.visible
+              ) {
+                webview.setAttribute("data-preview-main-visible", "true");
+              }
               const result = await ready.bridge.automation.click(
                 ready.runtimeTabId,
                 request.input as Parameters<typeof ready.bridge.automation.click>[1],

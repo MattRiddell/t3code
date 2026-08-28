@@ -312,6 +312,7 @@ export function HostedBrowserWebview(props: {
 
   const wrapperStyle = resolveHostedBrowserWebviewWrapperStyle({
     active,
+    automationClickHeld: presentation.automationClickHolds > 0,
     cornerRadius: presentation.cornerRadius,
     rect: lastRect,
     hiddenSize,

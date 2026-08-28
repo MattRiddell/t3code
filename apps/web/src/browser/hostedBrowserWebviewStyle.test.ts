@@ -40,6 +40,24 @@ describe("resolveHostedBrowserWebviewWrapperStyle", () => {
     });
   });
 
+  it("keeps a click-held webview above a newly selected surface", () => {
+    const rect = { x: 12, y: 34, width: 800, height: 600 };
+    const hiddenSize = { width: 1280, height: 800 };
+    const selectedStyle = resolveHostedBrowserWebviewWrapperStyle({
+      active: true,
+      rect,
+      hiddenSize,
+    });
+    const heldStyle = resolveHostedBrowserWebviewWrapperStyle({
+      active: true,
+      automationClickHeld: true,
+      rect,
+      hiddenSize,
+    });
+
+    expect(heldStyle.zIndex).toBeGreaterThan(selectedStyle.zIndex);
+  });
+
   it("keeps an inactive webview paintable while moving it offscreen", () => {
     const style = resolveHostedBrowserWebviewWrapperStyle({
       active: false,

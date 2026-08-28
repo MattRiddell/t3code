@@ -3406,9 +3406,10 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       );
       return { _tag: "Dispatched" } as const;
     }).pipe(
-      Effect.catchTag("PreviewAutomationTabNotVisibleError", () =>
-        Effect.succeed({ _tag: "NotSent", reason: "tab-not-visible" } as const),
-      ),
+      Effect.catchTags({
+        PreviewAutomationTabNotVisibleError: () =>
+          Effect.succeed({ _tag: "NotSent", reason: "tab-not-visible" } as const),
+      }),
     );
   });
 

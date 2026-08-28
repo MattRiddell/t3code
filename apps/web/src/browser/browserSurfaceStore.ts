@@ -215,6 +215,11 @@ export function acquireBrowserSurfaceClickPresentation(
   useBrowserSurfaceStore.setState((state) => {
     const current = state.byTabId[tabId];
     if (!current?.visible || current.rect === null) return state;
+    const anotherTabHasClickPresentation = Object.entries(state.byTabId).some(
+      ([candidateTabId, presentation]) =>
+        candidateTabId !== tabId && (presentation.automationClickHolds ?? 0) > 0,
+    );
+    if (anotherTabHasClickPresentation) return state;
     acquired = true;
     return {
       byTabId: {
