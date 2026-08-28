@@ -36,4 +36,14 @@ describe("desktop preload bundle verifier", () => {
       /unsupported sandbox imports: node:fs/,
     );
   });
+
+  it("ignores require-like text in strings and comments", () => {
+    assert.doesNotThrow(() =>
+      verifyPreloadBundle(`
+        ${validPreload}
+        const message = 'require("node:fs")';
+        // require("node:path")
+      `),
+    );
+  });
 });

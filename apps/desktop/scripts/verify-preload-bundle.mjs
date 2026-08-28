@@ -1,8 +1,6 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeURL from "node:url";
-import { init, parse } from "es-module-lexer";
-
-await init;
+import { parse } from "acorn";
 
 const expectedSymbols = [
   "desktopBridge",
@@ -11,6 +9,45 @@ const expectedSymbols = [
   "PICK_FOLDER_CHANNEL",
   "__clerk_internal_electron_passkeys",
 ];
+
+const isSyntaxNode = (value) =>
+  typeof value === "object" && value !== null && "type" in value && typeof value.type === "string";
+
+const readRuntimeImports = (source) => {
+  const runtimeImports = [];
+  const visit = (node) => {
+    if (node.type === "ImportExpression") {
+      throw new Error("Desktop preload bundle contains a dynamic import() call");
+    }
+
+    if (node.type === "CallExpression" && node.callee.type === "Identifier") {
+      if (node.callee.name === "require") {
+        const [argument] = node.arguments;
+        if (node.arguments.length !== 1 || argument?.type !== "Literal") {
+          throw new Error("Desktop preload bundle contains a dynamic require() call");
+        }
+        if (typeof argument.value !== "string") {
+          throw new Error("Desktop preload bundle contains a dynamic require() call");
+        }
+        runtimeImports.push(argument.value);
+      }
+    }
+
+    for (const child of Object.values(node)) {
+      if (Array.isArray(child)) {
+        for (const item of child) {
+          if (isSyntaxNode(item)) visit(item);
+        }
+      } else if (isSyntaxNode(child)) {
+        visit(child);
+      }
+    }
+  };
+
+  visit(parse(source, { ecmaVersion: "latest", sourceType: "script" }));
+  return runtimeImports;
+};
+
 export const verifyPreloadBundle = (source) => {
   const missingSymbols = expectedSymbols.filter((symbol) => !source.includes(symbol));
 
@@ -18,26 +55,7 @@ export const verifyPreloadBundle = (source) => {
     throw new Error(`Desktop preload bundle is missing: ${missingSymbols.join(", ")}`);
   }
 
-  const triviaPattern = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`;
-  const runtimeImportPattern = new RegExp(
-    String.raw`\brequire${triviaPattern}(?:\?\.)?${triviaPattern}\(${triviaPattern}(["'])([^"']+)\1${triviaPattern}\)`,
-    "g",
-  );
-  const runtimeImports = [...source.matchAll(runtimeImportPattern)].map((match) => match[2]);
-  const runtimeRequirePattern = new RegExp(
-    String.raw`\brequire${triviaPattern}(?:\?\.)?${triviaPattern}\(`,
-    "g",
-  );
-  const runtimeRequireCount = [...source.matchAll(runtimeRequirePattern)].length;
-
-  if (runtimeImports.length !== runtimeRequireCount) {
-    throw new Error("Desktop preload bundle contains a dynamic require() call");
-  }
-
-  const [moduleImports] = parse(source);
-  if (moduleImports.some((moduleImport) => moduleImport.d >= 0)) {
-    throw new Error("Desktop preload bundle contains a dynamic import() call");
-  }
+  const runtimeImports = readRuntimeImports(source);
 
   const sandboxModules = new Set(["electron", "events", "timers", "url"]);
   const unsupportedImports = [...new Set(runtimeImports)]
