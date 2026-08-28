@@ -176,6 +176,9 @@ importers:
       electron-builder:
         specifier: 26.15.6
         version: 26.15.6(electron-builder-squirrel-windows@26.15.6)
+      es-module-lexer:
+        specifier: 2.1.0
+        version: 2.1.0
       tailwindcss:
         specifier: ^4.0.0
         version: 4.3.0

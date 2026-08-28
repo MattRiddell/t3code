@@ -9,6 +9,9 @@ and pushes to `main`:
   then `vpr typecheck` for the workspace type check. The same job
   builds the desktop pipeline (`vp run build:desktop`) and verifies the preload bundle exists and
   still exports its expected symbols without runtime imports that Electron's sandbox cannot load.
+  `vp pack` can preserve dynamic imports in CommonJS output, including comments between `import`
+  and `(`, so the verifier parses module syntax instead of matching that syntax with a regular
+  expression.
 - **Test**: `vp run test` across the workspace.
 - **Mobile Native Static Analysis**: `vp run lint:mobile` on macOS, wrapping
   `scripts/mobile-native-static-check.ts`. A cheap Linux **Mobile Native Changes** job gates it:
