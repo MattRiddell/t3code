@@ -942,7 +942,7 @@ describe("PreviewManager", () => {
           }),
         );
         yield* manager.createTab("tab_favicon_reused_id");
-        yield* manager.registerWebview("tab_favicon_reused_id", 42);
+        const initialAttachmentId = yield* manager.registerWebview("tab_favicon_reused_id", 42);
         initial.listeners.get("page-favicon-updated")?.(
           {} as never,
           ["http://localhost:3200/favicon.png"] as never,
@@ -950,8 +950,19 @@ describe("PreviewManager", () => {
         yield* settle(() => states.at(-1)?.favicon !== undefined);
 
         active = replacement.webContents;
-        yield* manager.registerWebview("tab_favicon_reused_id", 42);
+        const replacementAttachmentId = yield* manager.registerWebview("tab_favicon_reused_id", 42);
 
+        expect(replacementAttachmentId).not.toBe(initialAttachmentId);
+        const staleVisibility = yield* manager
+          .setWebviewVisibility("tab_favicon_reused_id", 42, initialAttachmentId, true)
+          .pipe(Effect.exit);
+        expect(Exit.isFailure(staleVisibility)).toBe(true);
+        yield* manager.setWebviewVisibility(
+          "tab_favicon_reused_id",
+          42,
+          replacementAttachmentId,
+          true,
+        );
         expect(states.at(-1)?.favicon).toBeUndefined();
         expect(initial.off).toHaveBeenCalled();
         expect(replacement.listeners.has("page-favicon-updated")).toBe(true);
@@ -1611,10 +1622,16 @@ describe("PreviewManager", () => {
         const recreated = yield* Fiber.join(recreateFiber);
         const registrationExit = yield* Fiber.await(registrationFiber);
 
-        for (const exit of [registrationExit, recordingExit]) {
-          expect(Exit.isFailure(exit)).toBe(true);
-          if (Exit.isSuccess(exit)) continue;
-          expect(Option.getOrThrow(Cause.findErrorOption(exit.cause))).toMatchObject({
+        expect(Exit.isFailure(registrationExit)).toBe(true);
+        if (Exit.isFailure(registrationExit)) {
+          expect(Option.getOrThrow(Cause.findErrorOption(registrationExit.cause))).toMatchObject({
+            _tag: "PreviewTabNotFoundError",
+            tabId: "tab_close_register_race",
+          });
+        }
+        expect(Exit.isFailure(recordingExit)).toBe(true);
+        if (Exit.isFailure(recordingExit)) {
+          expect(Option.getOrThrow(Cause.findErrorOption(recordingExit.cause))).toMatchObject({
             _tag: "PreviewTabNotFoundError",
             tabId: "tab_close_register_race",
           });
@@ -2894,10 +2911,12 @@ describe("PreviewManager", () => {
     ),
   );
 
-  effectIt.effect("emits the resolved pointer target before dispatching an automation click", () =>
+  effectIt.effect("dispatches visible clicks and stops if the webview hides during animation", () =>
     withManager((manager) =>
       Effect.gen(function* () {
         let humanInput: ((_event: unknown, signal: unknown) => void) | undefined;
+        let hideBeforeDispatch = false;
+        let attachmentId = "unregistered";
         const activity: string[] = [];
         const sendCommand = vi.fn(async (method: string, params?: Record<string, unknown>) => {
           if (method === "Runtime.evaluate") {
@@ -2946,12 +2965,18 @@ describe("PreviewManager", () => {
         } as never);
 
         yield* manager.subscribePointerEvents((event) =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             activity.push(event.phase);
+            if (hideBeforeDispatch && event.phase === "click") {
+              yield* manager
+                .setWebviewVisibility("tab_1", 42, attachmentId, false)
+                .pipe(Effect.orDie);
+            }
           }),
         );
         yield* manager.createTab("tab_1");
-        yield* manager.registerWebview("tab_1", 42);
+        attachmentId = yield* manager.registerWebview("tab_1", 42);
+        yield* manager.setWebviewVisibility("tab_1", 42, attachmentId, true);
         const click = yield* manager
           .automationClick("tab_1", { x: 120, y: 80 })
           .pipe(Effect.forkChild({ startImmediately: true }));
@@ -2973,6 +2998,42 @@ describe("PreviewManager", () => {
           button: "left",
           clickCount: 1,
         });
+
+        sendCommand.mockClear();
+        hideBeforeDispatch = true;
+        yield* manager.setWebviewVisibility("tab_1", 42, attachmentId, true);
+        const hiddenDuringAnimation = yield* manager
+          .automationClick("tab_1", { x: 120, y: 80 })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* TestClock.adjust(200);
+        expect(yield* Fiber.join(hiddenDuringAnimation)).toEqual({
+          _tag: "NotSent",
+          reason: "tab-not-visible",
+        });
+        expect(
+          sendCommand.mock.calls.some(([method]) => method === "Input.dispatchMouseEvent"),
+        ).toBe(false);
+      }),
+    ),
+  );
+
+  effectIt.effect("rejects a hidden webview before starting browser control", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const wc = makeTestPreviewWebContents(async () => ({
+          toJPEG: () => Buffer.from("unused"),
+          getSize: () => ({ width: 800, height: 600 }),
+        })) as unknown as Electron.WebContents;
+        fromId.mockReturnValue(wc as never);
+
+        yield* manager.createTab("tab_hidden");
+        yield* manager.registerWebview("tab_hidden", 42);
+        expect(yield* manager.automationClick("tab_hidden", { x: 120, y: 80 })).toEqual({
+          _tag: "NotSent",
+          reason: "tab-not-visible",
+        });
+        expect(wc.debugger.attach).not.toHaveBeenCalled();
+        expect(wc.debugger.sendCommand).not.toHaveBeenCalled();
       }),
     ),
   );
@@ -3201,7 +3262,8 @@ describe("PreviewManager", () => {
         } as never);
 
         yield* manager.createTab("tab_1");
-        yield* manager.registerWebview("tab_1", 42);
+        const attachmentId = yield* manager.registerWebview("tab_1", 42);
+        yield* manager.setWebviewVisibility("tab_1", 42, attachmentId, true);
 
         const click = yield* manager
           .automationClick("tab_1", { x: 120, y: 80 })

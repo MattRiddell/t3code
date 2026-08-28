@@ -2,6 +2,7 @@ import {
   DesktopPreviewAnnotationThemeInputSchema,
   DesktopPreviewArtifactInputSchema,
   DesktopPreviewAutomationClickInputSchema,
+  DesktopPreviewAutomationClickResultSchema,
   DesktopPreviewAutomationEvaluateInputSchema,
   DesktopPreviewAutomationPressInputSchema,
   DesktopPreviewAutomationScrollInputSchema,
@@ -13,9 +14,11 @@ import {
   DesktopPreviewRecordingArtifactSchema,
   DesktopPreviewRecordingSaveInputSchema,
   DesktopPreviewRegisterWebviewInputSchema,
+  DesktopPreviewRegisterWebviewResultSchema,
   DesktopPreviewScreenshotArtifactSchema,
   DesktopPreviewSetAudioMutedInputSchema,
   DesktopPreviewSetColorSchemeInputSchema,
+  DesktopPreviewSetWebviewVisibilityInputSchema,
   DesktopPreviewCreateTabInputSchema,
   DesktopPreviewTabInputSchema,
   DesktopPreviewWebviewConfigSchema,
@@ -75,10 +78,26 @@ export const closeTab = DesktopIpc.makeIpcMethod({
 export const registerWebview = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.PREVIEW_REGISTER_WEBVIEW_CHANNEL,
   payload: DesktopPreviewRegisterWebviewInputSchema,
-  result: Schema.Void,
+  result: DesktopPreviewRegisterWebviewResultSchema,
   handler: Effect.fn("desktop.ipc.preview.registerWebview")(function* ({ tabId, webContentsId }) {
     const manager = yield* PreviewManager.PreviewManager;
-    yield* manager.registerWebview(tabId, webContentsId);
+    const attachmentId = yield* manager.registerWebview(tabId, webContentsId);
+    return { attachmentId };
+  }),
+});
+
+export const setWebviewVisibility = DesktopIpc.makeIpcMethod({
+  channel: IpcChannels.PREVIEW_SET_WEBVIEW_VISIBILITY_CHANNEL,
+  payload: DesktopPreviewSetWebviewVisibilityInputSchema,
+  result: Schema.Void,
+  handler: Effect.fn("desktop.ipc.preview.setWebviewVisibility")(function* ({
+    tabId,
+    webContentsId,
+    attachmentId,
+    visible,
+  }) {
+    const manager = yield* PreviewManager.PreviewManager;
+    yield* manager.setWebviewVisibility(tabId, webContentsId, attachmentId, visible);
   }),
 });
 
@@ -302,10 +321,10 @@ export const automationSnapshot = DesktopIpc.makeIpcMethod({
 export const automationClick = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.PREVIEW_AUTOMATION_CLICK_CHANNEL,
   payload: DesktopPreviewAutomationClickInputSchema,
-  result: Schema.Void,
+  result: DesktopPreviewAutomationClickResultSchema,
   handler: Effect.fn("desktop.ipc.preview.automationClick")(function* ({ tabId, input }) {
     const manager = yield* PreviewManager.PreviewManager;
-    yield* manager.automationClick(tabId, input);
+    return yield* manager.automationClick(tabId, input);
   }),
 });
 
@@ -373,6 +392,7 @@ export const methods = [
   createTab,
   closeTab,
   registerWebview,
+  setWebviewVisibility,
   navigate,
   goBack,
   goForward,

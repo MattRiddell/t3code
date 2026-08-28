@@ -1,5 +1,6 @@
 import {
   PREVIEW_AUTOMATION_V1_OPERATIONS,
+  PreviewAutomationClickDispatched,
   PreviewAutomationClientDisconnectedError,
   PreviewAutomationControlInterruptedError,
   PreviewAutomationExecutionError,
@@ -10,6 +11,7 @@ import {
   PreviewAutomationRequestQueueClosedError,
   PreviewAutomationResultTooLargeError,
   PreviewAutomationTabNotFoundError,
+  PreviewAutomationTabNotVisibleError,
   PreviewAutomationTargetNotEditableError,
   PreviewAutomationTimeoutError,
   PreviewAutomationUnsupportedClientError,
@@ -17,6 +19,7 @@ import {
   type PreviewAutomationError,
   type PreviewAutomationOperation,
   type PreviewAutomationHost,
+  type PreviewAutomationHostCapability,
   type PreviewAutomationHostFocus,
   type PreviewAutomationResponse,
   type PreviewAutomationStreamEvent,
@@ -62,6 +65,7 @@ interface ClientConnection {
   readonly clientId: string;
   readonly connectionId: string;
   readonly environmentId: PreviewAutomationHost["environmentId"];
+  readonly capabilities: ReadonlySet<PreviewAutomationHostCapability>;
   readonly supportedOperations: ReadonlySet<PreviewAutomationOperation>;
   readonly focused: boolean;
   readonly focusOrder: number;
@@ -164,7 +168,11 @@ const readResultTabId = (result: unknown): PreviewTabId | null | undefined => {
 const supportsOperation = (
   connection: ClientConnection,
   operation: PreviewAutomationOperation,
-): boolean => connection.supportedOperations.has(operation);
+): boolean =>
+  connection.supportedOperations.has(operation) &&
+  (operation !== "click" || connection.capabilities.has("click-visible-only-v1"));
+
+const isConfirmedClickDispatch = Schema.is(PreviewAutomationClickDispatched);
 
 type RemoteDetailKind = "null" | "array" | "object" | "string" | "number" | "boolean";
 
@@ -209,6 +217,19 @@ const classifyResponseError = (
         ...context,
         ...remoteDiagnostics,
       });
+    case "PreviewAutomationTabNotVisibleError": {
+      if (context.operation !== "click") {
+        return new PreviewAutomationExecutionError({
+          ...context,
+          ...remoteDiagnostics,
+        });
+      }
+      return new PreviewAutomationTabNotVisibleError({
+        ...context,
+        operation: "click",
+        ...remoteDiagnostics,
+      });
+    }
     case "PreviewAutomationTimeoutError":
       return new PreviewAutomationTimeoutError({
         ...context,
@@ -330,6 +351,7 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
       clientId,
       connectionId,
       environmentId: host.environmentId,
+      capabilities: new Set(host.capabilities ?? []),
       supportedOperations: new Set(host.supportedOperations ?? PREVIEW_AUTOMATION_V1_OPERATIONS),
       focused: false,
       focusOrder: 0,
@@ -412,6 +434,17 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
     });
     if (!pending) return;
     if (response.ok) {
+      if (pending.context.operation === "click") {
+        if (!isConfirmedClickDispatch(response.result)) {
+          yield* Deferred.fail(
+            pending.deferred,
+            new PreviewAutomationMalformedResponseError(pending.context),
+          );
+          return;
+        }
+        yield* Deferred.succeed(pending.deferred, undefined);
+        return;
+      }
       yield* Deferred.succeed(pending.deferred, response.result);
     } else {
       yield* Deferred.fail(

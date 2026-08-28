@@ -119,7 +119,7 @@ export const PreviewSnapshotTool = readonlyBrowserTool(
 export const PreviewClickTool = browserTool(
   Tool.make("preview_click", {
     description:
-      "Click exactly one target in the tab selected by tabId, or this agent session's current tab when omitted. Prefer a Playwright locator; selector accepts legacy CSS; x and y must be supplied together.",
+      "Click exactly one target in the visible tab selected by tabId, or this agent session's current visible tab when omitted. Hidden tabs must be shown before clicking. Prefer a Playwright locator; selector accepts legacy CSS; x and y must be supplied together.",
     parameters: PreviewAutomationClickInput,
     success: PreviewActionResult,
     failure: PreviewAutomationError,

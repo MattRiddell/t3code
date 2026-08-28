@@ -1004,6 +1004,23 @@ export const DesktopPreviewRegisterWebviewInputSchema = Schema.Struct({
   webContentsId: Schema.Int.check(Schema.isGreaterThan(0)),
 });
 
+export const DesktopPreviewWebviewAttachmentIdSchema = Schema.String.check(Schema.isTrimmed())
+  .check(Schema.isNonEmpty())
+  .check(Schema.isMaxLength(64));
+export type DesktopPreviewWebviewAttachmentId = typeof DesktopPreviewWebviewAttachmentIdSchema.Type;
+
+export const DesktopPreviewRegisterWebviewResultSchema = Schema.Struct({
+  attachmentId: DesktopPreviewWebviewAttachmentIdSchema,
+});
+export type DesktopPreviewRegisterWebviewResult =
+  typeof DesktopPreviewRegisterWebviewResultSchema.Type;
+
+export const DesktopPreviewSetWebviewVisibilityInputSchema = Schema.Struct({
+  ...DesktopPreviewRegisterWebviewInputSchema.fields,
+  attachmentId: DesktopPreviewWebviewAttachmentIdSchema,
+  visible: Schema.Boolean,
+});
+
 export const DesktopPreviewNavigateInputSchema = Schema.Struct({
   tabId: DesktopPreviewTabIdSchema,
   url: Schema.String,
@@ -1041,6 +1058,15 @@ export const DesktopPreviewAutomationClickInputSchema = Schema.Struct({
   tabId: DesktopPreviewTabIdSchema,
   input: PreviewAutomationClickInput,
 });
+
+export const DesktopPreviewAutomationClickResultSchema = Schema.Union([
+  Schema.TaggedStruct("Dispatched", {}),
+  Schema.TaggedStruct("NotSent", {
+    reason: Schema.Literal("tab-not-visible"),
+  }),
+]);
+export type DesktopPreviewAutomationClickResult =
+  typeof DesktopPreviewAutomationClickResultSchema.Type;
 
 export const DesktopPreviewAutomationTypeInputSchema = Schema.Struct({
   tabId: DesktopPreviewTabIdSchema,
@@ -1161,7 +1187,17 @@ export interface DesktopBridge {
 export interface DesktopPreviewBridge {
   createTab: (tabId: string, defaults?: DesktopPreviewTabDefaults) => Promise<void>;
   closeTab: (tabId: string) => Promise<void>;
-  registerWebview: (tabId: string, webContentsId: number) => Promise<void>;
+  registerWebview: (
+    tabId: string,
+    webContentsId: number,
+  ) => Promise<DesktopPreviewRegisterWebviewResult | void>;
+  /** Optional while newer renderers can run inside older desktop shells. */
+  setWebviewVisibility?: (
+    tabId: string,
+    webContentsId: number,
+    attachmentId: DesktopPreviewWebviewAttachmentId,
+    visible: boolean,
+  ) => Promise<void>;
   navigate: (tabId: string, url: string) => Promise<void>;
   goBack: (tabId: string) => Promise<void>;
   goForward: (tabId: string) => Promise<void>;
@@ -1225,7 +1261,10 @@ export interface DesktopPreviewBridge {
   automation: {
     status: (tabId: string) => Promise<DesktopPreviewAutomationStatus>;
     snapshot: (tabId: string) => Promise<PreviewAutomationSnapshot>;
-    click: (tabId: string, input: PreviewAutomationClickInput) => Promise<void>;
+    click: (
+      tabId: string,
+      input: PreviewAutomationClickInput,
+    ) => Promise<DesktopPreviewAutomationClickResult | void>;
     type: (tabId: string, input: PreviewAutomationTypeInput) => Promise<void>;
     press: (tabId: string, input: PreviewAutomationPressInput) => Promise<void>;
     scroll: (tabId: string, input: PreviewAutomationScrollInput) => Promise<void>;

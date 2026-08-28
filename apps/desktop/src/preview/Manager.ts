@@ -7,6 +7,7 @@
  */
 import type {
   DesktopPreviewAnnotationTheme,
+  DesktopPreviewAutomationClickResult,
   DesktopPreviewAutomationStatus,
   DesktopPreviewColorScheme,
   DesktopPreviewFavicon,
@@ -18,6 +19,7 @@ import type {
   DesktopPreviewRecordingFrame,
   DesktopPreviewScreenshotArtifact,
   DesktopPreviewTabDefaults,
+  DesktopPreviewWebviewAttachmentId,
   PreviewAutomationClickInput,
   PreviewAutomationActionEvent,
   PreviewAutomationConsoleEntry,
@@ -370,8 +372,13 @@ type PreviewInputSignal =
   | { readonly kind: "key"; readonly key: string; readonly code: string };
 
 interface ManagedListeners {
-  readonly attachmentId: symbol;
+  readonly attachmentId: DesktopPreviewWebviewAttachmentId;
   readonly cancelFaviconCapture: () => void;
+  readonly presentation: {
+    active: boolean;
+    readonly semaphore: Semaphore.Semaphore;
+    visible: boolean;
+  };
   readonly scope: Scope.Closeable;
   readonly webContents: Electron.WebContents;
 }
@@ -516,6 +523,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     ReadonlyMap<string, ReadonlyArray<PreviewAutomationActionEvent>>
   >(new Map());
   const actionSequenceRef = yield* Ref.make(0);
+  const attachmentSequenceRef = yield* Ref.make(0);
   const pointerSequenceRef = yield* Ref.make(0);
   const frameCaptureSessionsRef = yield* SynchronizedRef.make<
     ReadonlyMap<string, FrameCaptureSession>
@@ -1345,16 +1353,23 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const detachListeners = Effect.fn("PreviewManager.detachListeners")(function* (
     webContentsId: number,
   ) {
-    const managed = yield* Ref.modify(attachedRef, (attached) => [
-      attached.get(webContentsId),
-      replaceMap(attached, (copy) => {
-        copy.delete(webContentsId);
+    const managed = (yield* Ref.get(attachedRef)).get(webContentsId);
+    if (!managed) return;
+    const detached = yield* managed.presentation.semaphore.withPermit(
+      Ref.modify(attachedRef, (attached) => {
+        if (attached.get(webContentsId) !== managed) return [false, attached] as const;
+        managed.presentation.active = false;
+        return [
+          true,
+          replaceMap(attached, (copy) => {
+            copy.delete(webContentsId);
+          }),
+        ] as const;
       }),
-    ]);
-    if (managed) {
-      managed.cancelFaviconCapture();
-      yield* Scope.close(managed.scope, Exit.void).pipe(Effect.ignore);
-    }
+    );
+    if (!detached) return;
+    managed.cancelFaviconCapture();
+    yield* Scope.close(managed.scope, Exit.void).pipe(Effect.ignore);
   });
 
   const isAppShortcut = (input: Electron.Input): boolean =>
@@ -1418,7 +1433,9 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     wc: Electron.WebContents,
   ) {
     const scope = yield* Scope.fork(parentScope, "sequential");
-    const attachmentId = Symbol();
+    const attachmentSequence = yield* nextCounter(attachmentSequenceRef);
+    const attachmentId = `preview-attachment-${attachmentSequence.toString(36)}`;
+    const presentationSemaphore = yield* Semaphore.make(1);
     let documentId = 0;
     let nextRequestId = 0;
     let activeCapture: {
@@ -1716,11 +1733,18 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       });
       yield* Ref.update(attachedRef, (attached) =>
         replaceMap(attached, (copy) => {
-          copy.set(wc.id, { attachmentId, cancelFaviconCapture, scope, webContents: wc });
+          copy.set(wc.id, {
+            attachmentId,
+            cancelFaviconCapture,
+            presentation: { active: true, semaphore: presentationSemaphore, visible: false },
+            scope,
+            webContents: wc,
+          });
         }),
       );
     });
     yield* install().pipe(Effect.onError(() => Scope.close(scope, Exit.void).pipe(Effect.ignore)));
+    return attachmentId;
   });
 
   const setMainWindow = Effect.fn("PreviewManager.setMainWindow")(function* (
@@ -1906,7 +1930,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       yield* attempt({ operation: "registerWebview.sendTheme", tabId, webContentsId }, () =>
         wc.send(ANNOTATION_THEME_CHANNEL, annotationTheme),
       );
-      return;
+      return currentAttachment.attachmentId;
     }
     const replacedWebContentsId =
       tab.webContentsId != null &&
@@ -1944,7 +1968,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     yield* attempt({ operation: "registerWebview.restoreAudioMuted", tabId, webContentsId }, () =>
       wc.setAudioMuted(currentTab.audioMuted),
     );
-    yield* attachListeners(tabId, wc);
+    const attachmentId = yield* attachListeners(tabId, wc);
     const readAudible = attempt(
       { operation: "registerWebview.readAudible", tabId, webContentsId },
       () => wc.isCurrentlyAudible(),
@@ -2026,6 +2050,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         ).pipe(Effect.ignore),
       );
     }
+    return attachmentId;
   });
 
   const registerWebview = Effect.fn("PreviewManager.registerWebview")(function* (
@@ -2036,6 +2061,37 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     return yield* withTabLifecycleLock(
       tabId,
       registerWebviewUnlocked(tabId, webContentsId, expectedGeneration),
+    );
+  });
+
+  const setWebviewVisibility = Effect.fn("PreviewManager.setWebviewVisibility")(function* (
+    tabId: string,
+    webContentsId: number,
+    attachmentId: DesktopPreviewWebviewAttachmentId,
+    visible: boolean,
+  ) {
+    const attachment = (yield* Ref.get(attachedRef)).get(webContentsId);
+    if (!attachment) {
+      return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId });
+    }
+    yield* attachment.presentation.semaphore.withPermit(
+      Effect.gen(function* () {
+        const tab = (yield* SynchronizedRef.get(tabsRef)).get(tabId);
+        const wc = webContents.fromId(webContentsId);
+        const currentAttachment = (yield* Ref.get(attachedRef)).get(webContentsId);
+        if (
+          tab?.webContentsId !== webContentsId ||
+          !wc ||
+          wc.isDestroyed() ||
+          currentAttachment !== attachment ||
+          attachment.attachmentId !== attachmentId ||
+          attachment.webContents !== wc ||
+          !attachment.presentation.active
+        ) {
+          return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId });
+        }
+        attachment.presentation.visible = visible;
+      }),
     );
   });
 
@@ -3243,11 +3299,38 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     );
   });
 
+  const assertAutomationClickVisible = Effect.fn("PreviewManager.assertAutomationClickVisible")(
+    function* (tabId: string, wc: Electron.WebContents, attachment: ManagedListeners) {
+      const tab = (yield* SynchronizedRef.get(tabsRef)).get(tabId);
+      const currentAttachment = (yield* Ref.get(attachedRef)).get(wc.id);
+      if (
+        tab?.webContentsId !== wc.id ||
+        webContents.fromId(wc.id) !== wc ||
+        currentAttachment !== attachment ||
+        !attachment.presentation.active
+      ) {
+        return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId: wc.id });
+      }
+      if (!attachment.presentation.visible) {
+        return yield* new PreviewAutomationTabNotVisibleError({
+          operation: "click",
+          tabId,
+          webContentsId: wc.id,
+        });
+      }
+    },
+  );
+
   const performAutomationClick = Effect.fn("PreviewManager.performAutomationClick")(function* (
     tabId: string,
+    wc: Electron.WebContents,
     input: PreviewAutomationClickInput,
+    attachment: ManagedListeners,
     send: SendCommand,
   ) {
+    yield* attachment.presentation.semaphore.withPermit(
+      assertAutomationClickVisible(tabId, wc, attachment),
+    );
     yield* prepareAutomationInput(send, true);
     const point = yield* resolveClickPoint(tabId, send, input);
     const viewport = yield* evaluateWithDebugger<{ width: number; height: number }>(
@@ -3285,19 +3368,24 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       createdAt: clickCreatedAt,
     });
     yield* Effect.sleep(AGENT_CURSOR_CLICK_LEAD_MS);
-    yield* expectAgentInput(tabId, { kind: "pointer", ...point, button: 0 });
-    yield* send("Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      ...point,
-      button: "left",
-      clickCount: 1,
-    });
-    yield* send("Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      ...point,
-      button: "left",
-      clickCount: 1,
-    });
+    yield* attachment.presentation.semaphore.withPermit(
+      Effect.gen(function* () {
+        yield* assertAutomationClickVisible(tabId, wc, attachment);
+        yield* expectAgentInput(tabId, { kind: "pointer", ...point, button: 0 });
+        yield* send("Input.dispatchMouseEvent", {
+          type: "mousePressed",
+          ...point,
+          button: "left",
+          clickCount: 1,
+        });
+        yield* send("Input.dispatchMouseEvent", {
+          type: "mouseReleased",
+          ...point,
+          button: "left",
+          clickCount: 1,
+        });
+      }),
+    );
   });
 
   const automationClick = Effect.fn("PreviewManager.automationClick")(function* (
@@ -3305,8 +3393,22 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     input: PreviewAutomationClickInput,
   ) {
     const wc = yield* requireWebContents(tabId);
-    yield* withControlSession(tabId, wc, "click", (send) =>
-      performAutomationClick(tabId, input, send),
+    const attachment = (yield* Ref.get(attachedRef)).get(wc.id);
+    if (attachment?.webContents !== wc) {
+      return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId: wc.id });
+    }
+    return yield* Effect.gen(function* () {
+      yield* attachment.presentation.semaphore.withPermit(
+        assertAutomationClickVisible(tabId, wc, attachment),
+      );
+      yield* withControlSession(tabId, wc, "click", (send) =>
+        performAutomationClick(tabId, wc, input, attachment, send),
+      );
+      return { _tag: "Dispatched" } as const;
+    }).pipe(
+      Effect.catchTag("PreviewAutomationTabNotVisibleError", () =>
+        Effect.succeed({ _tag: "NotSent", reason: "tab-not-visible" } as const),
+      ),
     );
   });
 
@@ -3733,6 +3835,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     goBack,
     goForward,
     hardReload,
+    setWebviewVisibility,
     navigate,
     openPictureInPicture,
     openDevTools,
@@ -3998,6 +4101,19 @@ export class PreviewAutomationControlInterruptedError extends Schema.TaggedError
   }
 }
 
+export class PreviewAutomationTabNotVisibleError extends Schema.TaggedErrorClass<PreviewAutomationTabNotVisibleError>()(
+  "PreviewAutomationTabNotVisibleError",
+  {
+    operation: Schema.Literal("click"),
+    tabId: Schema.String,
+    webContentsId: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Preview tab ${this.tabId} is hidden. No mouse input was sent.`;
+  }
+}
+
 export const PreviewManagerError = Schema.Union([
   PreviewTabNotFoundError,
   PreviewWebContentsNotFoundError,
@@ -4016,6 +4132,7 @@ export const PreviewManagerError = Schema.Union([
   PreviewAutomationResultTooLargeError,
   PreviewAutomationTimeoutError,
   PreviewAutomationControlInterruptedError,
+  PreviewAutomationTabNotVisibleError,
 ]);
 export type PreviewManagerError = typeof PreviewManagerError.Type;
 
@@ -4042,6 +4159,12 @@ export class PreviewManager extends Context.Service<
     readonly registerWebview: (
       tabId: string,
       webContentsId: number,
+    ) => Effect.Effect<DesktopPreviewWebviewAttachmentId, PreviewManagerError>;
+    readonly setWebviewVisibility: (
+      tabId: string,
+      webContentsId: number,
+      attachmentId: DesktopPreviewWebviewAttachmentId,
+      visible: boolean,
     ) => Effect.Effect<void, PreviewManagerError>;
     readonly navigate: (tabId: string, url: string) => Effect.Effect<void, PreviewManagerError>;
     readonly goBack: (tabId: string) => Effect.Effect<void, PreviewManagerError>;
@@ -4096,7 +4219,7 @@ export class PreviewManager extends Context.Service<
     readonly automationClick: (
       tabId: string,
       input: PreviewAutomationClickInput,
-    ) => Effect.Effect<void, PreviewManagerError>;
+    ) => Effect.Effect<DesktopPreviewAutomationClickResult, PreviewManagerError>;
     readonly automationType: (
       tabId: string,
       input: PreviewAutomationTypeInput,
@@ -4150,6 +4273,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     createTab: operations.createTab,
     closeTab: operations.closeTab,
     registerWebview: operations.registerWebview,
+    setWebviewVisibility: operations.setWebviewVisibility,
     navigate: operations.navigate,
     goBack: operations.goBack,
     goForward: operations.goForward,

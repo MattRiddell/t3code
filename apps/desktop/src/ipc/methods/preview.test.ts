@@ -94,4 +94,47 @@ describe("preview IPC methods", () => {
       }),
     ).toThrow();
   });
+
+  effectIt.effect("returns the attachment identity used for visibility updates", () =>
+    Effect.gen(function* () {
+      const registerWebview = vi.fn(() => Effect.succeed("preview-attachment-1"));
+      const result = yield* PreviewIpc.registerWebview
+        .handler({ tabId: "tab-1", webContentsId: 42 })
+        .pipe(Effect.provideService(PreviewManager.PreviewManager, { registerWebview } as never));
+
+      expect(result).toEqual({ attachmentId: "preview-attachment-1" });
+      expect(registerWebview).toHaveBeenCalledWith("tab-1", 42);
+    }),
+  );
+
+  effectIt.effect("passes exact attachment visibility to the preview manager", () =>
+    Effect.gen(function* () {
+      const setWebviewVisibility = vi.fn(() => Effect.void);
+      yield* PreviewIpc.setWebviewVisibility
+        .handler({
+          tabId: "tab-1",
+          webContentsId: 42,
+          attachmentId: "preview-attachment-1",
+          visible: true,
+        })
+        .pipe(
+          Effect.provideService(PreviewManager.PreviewManager, { setWebviewVisibility } as never),
+        );
+
+      expect(setWebviewVisibility).toHaveBeenCalledWith("tab-1", 42, "preview-attachment-1", true);
+    }),
+  );
+
+  effectIt.effect("returns a structured result when a native click is not sent", () =>
+    Effect.gen(function* () {
+      const automationClick = vi.fn(() =>
+        Effect.succeed({ _tag: "NotSent", reason: "tab-not-visible" } as const),
+      );
+      const result = yield* PreviewIpc.automationClick
+        .handler({ tabId: "tab-1", input: { x: 10, y: 20 } })
+        .pipe(Effect.provideService(PreviewManager.PreviewManager, { automationClick } as never));
+
+      expect(result).toEqual({ _tag: "NotSent", reason: "tab-not-visible" });
+    }),
+  );
 });

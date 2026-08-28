@@ -10,6 +10,8 @@ export interface BrowserSurfaceRect {
 export interface BrowserSurfacePresentation {
   readonly rect: BrowserSurfaceRect | null;
   readonly visible: boolean;
+  /** Keeps a visible surface presented until a native automation click settles. */
+  readonly automationClickHolds?: number;
   readonly content: BrowserSurfaceContentPresentation | null;
   readonly fittedSourceContent: BrowserSurfaceContentPresentation | null;
   readonly fitSourceContent: boolean;
@@ -47,6 +49,10 @@ export interface BrowserSurfaceLease {
   readonly release: () => void;
 }
 
+export interface BrowserSurfaceClickPresentationLease {
+  readonly release: () => void;
+}
+
 export function resolveBrowserSurfacePanelRect(
   byTabId: Readonly<Record<string, BrowserSurfacePresentation>>,
   tabId: string,
@@ -74,6 +80,9 @@ export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) =
           [tabId]: {
             rect: current?.rect ?? null,
             visible: false,
+            ...(current?.automationClickHolds
+              ? { automationClickHolds: current.automationClickHolds }
+              : {}),
             content: current?.content ?? null,
             fittedSourceContent: fitSourceContent ? (current?.content ?? null) : null,
             fitSourceContent,
@@ -190,6 +199,53 @@ export function acquireBrowserSurface(
       if (released) return;
       released = true;
       useBrowserSurfaceStore.getState().release(tabId, owner);
+    },
+  };
+}
+
+/**
+ * Pins a currently visible surface on screen while desktop dispatches a native
+ * click. The synchronous visibility check prevents background tabs from
+ * becoming visible only for automation.
+ */
+export function acquireBrowserSurfaceClickPresentation(
+  tabId: string,
+): BrowserSurfaceClickPresentationLease | null {
+  let acquired = false;
+  useBrowserSurfaceStore.setState((state) => {
+    const current = state.byTabId[tabId];
+    if (!current?.visible || current.rect === null) return state;
+    acquired = true;
+    return {
+      byTabId: {
+        ...state.byTabId,
+        [tabId]: {
+          ...current,
+          automationClickHolds: (current.automationClickHolds ?? 0) + 1,
+        },
+      },
+    };
+  });
+  if (!acquired) return null;
+
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      useBrowserSurfaceStore.setState((state) => {
+        const current = state.byTabId[tabId];
+        if (!current || (current.automationClickHolds ?? 0) === 0) return state;
+        const nextHolds = Math.max(0, (current.automationClickHolds ?? 0) - 1);
+        const { automationClickHolds: _automationClickHolds, ...withoutClickHolds } = current;
+        return {
+          byTabId: {
+            ...state.byTabId,
+            [tabId]:
+              nextHolds === 0 ? withoutClickHolds : { ...current, automationClickHolds: nextHolds },
+          },
+        };
+      });
     },
   };
 }

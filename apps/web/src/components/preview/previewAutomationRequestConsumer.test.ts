@@ -10,6 +10,7 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  confirmPreviewAutomationClickDispatched,
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetUnavailableError,
   PreviewAutomationViewportTimeoutError,
@@ -320,6 +321,41 @@ describe("previewAutomationRequestConsumer", () => {
         tabId: "tab-1",
         selectorKind: "selector",
         selectorLength: 6,
+      },
+    });
+  });
+
+  it("maps hidden desktop clicks to a clear not-visible response", () => {
+    const context = {
+      requestId: "request-click",
+      operation: "click" as const,
+      environmentId,
+      threadId,
+      tabId,
+    };
+    expect(confirmPreviewAutomationClickDispatched({ _tag: "Dispatched" }, context)).toEqual({
+      _tag: "PreviewAutomationClickDispatched",
+    });
+
+    let hiddenError: unknown;
+    try {
+      confirmPreviewAutomationClickDispatched(
+        { _tag: "NotSent", reason: "tab-not-visible" },
+        context,
+      );
+    } catch (cause) {
+      hiddenError = cause;
+    }
+    expect(serializePreviewAutomationError(hiddenError, context)).toEqual({
+      _tag: "PreviewAutomationTabNotVisibleError",
+      message:
+        "Preview tab tab-1 is hidden. No mouse input was sent. Show the tab before clicking.",
+      detail: {
+        requestId: "request-click",
+        operation: "click",
+        environmentId: "environment-1",
+        threadId: "thread-1",
+        tabId: "tab-1",
       },
     });
   });

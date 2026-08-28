@@ -6,6 +6,7 @@ import {
   PreviewAutomationInvalidSelectorError,
   PreviewAutomationMalformedResponseError,
   PreviewAutomationNoAvailableHostError,
+  PreviewAutomationTabNotVisibleError,
   PreviewAutomationTargetNotEditableError,
   PreviewTabId,
   ProviderInstanceId,
@@ -38,6 +39,9 @@ const makeHost = (overrides: Partial<PreviewAutomationHost> = {}): PreviewAutoma
   environmentId: scope.environmentId,
   ...overrides,
 });
+
+const makeClickHost = (overrides: Partial<PreviewAutomationHost> = {}): PreviewAutomationHost =>
+  makeHost({ capabilities: ["click-visible-only-v1"], ...overrides });
 
 type RoutedRequest = PreviewAutomationRequest & {
   readonly connectionId: PreviewAutomationStreamEvent["connectionId"];
@@ -310,7 +314,7 @@ it.effect("preserves bounded request and remote selector diagnostics", () => {
   return Effect.scoped(
     Effect.gen(function* () {
       const broker = yield* makeBroker;
-      const requests = requestsFrom(yield* broker.connect(makeHost()));
+      const requests = requestsFrom(yield* broker.connect(makeClickHost()));
       yield* Stream.runForEach(requests, (request) =>
         broker.respond({
           clientId: "client-1",
@@ -400,6 +404,49 @@ it.effect("classifies a remote non-editable target without collapsing it to exec
         remoteTag: "PreviewAutomationTargetNotEditableError",
       });
       expect(error.message).toBe("Preview automation type requires an editable focused element.");
+    }),
+  );
+});
+
+it.effect("classifies a hidden-tab click without reporting success", () => {
+  const remoteError = {
+    _tag: "PreviewAutomationTabNotVisibleError",
+    message: "remote hidden-tab details",
+  } as const;
+
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const requests = requestsFrom(yield* broker.connect(makeClickHost()));
+      yield* Stream.runForEach(requests, (request) =>
+        broker.respond({
+          clientId: "client-1",
+          connectionId: request.connectionId,
+          requestId: request.requestId,
+          ok: false,
+          error: remoteError,
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const error = yield* broker
+        .invoke<void>({
+          scope,
+          operation: "click",
+          input: { x: 10, y: 10 },
+          tabId: PreviewTabId.make("tab-1"),
+        })
+        .pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(PreviewAutomationTabNotVisibleError);
+      expect(error).toMatchObject({
+        operation: "click",
+        tabId: "tab-1",
+        remoteTag: "PreviewAutomationTabNotVisibleError",
+      });
+      expect(error.message).toBe(
+        "Preview tab tab-1 is hidden. No mouse input was sent. Show the tab before clicking.",
+      );
     }),
   );
 });
@@ -673,6 +720,24 @@ it.effect("does not route new operations to legacy hosts that did not advertise 
   ),
 );
 
+it.effect("does not route clicks to hosts without guarded-click support", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const legacyEvents = yield* broker.connect(makeHost());
+      yield* Stream.runDrain(legacyEvents).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const error = yield* broker
+        .invoke<void>({ scope, operation: "click", input: { x: 10, y: 10 } })
+        .pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(PreviewAutomationNoAvailableHostError);
+      expect(error).toMatchObject({ operation: "click", environmentId: scope.environmentId });
+    }),
+  ),
+);
+
 it.effect("routes resize to a capable host instead of a newer legacy connection", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -868,11 +933,36 @@ it.effect("fails over a pinned provider session only after its host disconnects"
   ),
 );
 
-it.effect("lets the browser host resolve an active tab locally", () =>
+it.effect("rejects click success without a native dispatch marker", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const broker = yield* makeBroker;
-      const requests = requestsFrom(yield* broker.connect(makeHost()));
+      const requests = requestsFrom(yield* broker.connect(makeClickHost()));
+      yield* Stream.runForEach(requests, (request) =>
+        broker.respond({
+          clientId: "client-1",
+          connectionId: request.connectionId,
+          requestId: request.requestId,
+          ok: true,
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* Effect.yieldNow;
+
+      const error = yield* broker
+        .invoke<void>({ scope, operation: "click", input: { x: 10, y: 10 } })
+        .pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(PreviewAutomationMalformedResponseError);
+      expect(error).toMatchObject({ operation: "click", clientId: "client-1" });
+    }),
+  ),
+);
+
+it.effect("accepts confirmed click dispatch while resolving an active tab locally", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* makeBroker;
+      const requests = requestsFrom(yield* broker.connect(makeClickHost()));
       let routedTabId: string | undefined;
       yield* Stream.runForEach(requests, (request) => {
         routedTabId = request.tabId;
@@ -881,6 +971,7 @@ it.effect("lets the browser host resolve an active tab locally", () =>
           connectionId: request.connectionId,
           requestId: request.requestId,
           ok: true,
+          result: { _tag: "PreviewAutomationClickDispatched" },
         });
       }).pipe(Effect.forkScoped);
       yield* Effect.yieldNow;

@@ -67,10 +67,21 @@ export function HostedBrowserWebview(props: {
         fittedSourceContent: current?.fittedSourceContent ?? null,
         rect: resolveBrowserSurfacePanelRect(state.byTabId, runtimeTabId),
         visible: current?.visible ?? false,
+        automationClickHolds: current?.automationClickHolds ?? 0,
       };
     }),
   );
   usePreviewBridge({ threadRef, tabId, runtimeTabId });
+  const desiredActive = presentation.visible && presentation.rect !== null;
+  const active =
+    (desiredActive || presentation.automationClickHolds > 0) && presentation.rect !== null;
+  const lastRect = presentation.rect;
+  const activeRef = useRef(active);
+  const registeredWebviewRef = useRef<{
+    readonly attachmentId: string;
+    readonly webContentsId: number;
+  } | null>(null);
+  activeRef.current = active;
 
   useEffect(() => {
     crashRecoveryRef.current = INITIAL_WEBVIEW_CRASH_RECOVERY_STATE;
@@ -113,7 +124,35 @@ export function HostedBrowserWebview(props: {
           if (disposed || webviewRef.current !== webview) return;
           const webContentsId = webview.getWebContentsId();
           if (Number.isInteger(webContentsId) && webContentsId > 0) {
-            await bridge.registerWebview(runtimeTabId, webContentsId);
+            const registration = await bridge.registerWebview(runtimeTabId, webContentsId);
+            if (disposed || webviewRef.current !== webview) return;
+            if (!registration) return;
+            registeredWebviewRef.current = {
+              attachmentId: registration.attachmentId,
+              webContentsId,
+            };
+            webview.setAttribute("data-preview-attachment-id", registration.attachmentId);
+            webview.setAttribute("data-preview-web-contents-id", String(webContentsId));
+            const setWebviewVisibility = bridge.setWebviewVisibility;
+            if (setWebviewVisibility) {
+              const visible = activeRef.current;
+              if (!visible) webview.removeAttribute("data-preview-main-visible");
+              await setWebviewVisibility(
+                runtimeTabId,
+                webContentsId,
+                registration.attachmentId,
+                visible,
+              );
+              if (
+                !disposed &&
+                webviewRef.current === webview &&
+                registeredWebviewRef.current?.attachmentId === registration.attachmentId &&
+                activeRef.current === visible
+              ) {
+                if (visible) webview.setAttribute("data-preview-main-visible", "true");
+                else webview.removeAttribute("data-preview-main-visible");
+              }
+            }
           }
         } catch {
           // did-attach/dom-ready will retry if the guest was not ready yet.
@@ -143,11 +182,51 @@ export function HostedBrowserWebview(props: {
       webview.removeEventListener("did-attach", register);
       webview.removeEventListener("dom-ready", register);
       webview.removeEventListener("render-process-gone", recoverGuest);
+      const registeredWebview = registeredWebviewRef.current;
+      if (registeredWebview !== null) {
+        registeredWebviewRef.current = null;
+        webview.removeAttribute("data-preview-attachment-id");
+        webview.removeAttribute("data-preview-web-contents-id");
+        webview.removeAttribute("data-preview-main-visible");
+        void bridge
+          .setWebviewVisibility?.(
+            runtimeTabId,
+            registeredWebview.webContentsId,
+            registeredWebview.attachmentId,
+            false,
+          )
+          .catch(() => undefined);
+      }
     };
   }, [config, initialSrc, runtimeTabId, webviewGeneration]);
 
-  const active = presentation.visible && presentation.rect !== null;
-  const lastRect = presentation.rect;
+  useEffect(() => {
+    const registeredWebview = registeredWebviewRef.current;
+    const setWebviewVisibility = previewBridge?.setWebviewVisibility;
+    if (registeredWebview === null || !setWebviewVisibility) return;
+    const webview = webviewRef.current;
+    if (!active) webview?.removeAttribute("data-preview-main-visible");
+    void setWebviewVisibility(
+      runtimeTabId,
+      registeredWebview.webContentsId,
+      registeredWebview.attachmentId,
+      active,
+    ).then(
+      () => {
+        if (
+          webviewRef.current !== webview ||
+          registeredWebviewRef.current?.attachmentId !== registeredWebview.attachmentId ||
+          activeRef.current !== active
+        ) {
+          return;
+        }
+        if (active) webview?.setAttribute("data-preview-main-visible", "true");
+        else webview?.removeAttribute("data-preview-main-visible");
+      },
+      () => undefined,
+    );
+  }, [active, runtimeTabId]);
+
   const normalizedZoomFactor = Number.isFinite(zoomFactor) && zoomFactor > 0 ? zoomFactor : 1;
   const viewportWidth = viewport._tag === "fill" ? null : viewport.width;
   const viewportHeight = viewport._tag === "fill" ? null : viewport.height;

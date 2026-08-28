@@ -329,6 +329,12 @@ export const PreviewAutomationClickInput = Schema.Struct({
   });
 export type PreviewAutomationClickInput = typeof PreviewAutomationClickInput.Type;
 
+export const PreviewAutomationClickDispatched = Schema.TaggedStruct(
+  "PreviewAutomationClickDispatched",
+  {},
+);
+export type PreviewAutomationClickDispatched = typeof PreviewAutomationClickDispatched.Type;
+
 export const PreviewAutomationTypeInput = Schema.Struct({
   ...PreviewAutomationTabTargetFields,
   text: Schema.String.annotate({ description: "Literal text to insert." }),
@@ -574,6 +580,9 @@ export const PreviewAutomationHostIdentity = Schema.Struct({
 });
 export type PreviewAutomationHostIdentity = typeof PreviewAutomationHostIdentity.Type;
 
+export const PreviewAutomationHostCapability = Schema.Literals(["click-visible-only-v1"]);
+export type PreviewAutomationHostCapability = typeof PreviewAutomationHostCapability.Type;
+
 export const PreviewAutomationHost = Schema.Struct({
   ...PreviewAutomationHostIdentity.fields,
   /**
@@ -581,6 +590,7 @@ export const PreviewAutomationHost = Schema.Struct({
    * a newer server safely coexist with an older desktop during rollout.
    */
   supportedOperations: Schema.optional(Schema.Array(PreviewAutomationOperation)),
+  capabilities: Schema.optional(Schema.Array(PreviewAutomationHostCapability)),
 });
 export type PreviewAutomationHost = typeof PreviewAutomationHost.Type;
 
@@ -726,6 +736,19 @@ export class PreviewAutomationTabNotFoundError extends Schema.TaggedErrorClass<P
   }
 }
 
+export class PreviewAutomationTabNotVisibleError extends Schema.TaggedErrorClass<PreviewAutomationTabNotVisibleError>()(
+  "PreviewAutomationTabNotVisibleError",
+  {
+    ...PreviewAutomationRequestErrorFields,
+    operation: Schema.Literal("click"),
+    ...PreviewAutomationRemoteDiagnosticFields,
+  },
+) {
+  override get message(): string {
+    return `Preview tab ${this.tabId ?? "unassigned"} is hidden. No mouse input was sent. Show the tab before clicking.`;
+  }
+}
+
 export class PreviewAutomationTimeoutError extends Schema.TaggedErrorClass<PreviewAutomationTimeoutError>()(
   "PreviewAutomationTimeoutError",
   {
@@ -861,6 +884,7 @@ export const PreviewAutomationError = Schema.Union([
   PreviewAutomationNoAvailableHostError,
   PreviewAutomationUnsupportedClientError,
   PreviewAutomationTabNotFoundError,
+  PreviewAutomationTabNotVisibleError,
   PreviewAutomationTimeoutError,
   PreviewAutomationControlInterruptedError,
   PreviewAutomationExecutionError,

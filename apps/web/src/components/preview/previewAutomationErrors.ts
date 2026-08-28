@@ -1,5 +1,7 @@
 import {
+  type DesktopPreviewAutomationClickResult,
   EnvironmentId,
+  PreviewAutomationClickDispatched,
   type PreviewAutomationHost,
   PreviewAutomationOperation,
   type PreviewAutomationRequest,
@@ -134,6 +136,41 @@ export class PreviewAutomationTargetNotEditableHostError extends Schema.TaggedEr
   }
 }
 
+export class PreviewAutomationTabNotVisibleHostError extends Schema.TaggedErrorClass<PreviewAutomationTabNotVisibleHostError>()(
+  "PreviewAutomationTabNotVisibleHostError",
+  {
+    requestId: TrimmedNonEmptyString,
+    operation: Schema.Literal("click"),
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    tabId: PreviewTabId,
+  },
+) {
+  get responseTag() {
+    return "PreviewAutomationTabNotVisibleError" as const;
+  }
+
+  override get message(): string {
+    return `Preview tab ${this.tabId} is hidden. No mouse input was sent. Show the tab before clicking.`;
+  }
+}
+
+export function confirmPreviewAutomationClickDispatched(
+  result: DesktopPreviewAutomationClickResult | void,
+  context: PreviewAutomationOperationContext & {
+    readonly operation: "click";
+    readonly tabId: PreviewTabId;
+  },
+): PreviewAutomationClickDispatched {
+  if (result?._tag === "Dispatched") {
+    return { _tag: "PreviewAutomationClickDispatched" };
+  }
+  if (result?._tag === "NotSent") {
+    throw new PreviewAutomationTabNotVisibleHostError(context);
+  }
+  throw new Error("Desktop preview did not confirm native click dispatch.");
+}
+
 const targetNotEditableDiagnostics = (
   cause: unknown,
 ): {
@@ -212,6 +249,7 @@ export const PreviewAutomationHostError = Schema.Union([
   PreviewAutomationTargetUnavailableError,
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetNotEditableHostError,
+  PreviewAutomationTabNotVisibleHostError,
   PreviewAutomationOperationError,
 ]);
 export type PreviewAutomationHostError = typeof PreviewAutomationHostError.Type;

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
   acquireBrowserSurface,
+  acquireBrowserSurfaceClickPresentation,
   resolveBrowserSurfacePanelRect,
   useBrowserSurfaceStore,
 } from "./browserSurfaceStore";
@@ -148,6 +149,26 @@ describe("browserSurfaceStore", () => {
       visible: false,
       owner: null,
     });
+  });
+
+  it("pins only visible surfaces through owner changes during a native click", () => {
+    const tabId = "click-presentation-surface";
+    expect(acquireBrowserSurfaceClickPresentation(tabId)).toBeNull();
+
+    const initialSurface = acquireBrowserSurface(tabId);
+    initialSurface.present({ x: 10, y: 20, width: 900, height: 640 }, true);
+    const clickPresentation = acquireBrowserSurfaceClickPresentation(tabId);
+    expect(clickPresentation).not.toBeNull();
+    expect(useBrowserSurfaceStore.getState().byTabId[tabId]?.automationClickHolds).toBe(1);
+
+    acquireBrowserSurface(tabId);
+    expect(useBrowserSurfaceStore.getState().byTabId[tabId]).toMatchObject({
+      visible: false,
+      automationClickHolds: 1,
+    });
+
+    clickPresentation?.release();
+    expect(useBrowserSurfaceStore.getState().byTabId[tabId]?.automationClickHolds).toBeUndefined();
   });
 
   it("clears fitted presentation state when its lease is released", () => {
