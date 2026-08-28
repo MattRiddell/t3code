@@ -68,6 +68,12 @@ const rectEquals = (left: BrowserSurfaceRect | null, right: BrowserSurfaceRect):
   left.width === right.width &&
   left.height === right.height;
 
+const rectsOverlap = (left: BrowserSurfaceRect, right: BrowserSurfaceRect): boolean =>
+  left.x < right.x + right.width &&
+  left.x + left.width > right.x &&
+  left.y < right.y + right.height &&
+  left.y + left.height > right.y;
+
 export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) => ({
   byTabId: {},
   claim: (tabId, owner, fitSourceContent) =>
@@ -215,11 +221,15 @@ export function acquireBrowserSurfaceClickPresentation(
   useBrowserSurfaceStore.setState((state) => {
     const current = state.byTabId[tabId];
     if (!current?.visible || current.rect === null) return state;
-    const anotherTabHasClickPresentation = Object.entries(state.byTabId).some(
+    const currentRect = current.rect;
+    const anotherTabHasOverlappingClickPresentation = Object.entries(state.byTabId).some(
       ([candidateTabId, presentation]) =>
-        candidateTabId !== tabId && (presentation.automationClickHolds ?? 0) > 0,
+        candidateTabId !== tabId &&
+        (presentation.automationClickHolds ?? 0) > 0 &&
+        presentation.rect !== null &&
+        rectsOverlap(currentRect, presentation.rect),
     );
-    if (anotherTabHasClickPresentation) return state;
+    if (anotherTabHasOverlappingClickPresentation) return state;
     acquired = true;
     return {
       byTabId: {

@@ -195,7 +195,7 @@ describe("browserSurfaceStore", () => {
     ).toBeUndefined();
   });
 
-  it("rejects concurrent click presentation holds on different tabs", () => {
+  it("rejects concurrent click presentation holds on overlapping tabs", () => {
     const firstTabId = "first-click-browser-surface";
     const secondTabId = "second-click-browser-surface";
     const rect = { x: 10, y: 20, width: 900, height: 640 };
@@ -218,6 +218,40 @@ describe("browserSurfaceStore", () => {
     const secondTabClickPresentation = acquireBrowserSurfaceClickPresentation(secondTabId);
     expect(secondTabClickPresentation).not.toBeNull();
     secondTabClickPresentation?.release();
+  });
+
+  it("allows concurrent click presentation holds when tab edges only touch", () => {
+    const firstTabId = "first-edge-browser-surface";
+    const secondTabId = "second-edge-browser-surface";
+    const firstSurface = acquireBrowserSurface(firstTabId);
+    const secondSurface = acquireBrowserSurface(secondTabId);
+    firstSurface.present({ x: 10, y: 20, width: 900, height: 640 }, true);
+    secondSurface.present({ x: 910, y: 20, width: 360, height: 203 }, true);
+
+    const firstClickPresentation = acquireBrowserSurfaceClickPresentation(firstTabId);
+    const secondClickPresentation = acquireBrowserSurfaceClickPresentation(secondTabId);
+
+    expect(firstClickPresentation).not.toBeNull();
+    expect(secondClickPresentation).not.toBeNull();
+    firstClickPresentation?.release();
+    secondClickPresentation?.release();
+  });
+
+  it("allows concurrent click presentation holds on disjoint main and mini-player surfaces", () => {
+    const mainTabId = "main-browser-surface";
+    const miniPlayerTabId = "mini-player-browser-surface";
+    const mainSurface = acquireBrowserSurface(mainTabId);
+    const miniPlayerSurface = acquireBrowserSurface(miniPlayerTabId);
+    mainSurface.present({ x: 24, y: 80, width: 960, height: 720 }, true);
+    miniPlayerSurface.present({ x: 1_100, y: 620, width: 360, height: 203 }, true);
+
+    const mainClickPresentation = acquireBrowserSurfaceClickPresentation(mainTabId);
+    const miniPlayerClickPresentation = acquireBrowserSurfaceClickPresentation(miniPlayerTabId);
+
+    expect(mainClickPresentation).not.toBeNull();
+    expect(miniPlayerClickPresentation).not.toBeNull();
+    mainClickPresentation?.release();
+    miniPlayerClickPresentation?.release();
   });
 
   it("clears fitted presentation state when its lease is released", () => {
