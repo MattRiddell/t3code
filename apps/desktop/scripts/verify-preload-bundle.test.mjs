@@ -3,12 +3,29 @@ import { assert, describe, it } from "vite-plus/test";
 import { verifyPreloadBundle } from "./verify-preload-bundle.mjs";
 
 const validPreload = `
-  "desktopBridge getClientPlatform getLocalEnvironmentBootstrap";
-  "PICK_FOLDER_CHANNEL __clerk_internal_electron_passkeys";
-  require("electron");
+  const electron = require("electron");
+  const PICK_FOLDER_CHANNEL = "desktop:pick-folder";
+  electron.contextBridge.exposeInMainWorld("__clerk_internal_electron_passkeys", {});
+  electron.contextBridge.exposeInMainWorld("desktopBridge", {
+    getClientPlatform: () => process.platform,
+    getLocalEnvironmentBootstraps: () => [],
+    pickFolder: (options) => electron.ipcRenderer.invoke(PICK_FOLDER_CHANNEL, options),
+  });
 `;
 
 describe("desktop preload bundle verifier", () => {
+  it("rejects required API names that only appear in strings", () => {
+    assert.throws(
+      () =>
+        verifyPreloadBundle(`
+          "desktopBridge getClientPlatform getLocalEnvironmentBootstraps pickFolder";
+          "__clerk_internal_electron_passkeys";
+          require("electron");
+        `),
+      /missing executable APIs/,
+    );
+  });
+
   it("rejects dynamic imports with comments before the opening parenthesis", () => {
     assert.throws(
       () =>

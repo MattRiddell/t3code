@@ -2,19 +2,36 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeURL from "node:url";
 import { parse } from "acorn";
 
-const expectedSymbols = [
-  "desktopBridge",
+const expectedDesktopBridgeApis = [
   "getClientPlatform",
-  "getLocalEnvironmentBootstrap",
-  "PICK_FOLDER_CHANNEL",
-  "__clerk_internal_electron_passkeys",
+  "getLocalEnvironmentBootstraps",
+  "pickFolder",
 ];
+const clerkPasskeysGlobal = "__clerk_internal_electron_passkeys";
 
 const isSyntaxNode = (value) =>
   typeof value === "object" && value !== null && "type" in value && typeof value.type === "string";
 
-const readRuntimeImports = (source) => {
+const readStaticName = (node) => {
+  if (node.type === "Identifier") return node.name;
+  if (node.type === "Literal" && typeof node.value === "string") return node.value;
+  return undefined;
+};
+
+const readMemberName = (node) => {
+  if (node.type !== "MemberExpression") return undefined;
+  if (!node.computed && node.property.type === "Identifier") return node.property.name;
+  return readStaticName(node.property);
+};
+
+const isContextBridge = (node) =>
+  (node.type === "Identifier" && node.name === "contextBridge") ||
+  (node.type === "MemberExpression" && readMemberName(node) === "contextBridge");
+
+const inspectBundle = (source) => {
   const runtimeImports = [];
+  const exposedGlobals = new Set();
+  const desktopBridgeApis = new Set();
   const visit = (node) => {
     if (node.type === "ImportExpression") {
       throw new Error("Desktop preload bundle contains a dynamic import() call");
@@ -33,6 +50,25 @@ const readRuntimeImports = (source) => {
       }
     }
 
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "MemberExpression" &&
+      readMemberName(node.callee) === "exposeInMainWorld" &&
+      isContextBridge(node.callee.object)
+    ) {
+      const [globalName, api] = node.arguments;
+      const name = globalName === undefined ? undefined : readStaticName(globalName);
+      if (name !== undefined) exposedGlobals.add(name);
+
+      if (name === "desktopBridge" && api?.type === "ObjectExpression") {
+        for (const property of api.properties) {
+          if (property.type !== "Property") continue;
+          const propertyName = readStaticName(property.key);
+          if (propertyName !== undefined) desktopBridgeApis.add(propertyName);
+        }
+      }
+    }
+
     for (const child of Object.values(node)) {
       if (Array.isArray(child)) {
         for (const item of child) {
@@ -45,17 +81,18 @@ const readRuntimeImports = (source) => {
   };
 
   visit(parse(source, { ecmaVersion: "latest", sourceType: "script" }));
-  return runtimeImports;
+  return { desktopBridgeApis, exposedGlobals, runtimeImports };
 };
 
 export const verifyPreloadBundle = (source) => {
-  const missingSymbols = expectedSymbols.filter((symbol) => !source.includes(symbol));
+  const { desktopBridgeApis, exposedGlobals, runtimeImports } = inspectBundle(source);
+  const missingApis = expectedDesktopBridgeApis.filter((api) => !desktopBridgeApis.has(api));
+  if (!exposedGlobals.has("desktopBridge")) missingApis.unshift("desktopBridge exposure");
+  if (!exposedGlobals.has(clerkPasskeysGlobal)) missingApis.push(`${clerkPasskeysGlobal} exposure`);
 
-  if (missingSymbols.length > 0) {
-    throw new Error(`Desktop preload bundle is missing: ${missingSymbols.join(", ")}`);
+  if (missingApis.length > 0) {
+    throw new Error(`Desktop preload bundle is missing executable APIs: ${missingApis.join(", ")}`);
   }
-
-  const runtimeImports = readRuntimeImports(source);
 
   const sandboxModules = new Set(["electron", "events", "timers", "url"]);
   const unsupportedImports = [...new Set(runtimeImports)]
