@@ -21,7 +21,11 @@ const runtimeImports = [...source.matchAll(runtimeImportPattern)].map((match) =>
 const runtimeRequireCount = [...source.matchAll(/\brequire\s*\(/g)].length;
 
 if (runtimeImports.length !== runtimeRequireCount) {
-  throw new Error("Desktop preload bundle contains a dynamic runtime import");
+  throw new Error("Desktop preload bundle contains a dynamic require() call");
+}
+
+if (/\bimport\s*\(/.test(source)) {
+  throw new Error("Desktop preload bundle contains a dynamic import() call");
 }
 
 const sandboxModules = new Set(["electron", "events", "timers", "url"]);
