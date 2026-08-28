@@ -14,15 +14,12 @@ export function PullRequestsUnavailableState({
   title = "Could not load pull requests",
   error,
   onRetry,
-  browserLink,
+  gitHubUrl,
 }: {
   title?: string;
   error: string;
   onRetry?: () => void;
-  browserLink?: {
-    readonly href: string;
-    readonly label: string;
-  };
+  gitHubUrl?: string;
 }) {
   return (
     <Empty className="px-4 py-16 md:px-4">
@@ -35,7 +32,7 @@ export function PullRequestsUnavailableState({
             shows its message rather than trying to infer one from the failure text. */}
         <EmptyDescription>{error}</EmptyDescription>
       </EmptyHeader>
-      {onRetry || browserLink ? (
+      {onRetry || gitHubUrl ? (
         <EmptyContent className="flex-row flex-wrap justify-center gap-2">
           {onRetry ? (
             <Button size="sm" variant="outline" onClick={onRetry}>
@@ -43,14 +40,14 @@ export function PullRequestsUnavailableState({
               Retry
             </Button>
           ) : null}
-          {browserLink ? (
+          {gitHubUrl ? (
             <Button
               size="sm"
               variant="outline"
-              render={<a href={browserLink.href} target="_blank" rel="noopener noreferrer" />}
+              render={<a href={gitHubUrl} target="_blank" rel="noopener noreferrer" />}
             >
               <ExternalLinkIcon aria-hidden className="size-3.5" />
-              {browserLink.label}
+              Open on GitHub
             </Button>
           ) : null}
         </EmptyContent>

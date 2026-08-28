@@ -3,10 +3,10 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import {
   changeRequestRepositoryUrl,
   findProjectForChangeRequest,
+  gitHubPullRequestBrowserUrl,
   matchesLinkedPullRequestUrl,
   openPullRequestLink,
   parseChangeRequestUrl,
-  pullRequestBrowserUrl,
   PullRequestLinkOpenError,
   shouldOpenPullRequestExternally,
 } from "./openPullRequestLink";
@@ -24,7 +24,7 @@ function repositoryIdentity(
   };
 }
 
-describe("pullRequestBrowserUrl", () => {
+describe("gitHubPullRequestBrowserUrl", () => {
   it("uses the requested GitHub repository instead of the project's default repository", () => {
     const identity = repositoryIdentity(
       "github",
@@ -32,7 +32,7 @@ describe("pullRequestBrowserUrl", () => {
       "https://github.com/acme/default.git",
     );
 
-    expect(pullRequestBrowserUrl(identity, "acme/other", 42)).toBe(
+    expect(gitHubPullRequestBrowserUrl(identity, "acme/other", 42)).toBe(
       "https://github.com/acme/other/pull/42",
     );
   });
@@ -44,94 +44,72 @@ describe("pullRequestBrowserUrl", () => {
       "http://token@github.acme.test:8443/team/default.git",
     );
 
-    expect(pullRequestBrowserUrl(identity, "platform/api", 7)).toBe(
+    expect(gitHubPullRequestBrowserUrl(identity, "platform/api", 7)).toBe(
       "http://github.acme.test:8443/platform/api/pull/7",
     );
   });
 
-  it("preserves a nested GitLab repository path from an SSH remote", () => {
-    const identity = repositoryIdentity(
-      "gitlab",
-      "gitlab.acme.test/group/default",
-      "git@gitlab.acme.test:group/default.git",
-    );
+  it.each([
+    {
+      name: "SSH",
+      remoteUrl: "git@github.acme.test:team/default.git",
+    },
+    {
+      name: "git protocol",
+      remoteUrl: "git://github.acme.test/team/default.git",
+    },
+  ])("uses the normalized host for a $name remote", ({ remoteUrl }) => {
+    const identity = repositoryIdentity("github", "github.acme.test/team/default", remoteUrl);
 
-    expect(pullRequestBrowserUrl(identity, "team/platform/api", 9)).toBe(
-      "https://gitlab.acme.test/team/platform/api/-/merge_requests/9",
+    expect(gitHubPullRequestBrowserUrl(identity, "platform/api", 9)).toBe(
+      "https://github.acme.test/platform/api/pull/9",
     );
   });
 
-  it("builds a Bitbucket pull request URL", () => {
-    const identity = repositoryIdentity(
-      "bitbucket",
-      "bitbucket.org/workspace/default",
-      "git://bitbucket.org/workspace/default.git",
-    );
-
-    expect(pullRequestBrowserUrl(identity, "workspace/repository", 5)).toBe(
-      "https://bitbucket.org/workspace/repository/pull-requests/5",
-    );
-  });
-
-  it("uses Azure DevOps remote context with the requested repository name", () => {
-    const identity = repositoryIdentity(
-      "azure-devops",
-      "dev.azure.com/acme/platform/_git/default",
-      "https://user:token@dev.azure.com/acme/platform/_git/default.git",
-    );
-
-    expect(pullRequestBrowserUrl(identity, "checkout", 17)).toBe(
-      "https://dev.azure.com/acme/platform/_git/checkout/pullrequest/17",
-    );
-  });
-
-  it("converts an Azure DevOps SSH remote to its browser URL", () => {
-    const identity = repositoryIdentity(
-      "azure-devops",
-      "ssh.dev.azure.com/v3/acme/platform/default",
-      "git@ssh.dev.azure.com:v3/acme/platform/default",
-    );
-
-    expect(pullRequestBrowserUrl(identity, "checkout", 17)).toBe(
-      "https://dev.azure.com/acme/platform/_git/checkout/pullrequest/17",
-    );
-    expect(pullRequestBrowserUrl(identity, "v3/acme/payments/checkout", 18)).toBe(
-      "https://dev.azure.com/acme/payments/_git/checkout/pullrequest/18",
-    );
-    expect(pullRequestBrowserUrl(identity, "acme/payments/_git/checkout", 19)).toBe(
-      "https://dev.azure.com/acme/payments/_git/checkout/pullrequest/19",
-    );
-  });
-
-  it("keeps a full Azure DevOps repository path from a linked pull request", () => {
-    const identity = repositoryIdentity(
-      "azure-devops",
-      "dev.azure.com/acme/platform/_git/default",
-      "https://dev.azure.com/acme/platform/_git/default.git",
-    );
-
-    expect(pullRequestBrowserUrl(identity, "acme/payments/_git/checkout", 17)).toBe(
-      "https://dev.azure.com/acme/payments/_git/checkout/pullrequest/17",
-    );
-  });
-
-  it("returns null without a supported repository identity", () => {
-    const unknown = repositoryIdentity(
-      "unknown",
-      "code.example.test/acme/repository",
-      "https://code.example.test/acme/repository.git",
-    );
-
-    expect(pullRequestBrowserUrl(null, "acme/repository", 1)).toBeNull();
-    expect(pullRequestBrowserUrl(unknown, "acme/repository", 1)).toBeNull();
+  it("returns null for missing or invalid GitHub data", () => {
+    expect(gitHubPullRequestBrowserUrl(null, "acme/repository", 1)).toBeNull();
     expect(
-      pullRequestBrowserUrl(
+      gitHubPullRequestBrowserUrl(
+        repositoryIdentity("github", "github.com/acme/repository", "https://github.com/a/b"),
+        "acme",
+        1,
+      ),
+    ).toBeNull();
+    expect(
+      gitHubPullRequestBrowserUrl(
+        repositoryIdentity("github", "github.com/acme/repository", "https://github.com/a/b"),
+        "../repository",
+        1,
+      ),
+    ).toBeNull();
+    expect(
+      gitHubPullRequestBrowserUrl(
+        repositoryIdentity("github", "github.com/acme/repository", "https://github.com/a/b"),
+        "acme/repository",
+        0,
+      ),
+    ).toBeNull();
+    expect(
+      gitHubPullRequestBrowserUrl(
         repositoryIdentity("github", "bad host/acme/repository", "not a remote"),
         "acme/repository",
         1,
       ),
     ).toBeNull();
   });
+
+  it.each(["gitlab", "bitbucket", "azure-devops", "unknown"])(
+    "does not build a fallback for %s",
+    (provider) => {
+      expect(
+        gitHubPullRequestBrowserUrl(
+          repositoryIdentity(provider, "github.com/acme/repository", "https://github.com/a/b"),
+          "acme/repository",
+          1,
+        ),
+      ).toBeNull();
+    },
+  );
 });
 
 describe("changeRequestRepositoryUrl", () => {
