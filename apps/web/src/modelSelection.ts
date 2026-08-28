@@ -244,14 +244,24 @@ export function resolveAppModelSelectionForInstance(
   settings: UnifiedSettings,
   providers: ReadonlyArray<ServerProvider>,
   selectedModel: string | null | undefined,
+  resolutionOptions?: { readonly preserveUnavailableSelection?: boolean },
 ): string | null {
   const entry = deriveProviderInstanceEntries(providers).find(
     (candidate) => candidate.instanceId === instanceId,
   );
   if (!entry) return null;
   const options = getAppModelOptionsForInstance(settings, entry);
+  const resolvedSelection = resolveSelectableModel(entry.driverKind, selectedModel, options);
+  if (resolvedSelection) {
+    return resolvedSelection;
+  }
+  if (resolutionOptions?.preserveUnavailableSelection) {
+    const unavailableSelection = normalizeCustomModelSlug(selectedModel);
+    if (unavailableSelection) {
+      return unavailableSelection;
+    }
+  }
   return (
-    resolveSelectableModel(entry.driverKind, selectedModel, options) ??
     options.find((option) => option.isDefault)?.slug ??
     options[0]?.slug ??
     entry.models.find((model) => model.isDefault)?.slug ??

@@ -299,6 +299,34 @@ describe("instance-scoped model selection", () => {
     ).toBe("claude-sonnet-4-6");
   });
 
+  it("preserves an existing OpenCode model when a catalog refresh no longer contains it", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("opencode"),
+        instanceId: "opencode",
+        models: ["opencode/big-pickle"],
+      }),
+    ];
+
+    expect(
+      resolveAppModelSelectionForInstance(
+        ProviderInstanceId.make("opencode"),
+        settingsWithProviderInstances(),
+        providers,
+        "opencode/kimi-k3",
+        { preserveUnavailableSelection: true },
+      ),
+    ).toBe("opencode/kimi-k3");
+    expect(
+      resolveAppModelSelectionForInstance(
+        ProviderInstanceId.make("opencode"),
+        settingsWithProviderInstances(),
+        providers,
+        "opencode/kimi-k3",
+      ),
+    ).toBe("opencode/big-pickle");
+  });
+
   it("preserves custom provider instances in settings model selection", () => {
     const providers = [
       provider({
