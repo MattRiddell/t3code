@@ -5,11 +5,15 @@ import type {
   DesktopPreviewTabState,
 } from "@t3tools/contracts";
 import { exposeClerkBridge } from "@clerk/electron/preload";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as Effect from "effect/Effect";
 import { contextBridge, ipcRenderer } from "electron";
 
 import * as IpcChannels from "./ipc/channels.ts";
 
 exposeClerkBridge({ passkeys: true });
+
+const clientPlatform = Effect.runSync(HostProcessPlatform);
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
   if (
@@ -35,6 +39,7 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     }
     return result as ReturnType<DesktopBridge["getAppBranding"]>;
   },
+  getClientPlatform: () => clientPlatform,
   getSystemLocale: () => {
     const result = ipcRenderer.sendSync(IpcChannels.GET_SYSTEM_LOCALE_CHANNEL);
     return typeof result === "string" ? result : null;
