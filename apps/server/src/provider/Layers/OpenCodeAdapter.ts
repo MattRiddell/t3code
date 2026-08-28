@@ -274,6 +274,7 @@ interface OpenCodeSessionContext {
   activeVariant: string | undefined;
   cancellation: OpenCodeCancellation | undefined;
   interruptedTurnId: TurnId | undefined;
+  reconcileIdleStatus: boolean;
   /**
    * One-shot guard flipped by `stopOpenCodeContext` / `emitUnexpectedExit`.
    * The session lifecycle is owned by `sessionScope`; this Ref exists only
@@ -720,6 +721,16 @@ export function makeOpenCodeAdapter(
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
 
+    const isOpenCodeSessionCurrentlyIdle = Effect.fn("isOpenCodeSessionCurrentlyIdle")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const response = yield* runOpenCodeSdk("session.status", () =>
+        context.client.session.status(),
+      ).pipe(Effect.orElseSucceed(() => undefined));
+      const status = response?.data?.[context.openCodeSessionId];
+      return response?.data !== undefined && (status?.type ?? "idle") === "idle";
+    });
+
     const completeOpenCodeTurn = Effect.fn("completeOpenCodeTurn")(function* (
       context: OpenCodeSessionContext,
       turnId: TurnId,
@@ -754,6 +765,7 @@ export function makeOpenCodeAdapter(
         return;
       }
       context.interruptedTurnId = turnId;
+      context.reconcileIdleStatus = true;
       if (context.cancellation?.turnId === turnId) {
         context.cancellation = undefined;
       }
@@ -1163,13 +1175,6 @@ export function makeOpenCodeAdapter(
 
         case "session.status": {
           if (event.properties.status.type === "busy") {
-            if (
-              context.interruptedTurnId !== undefined &&
-              context.activeTurnId !== undefined &&
-              context.interruptedTurnId !== context.activeTurnId
-            ) {
-              context.interruptedTurnId = undefined;
-            }
             yield* updateProviderSession(context, {
               status: "running",
               activeTurnId: turnId,
@@ -1197,9 +1202,10 @@ export function makeOpenCodeAdapter(
               context.cancellation.deferredIdleEvent = event;
               break;
             }
-            if (context.interruptedTurnId !== undefined && context.interruptedTurnId !== turnId) {
+            if (context.reconcileIdleStatus && !(yield* isOpenCodeSessionCurrentlyIdle(context))) {
               break;
             }
+            context.interruptedTurnId = undefined;
             yield* completeOpenCodeTurn(context, turnId, event);
           }
           break;
@@ -1535,6 +1541,7 @@ export function makeOpenCodeAdapter(
           activeVariant: undefined,
           cancellation: undefined,
           interruptedTurnId: undefined,
+          reconcileIdleStatus: false,
           stopped: yield* Ref.make(false),
           sessionScope: started.sessionScope,
         };
@@ -1706,7 +1713,7 @@ export function makeOpenCodeAdapter(
         const cancellation: OpenCodeCancellation | undefined = interruptedTurnId
           ? {
               turnId: interruptedTurnId,
-              completion: yield* Deferred.make<void, ProviderAdapterRequestError>(),
+              completion: Deferred.makeUnsafe<void, ProviderAdapterRequestError>(),
             }
           : undefined;
         if (cancellation) {

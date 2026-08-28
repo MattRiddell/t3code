@@ -75,6 +75,7 @@ const runtimeMock = {
       requestID: string;
       answers: ReadonlyArray<ReadonlyArray<string>>;
     }>,
+    sessionStatus: "idle" as "idle" | "busy",
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -98,6 +99,7 @@ const runtimeMock = {
     this.state.subscribedEvents = [];
     this.state.permissionReplyCalls.length = 0;
     this.state.questionReplyCalls.length = 0;
+    this.state.sessionStatus = "idle";
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -188,6 +190,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           runtimeMock.state.abortCalls.push(sessionID);
           await runtimeMock.state.abortImplementation?.(sessionID);
         },
+        status: async () => ({
+          data:
+            runtimeMock.state.sessionStatus === "idle"
+              ? {}
+              : { "http://127.0.0.1:9999/session": { type: "busy" as const } },
+        }),
         promptAsync: async (input: unknown) => {
           runtimeMock.state.promptCalls.push(input);
           if (runtimeMock.state.promptAsyncError) {
@@ -1218,10 +1226,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const firstInterrupt = yield* adapter
         .interruptTurn(threadId, turn.turnId)
         .pipe(Effect.forkChild);
-      yield* Effect.promise(() => abortStarted.promise);
       const secondInterrupt = yield* adapter
         .interruptTurn(threadId, turn.turnId)
         .pipe(Effect.forkChild);
+      yield* Effect.promise(() => abortStarted.promise);
       yield* Effect.yieldNow;
       NodeAssert.equal(runtimeMock.state.abortCalls.length, 1);
 
@@ -1241,18 +1249,20 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect("ignores delayed stop events until the next turn becomes busy", () =>
+  it.effect("ignores delayed stop events after the next turn becomes busy", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-delayed-interrupt-events");
+      const nextBusy = promiseWithResolvers<unknown>();
       const staleAbort = promiseWithResolvers<unknown>();
       const staleIdle = promiseWithResolvers<unknown>();
-      const nextBusy = promiseWithResolvers<unknown>();
+      const secondStaleIdle = promiseWithResolvers<unknown>();
       const nextIdle = promiseWithResolvers<unknown>();
       runtimeMock.state.subscribedEvents = [
+        nextBusy.promise,
         staleAbort.promise,
         staleIdle.promise,
-        nextBusy.promise,
+        secondStaleIdle.promise,
         nextIdle.promise,
       ];
 
@@ -1285,6 +1295,15 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         ),
       });
 
+      runtimeMock.state.sessionStatus = "busy";
+      nextBusy.resolve({
+        id: "evt-next-busy",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "busy" },
+        },
+      });
       staleAbort.resolve({
         id: "evt-delayed-abort",
         type: "session.error",
@@ -1301,25 +1320,26 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           status: { type: "idle" },
         },
       });
+      secondStaleIdle.resolve({
+        id: "evt-second-delayed-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
       for (let index = 0; index < 4; index += 1) {
         yield* Effect.yieldNow;
       }
 
-      const sessionsBeforeBusy = yield* adapter.listSessions();
-      const sessionBeforeBusy = sessionsBeforeBusy.find(
+      const sessionsBeforeRealIdle = yield* adapter.listSessions();
+      const sessionBeforeRealIdle = sessionsBeforeRealIdle.find(
         (candidate) => candidate.threadId === threadId,
       );
-      NodeAssert.equal(sessionBeforeBusy?.status, "running");
-      NodeAssert.equal(sessionBeforeBusy?.activeTurnId, secondTurn.turnId);
+      NodeAssert.equal(sessionBeforeRealIdle?.status, "running");
+      NodeAssert.equal(sessionBeforeRealIdle?.activeTurnId, secondTurn.turnId);
 
-      nextBusy.resolve({
-        id: "evt-next-busy",
-        type: "session.status",
-        properties: {
-          sessionID: "http://127.0.0.1:9999/session",
-          status: { type: "busy" },
-        },
-      });
+      runtimeMock.state.sessionStatus = "idle";
       nextIdle.resolve({
         id: "evt-next-idle",
         type: "session.status",
