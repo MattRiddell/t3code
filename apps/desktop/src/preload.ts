@@ -5,15 +5,14 @@ import type {
   DesktopPreviewTabState,
 } from "@t3tools/contracts";
 import { exposeClerkBridge } from "@clerk/electron/preload";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
-import * as Effect from "effect/Effect";
 import { contextBridge, ipcRenderer } from "electron";
 
 import * as IpcChannels from "./ipc/channels.ts";
 
 exposeClerkBridge({ passkeys: true });
 
-const clientPlatform = Effect.runSync(HostProcessPlatform);
+// oxlint-disable-next-line t3code/no-global-process-runtime -- Electron exposes the client platform in its sandboxed preload process.
+const clientPlatform = process.platform;
 
 function unwrapEnsureSshEnvironmentResult(result: unknown) {
   if (

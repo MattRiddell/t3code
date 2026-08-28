@@ -8,7 +8,7 @@ and pushes to `main`:
 - **Check**: `vp check` (format and lint; this repo sets `typeCheck: false` in its lint options),
   then `vpr typecheck` for the workspace type check. The same job
   builds the desktop pipeline (`vp run build:desktop`) and verifies the preload bundle exists and
-  still exports its expected symbols.
+  still exports its expected symbols without runtime imports that Electron's sandbox cannot load.
 - **Test**: `vp run test` across the workspace.
 - **Mobile Native Static Analysis**: `vp run lint:mobile` on macOS, wrapping
   `scripts/mobile-native-static-check.ts`. A cheap Linux **Mobile Native Changes** job gates it:
