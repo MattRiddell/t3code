@@ -56,6 +56,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -4763,6 +4764,61 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         type: "keybindingsUpdated",
         payload: { keybindings: [], issues: [] },
       });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("skips OpenCode only for the subscribeServerConfig background refresh", () =>
+    Effect.gen(function* () {
+      const refreshCalls = yield* Ref.make<
+        ReadonlyArray<{
+          readonly provider: ProviderDriverKind | undefined;
+          readonly exclude: ReadonlySet<ProviderDriverKind> | undefined;
+        }>
+      >([]);
+      const subscriptionRefreshDone = yield* Deferred.make<void>();
+
+      yield* buildAppUnderTest({
+        layers: {
+          providerRegistry: {
+            refresh: (provider, options) =>
+              Ref.update(refreshCalls, (calls) => [
+                ...calls,
+                { provider, exclude: options?.exclude },
+              ]).pipe(
+                Effect.andThen(
+                  options?.exclude
+                    ? Deferred.succeed(subscriptionRefreshDone, undefined).pipe(Effect.ignore)
+                    : Effect.void,
+                ),
+                Effect.as([]),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const snapshotFiber = yield* client[WS_METHODS.subscribeServerConfig]({}).pipe(
+              Stream.runHead,
+              Effect.forkChild,
+            );
+            yield* Deferred.await(subscriptionRefreshDone);
+            yield* client[WS_METHODS.serverRefreshProviders]({});
+            yield* Fiber.join(snapshotFiber);
+          }),
+        ),
+      );
+
+      const calls = yield* Ref.get(refreshCalls);
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0]?.provider, undefined);
+      assert.deepEqual(calls[0]?.exclude ? Array.from(calls[0].exclude) : [], [
+        ProviderDriverKind.make("opencode"),
+      ]);
+      assert.equal(calls[1]?.provider, undefined);
+      assert.equal(calls[1]?.exclude, undefined);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

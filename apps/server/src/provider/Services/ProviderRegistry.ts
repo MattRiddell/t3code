@@ -36,7 +36,10 @@ export interface ProviderRegistryShape {
    *
    * @deprecated prefer `refreshInstance` for new call sites.
    */
-  readonly refresh: (provider?: ProviderDriverKind) => Effect.Effect<ReadonlyArray<ServerProvider>>;
+  readonly refresh: (
+    provider?: ProviderDriverKind,
+    options?: { readonly exclude?: ReadonlySet<ProviderDriverKind> },
+  ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
   /**
    * Refresh the specific configured instance. Returns the updated snapshot

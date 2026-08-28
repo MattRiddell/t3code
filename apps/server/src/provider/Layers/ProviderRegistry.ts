@@ -95,6 +95,10 @@ const shouldRetainMissingProviderModels = (provider: ServerProvider): boolean =>
   return isPendingInitialProbe || didInstalledProviderProbeFail;
 };
 
+const shouldRetainMissingOpenCodeMetadata = (provider: ServerProvider): boolean =>
+  provider.driver === ProviderDriverKind.make("opencode") &&
+  shouldRetainMissingProviderModels(provider);
+
 const mergeProviderModels = (
   provider: ServerProvider,
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
@@ -132,6 +136,16 @@ export const mergeProviderSnapshot = (
     : {
         ...nextProvider,
         models: mergeProviderModels(nextProvider, previousProvider.models, nextProvider.models),
+        ...(shouldRetainMissingOpenCodeMetadata(nextProvider)
+          ? {
+              slashCommands:
+                nextProvider.slashCommands.length === 0
+                  ? previousProvider.slashCommands
+                  : nextProvider.slashCommands,
+              skills:
+                nextProvider.skills.length === 0 ? previousProvider.skills : nextProvider.skills,
+            }
+          : {}),
       };
 
 export const mergeProviderSnapshots = (
@@ -461,17 +475,25 @@ export const ProviderRegistryLive = Layer.effect(
       );
     });
 
-    const refreshAll = Effect.fn("refreshAll")(function* () {
+    const refreshAll = Effect.fn("refreshAll")(function* (
+      exclude?: ReadonlySet<ProviderDriverKind>,
+    ) {
       const sources = yield* getLiveSources;
-      return yield* Effect.forEach(sources, (source) => refreshOneSource(source), {
+      const sourcesToRefresh = exclude
+        ? sources.filter((source) => !exclude.has(source.driverKind))
+        : sources;
+      return yield* Effect.forEach(sourcesToRefresh, (source) => refreshOneSource(source), {
         concurrency: "unbounded",
         discard: true,
       }).pipe(Effect.andThen(Ref.get(providersRef)));
     });
 
-    const refresh = Effect.fn("refresh")(function* (provider?: ProviderDriverKind) {
+    const refresh = Effect.fn("refresh")(function* (
+      provider?: ProviderDriverKind,
+      options?: { readonly exclude?: ReadonlySet<ProviderDriverKind> },
+    ) {
       if (provider === undefined) {
-        return yield* refreshAll();
+        return yield* refreshAll(options?.exclude);
       }
       // Kind-scoped refreshes target the default instance for that driver.
       const defaultInstanceId = defaultInstanceIdForDriver(provider);
@@ -706,8 +728,10 @@ export const ProviderRegistryLive = Layer.effect(
 
     return {
       getProviders: Ref.get(providersRef),
-      refresh: (provider?: ProviderDriverKind) =>
-        refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
+      refresh: (
+        provider?: ProviderDriverKind,
+        options?: { readonly exclude?: ReadonlySet<ProviderDriverKind> },
+      ) => refresh(provider, options).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>
         refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
       getProviderMaintenanceCapabilitiesForInstance,

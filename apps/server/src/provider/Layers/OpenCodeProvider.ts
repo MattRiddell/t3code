@@ -24,6 +24,7 @@ import {
   type OpenCodeInventory,
 } from "../opencodeRuntime.ts";
 import type { Agent, ProviderListResponse } from "@opencode-ai/sdk/v2";
+import type { OpenCodeServerOwner } from "../OpenCodeServerOwner.ts";
 
 const OPENCODE_PRESENTATION = {
   displayName: "OpenCode",
@@ -329,6 +330,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
   openCodeSettings: OpenCodeSettings,
   cwd: string,
   environment?: NodeJS.ProcessEnv,
+  serverOwner?: OpenCodeServerOwner,
 ): Effect.fn.Return<ServerProviderDraft, never, OpenCodeRuntime> {
   const openCodeRuntime = yield* OpenCodeRuntime;
   const resolvedEnvironment = environment ?? process.env;
@@ -425,25 +427,30 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
     }
   }
 
-  const inventoryExit = yield* Effect.exit(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const server = yield* openCodeRuntime.connectToOpenCodeServer({
-          binaryPath: openCodeSettings.binaryPath,
-          ...(isExternalServer ? { serverUrl: openCodeSettings.serverUrl } : {}),
-          environment: resolvedEnvironment,
-        });
-        return yield* openCodeRuntime.loadOpenCodeInventory(
-          openCodeRuntime.createOpenCodeSdkClient({
-            baseUrl: server.url,
-            directory: cwd,
-            ...(openCodeSettings.serverPassword
-              ? { serverPassword: openCodeSettings.serverPassword }
-              : {}),
-          }),
-        );
+  const loadInventory = (server: { readonly url: string }) =>
+    openCodeRuntime.loadOpenCodeInventory(
+      openCodeRuntime.createOpenCodeSdkClient({
+        baseUrl: server.url,
+        directory: cwd,
+        ...(openCodeSettings.serverPassword
+          ? { serverPassword: openCodeSettings.serverPassword }
+          : {}),
       }),
-    ).pipe(
+    );
+  const inventoryEffect = isExternalServer
+    ? loadInventory({ url: openCodeSettings.serverUrl })
+    : serverOwner
+      ? serverOwner.withServer(loadInventory)
+      : Effect.scoped(
+          openCodeRuntime
+            .connectToOpenCodeServer({
+              binaryPath: openCodeSettings.binaryPath,
+              environment: resolvedEnvironment,
+            })
+            .pipe(Effect.flatMap(loadInventory)),
+        );
+  const inventoryExit = yield* Effect.exit(
+    inventoryEffect.pipe(
       Effect.mapError(
         (cause) => new OpenCodeProbeError({ cause, detail: openCodeRuntimeErrorDetail(cause) }),
       ),

@@ -589,18 +589,35 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               }),
             },
           ],
-          slashCommands: [],
-          skills: [],
+          slashCommands: [{ name: "review", description: "Review changes" }],
+          skills: [
+            {
+              name: "typescript",
+              description: "TypeScript help",
+              path: "/skills/typescript/SKILL.md",
+              enabled: true,
+            },
+          ],
         } as const satisfies ServerProvider;
         const refreshedProvider = {
           ...previousProvider,
           checkedAt: "2026-04-14T00:01:00.000Z",
           models: [],
+          slashCommands: [],
+          skills: [],
         } satisfies ServerProvider;
 
         assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
           ...previousProvider.models,
         ]);
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider).slashCommands,
+          [],
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider).skills,
+          [],
+        );
       });
 
       it("drops stale OpenCode models missing from a successful refresh", () => {
@@ -670,8 +687,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               capabilities: null,
             },
           ],
-          slashCommands: [],
-          skills: [],
+          slashCommands: [{ name: "review", description: "Review changes" }],
+          skills: [
+            {
+              name: "typescript",
+              description: "TypeScript help",
+              path: "/skills/typescript/SKILL.md",
+              enabled: true,
+            },
+          ],
         } as const satisfies ServerProvider;
         const refreshedProvider = {
           ...previousProvider,
@@ -685,6 +709,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, refreshedProvider).models, [
           ...previousProvider.models,
         ]);
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider).slashCommands,
+          previousProvider.slashCommands,
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, refreshedProvider).skills,
+          previousProvider.skills,
+        );
       });
 
       it("classifies pending, logout, uninstall, and reconnect OpenCode inventories", () => {
@@ -713,8 +745,15 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               capabilities: null,
             },
           ],
-          slashCommands: [],
-          skills: [],
+          slashCommands: [{ name: "review", description: "Review changes" }],
+          skills: [
+            {
+              name: "typescript",
+              description: "TypeScript help",
+              path: "/skills/typescript/SKILL.md",
+              enabled: true,
+            },
+          ],
         } as const satisfies ServerProvider;
         const pendingProvider = {
           ...previousProvider,
@@ -732,6 +771,8 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           auth: { status: "unknown" },
           checkedAt: "2026-07-17T00:02:00.000Z",
           models: [],
+          slashCommands: [],
+          skills: [],
           message: "OpenCode is available, but it did not report any connected upstream providers.",
         } satisfies ServerProvider;
         const missingProvider = {
@@ -763,6 +804,14 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
         ]);
         assert.deepStrictEqual(
           mergeProviderSnapshot(previousProvider, loggedOutProvider).models,
+          [],
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, loggedOutProvider).slashCommands,
+          [],
+        );
+        assert.deepStrictEqual(
+          mergeProviderSnapshot(previousProvider, loggedOutProvider).skills,
           [],
         );
         assert.deepStrictEqual(mergeProviderSnapshot(previousProvider, missingProvider).models, []);
@@ -893,6 +942,107 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             assert.deepStrictEqual(yield* registry.getProviders, [initialProvider]);
             assert.strictEqual(yield* Ref.get(refreshCalls), 0);
           }).pipe(Effect.provide(runtimeServices));
+        }),
+      );
+
+      it.effect("refreshes other providers while excluding OpenCode", () =>
+        Effect.gen(function* () {
+          const codexDriver = ProviderDriverKind.make("codex");
+          const openCodeDriver = ProviderDriverKind.make("opencode");
+          const codexInstanceId = ProviderInstanceId.make("codex");
+          const openCodeInstanceId = ProviderInstanceId.make("opencode");
+          const codexRefreshCalls = yield* Ref.make(0);
+          const openCodeRefreshCalls = yield* Ref.make(0);
+          const makeProvider = (
+            instanceId: ProviderInstanceId,
+            driver: ProviderDriverKind,
+          ): ServerProvider => ({
+            instanceId,
+            driver,
+            status: "ready",
+            enabled: true,
+            installed: true,
+            auth: { status: "authenticated" },
+            checkedAt: "2026-06-10T00:00:00.000Z",
+            version: "1.0.0",
+            models: [],
+            slashCommands: [],
+            skills: [],
+          });
+          const makeInstance = (input: {
+            readonly instanceId: ProviderInstanceId;
+            readonly driver: ProviderDriverKind;
+            readonly refreshCalls: Ref.Ref<number>;
+          }): ProviderInstance => {
+            const provider = makeProvider(input.instanceId, input.driver);
+            return {
+              instanceId: input.instanceId,
+              driverKind: input.driver,
+              continuationIdentity: {
+                driverKind: input.driver,
+                continuationKey: `${input.driver}:instance:${input.instanceId}`,
+              },
+              displayName: undefined,
+              enabled: true,
+              snapshot: {
+                maintenanceCapabilities: makeManualOnlyProviderMaintenanceCapabilities({
+                  provider: input.driver,
+                  packageName: null,
+                }),
+                getSnapshot: Effect.succeed(provider),
+                refresh: Ref.update(input.refreshCalls, (count) => count + 1).pipe(
+                  Effect.as(provider),
+                ),
+                streamChanges: Stream.empty,
+              },
+              adapter: {} as ProviderInstance["adapter"],
+              textGeneration: {} as ProviderInstance["textGeneration"],
+            };
+          };
+          const instances = [
+            makeInstance({
+              instanceId: codexInstanceId,
+              driver: codexDriver,
+              refreshCalls: codexRefreshCalls,
+            }),
+            makeInstance({
+              instanceId: openCodeInstanceId,
+              driver: openCodeDriver,
+              refreshCalls: openCodeRefreshCalls,
+            }),
+          ];
+          const instanceRegistryLayer = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: (instanceId) =>
+                Effect.succeed(instances.find((instance) => instance.instanceId === instanceId)),
+              listInstances: Effect.succeed(instances),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.empty,
+              subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+            },
+          );
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+          const runtimeServices = yield* Layer.build(
+            ProviderRegistryLive.pipe(
+              Layer.provideMerge(instanceRegistryLayer),
+              Layer.provideMerge(
+                ServerConfig.layerTest(process.cwd(), {
+                  prefix: "t3-provider-registry-excluded-refresh-",
+                }),
+              ),
+              Layer.provideMerge(NodeServices.layer),
+            ),
+          ).pipe(Scope.provide(scope));
+
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            yield* registry.refresh(undefined, { exclude: new Set([openCodeDriver]) });
+          }).pipe(Effect.provide(runtimeServices));
+
+          assert.strictEqual(yield* Ref.get(codexRefreshCalls), 1);
+          assert.strictEqual(yield* Ref.get(openCodeRefreshCalls), 0);
         }),
       );
 
