@@ -11,6 +11,7 @@ import { beforeEach, expect } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as OpenCodeRuntime from "../provider/opencodeRuntime.ts";
+import * as OpenCodeServerOwner from "../provider/OpenCodeServerOwner.ts";
 import * as OpenCodeTextGeneration from "./OpenCodeTextGeneration.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 
@@ -175,7 +176,10 @@ function withOpenCodeTextGeneration<A, E, R>(
   effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
-    const textGeneration = yield* OpenCodeTextGeneration.makeOpenCodeTextGeneration(settings);
+    const serverOwner = yield* OpenCodeServerOwner.make({ binaryPath: settings.binaryPath });
+    const textGeneration = yield* OpenCodeTextGeneration.makeOpenCodeTextGeneration(settings).pipe(
+      Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner),
+    );
     return yield* effectFn(textGeneration);
   }).pipe(Effect.scoped);
 }

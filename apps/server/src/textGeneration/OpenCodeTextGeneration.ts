@@ -27,10 +27,7 @@ import {
   sanitizeThreadTitle,
 } from "./TextGenerationUtils.ts";
 import * as OpenCodeRuntime from "../provider/opencodeRuntime.ts";
-import {
-  makeOpenCodeServerOwner,
-  type OpenCodeServerOwner,
-} from "../provider/OpenCodeServerOwner.ts";
+import * as OpenCodeServerOwner from "../provider/OpenCodeServerOwner.ts";
 
 const OpenCodeTextGenerationOperation = Schema.Literals([
   "generateCommitMessage",
@@ -175,17 +172,10 @@ function getOpenCodeTextResponse(parts: ReadonlyArray<unknown> | undefined): str
 
 export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration")(function* (
   openCodeSettings: OpenCodeSettings,
-  environment?: NodeJS.ProcessEnv,
-  serverOwner?: OpenCodeServerOwner,
 ) {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const openCodeRuntime = yield* OpenCodeRuntime.OpenCodeRuntime;
-  const effectiveServerOwner =
-    serverOwner ??
-    (yield* makeOpenCodeServerOwner({
-      binaryPath: openCodeSettings.binaryPath,
-      environment: environment ?? process.env,
-    }));
+  const serverOwner = yield* OpenCodeServerOwner.OpenCodeServerOwner;
 
   const runOpenCodeJson = Effect.fn("runOpenCodeJson")(function* <S extends Schema.Top>(input: {
     readonly operation: OpenCodeTextGenerationOperation;
@@ -328,7 +318,7 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
     const rawOutput =
       openCodeSettings.serverUrl.length > 0
         ? yield* runAgainstServer({ url: openCodeSettings.serverUrl })
-        : yield* effectiveServerOwner.withServer(runAgainstServer).pipe(
+        : yield* serverOwner.withServer(runAgainstServer).pipe(
             Effect.mapError((cause) =>
               OpenCodeRuntime.OpenCodeRuntimeError.is(cause)
                 ? new TextGenerationError({

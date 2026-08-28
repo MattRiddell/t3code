@@ -1,36 +1,37 @@
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
-import {
-  OpenCodeRuntime,
-  type OpenCodeRuntimeError,
-  type OpenCodeServerProcess,
-} from "./opencodeRuntime.ts";
+import * as OpenCodeRuntime from "./opencodeRuntime.ts";
 
 export const OPENCODE_SERVER_IDLE_TTL = "30 seconds";
 
 interface OpenCodeServerOwnerState {
-  server: OpenCodeServerProcess | null;
+  server: OpenCodeRuntime.OpenCodeServerProcess | null;
   serverScope: Scope.Closeable | null;
   borrowers: number;
   idleCloseFiber: Fiber.Fiber<void, never> | null;
 }
 
-export interface OpenCodeServerOwner {
-  readonly withServer: <A, E, R>(
-    use: (server: OpenCodeServerProcess) => Effect.Effect<A, E, R>,
-  ) => Effect.Effect<A, E | OpenCodeRuntimeError, R>;
-}
+export class OpenCodeServerOwner extends Context.Service<
+  OpenCodeServerOwner,
+  {
+    readonly withServer: <A, E, R>(
+      use: (server: OpenCodeRuntime.OpenCodeServerProcess) => Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | OpenCodeRuntime.OpenCodeRuntimeError, R>;
+  }
+>()("t3/provider/OpenCodeServerOwner") {}
 
 /** Owns the lazy local OpenCode server shared by one provider instance. */
-export const makeOpenCodeServerOwner = Effect.fn("makeOpenCodeServerOwner")(function* (input: {
+export const make = Effect.fn("OpenCodeServerOwner.make")(function* (input: {
   readonly binaryPath: string;
   readonly environment?: NodeJS.ProcessEnv;
 }) {
-  const runtime = yield* OpenCodeRuntime;
+  const runtime = yield* OpenCodeRuntime.OpenCodeRuntime;
   const ownerScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
     Scope.close(scope, Exit.void),
   );
@@ -51,7 +52,7 @@ export const makeOpenCodeServerOwner = Effect.fn("makeOpenCodeServerOwner")(func
   });
 
   const closeServer = Effect.fn("OpenCodeServerOwner.closeServer")(function* (
-    expected?: OpenCodeServerProcess,
+    expected?: OpenCodeRuntime.OpenCodeServerProcess,
   ) {
     if (expected !== undefined && state.server !== expected) {
       return;
@@ -65,7 +66,7 @@ export const makeOpenCodeServerOwner = Effect.fn("makeOpenCodeServerOwner")(func
   });
 
   const watchServerExit = Effect.fn("OpenCodeServerOwner.watchServerExit")(function* (
-    server: OpenCodeServerProcess,
+    server: OpenCodeRuntime.OpenCodeServerProcess,
   ) {
     yield* server.exitCode;
     yield* mutex.withPermit(
@@ -116,7 +117,7 @@ export const makeOpenCodeServerOwner = Effect.fn("makeOpenCodeServerOwner")(func
     }),
   );
 
-  const releaseServer = (server: OpenCodeServerProcess) =>
+  const releaseServer = (server: OpenCodeRuntime.OpenCodeServerProcess) =>
     mutex.withPermit(
       Effect.gen(function* () {
         if (state.server !== server) {
@@ -154,7 +155,7 @@ export const makeOpenCodeServerOwner = Effect.fn("makeOpenCodeServerOwner")(func
     ),
   );
 
-  return {
+  return OpenCodeServerOwner.of({
     withServer: (use) =>
       Effect.uninterruptibleMask((restore) =>
         restore(acquireServer).pipe(
@@ -163,5 +164,10 @@ export const makeOpenCodeServerOwner = Effect.fn("makeOpenCodeServerOwner")(func
           ),
         ),
       ),
-  } satisfies OpenCodeServerOwner;
+  });
 });
+
+export const layer = (input: {
+  readonly binaryPath: string;
+  readonly environment?: NodeJS.ProcessEnv;
+}) => Layer.effect(OpenCodeServerOwner, make(input));

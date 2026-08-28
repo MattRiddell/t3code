@@ -24,7 +24,7 @@ import {
   type OpenCodeInventory,
 } from "../opencodeRuntime.ts";
 import type { Agent, ProviderListResponse } from "@opencode-ai/sdk/v2";
-import type { OpenCodeServerOwner } from "../OpenCodeServerOwner.ts";
+import * as OpenCodeServerOwner from "../OpenCodeServerOwner.ts";
 
 const OPENCODE_PRESENTATION = {
   displayName: "OpenCode",
@@ -330,9 +330,13 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
   openCodeSettings: OpenCodeSettings,
   cwd: string,
   environment?: NodeJS.ProcessEnv,
-  serverOwner?: OpenCodeServerOwner,
-): Effect.fn.Return<ServerProviderDraft, never, OpenCodeRuntime> {
+): Effect.fn.Return<
+  ServerProviderDraft,
+  never,
+  OpenCodeRuntime | OpenCodeServerOwner.OpenCodeServerOwner
+> {
   const openCodeRuntime = yield* OpenCodeRuntime;
+  const serverOwner = yield* OpenCodeServerOwner.OpenCodeServerOwner;
   const resolvedEnvironment = environment ?? process.env;
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const customModels = openCodeSettings.customModels;
@@ -439,16 +443,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
     );
   const inventoryEffect = isExternalServer
     ? loadInventory({ url: openCodeSettings.serverUrl })
-    : serverOwner
-      ? serverOwner.withServer(loadInventory)
-      : Effect.scoped(
-          openCodeRuntime
-            .connectToOpenCodeServer({
-              binaryPath: openCodeSettings.binaryPath,
-              environment: resolvedEnvironment,
-            })
-            .pipe(Effect.flatMap(loadInventory)),
-        );
+    : serverOwner.withServer(loadInventory);
   const inventoryExit = yield* Effect.exit(
     inventoryEffect.pipe(
       Effect.mapError(

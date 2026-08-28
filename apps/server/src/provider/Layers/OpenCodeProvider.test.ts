@@ -14,6 +14,7 @@ import {
   OpenCodeRuntimeError,
   type OpenCodeRuntimeShape,
 } from "../opencodeRuntime.ts";
+import * as OpenCodeServerOwner from "../OpenCodeServerOwner.ts";
 import { checkOpenCodeProviderStatus } from "./OpenCodeProvider.ts";
 import type { OpenCodeInventory } from "../opencodeRuntime.ts";
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
@@ -64,9 +65,16 @@ const runtimeMock = {
 
 const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   startOpenCodeServerProcess: () =>
-    Effect.succeed({
-      url: "http://127.0.0.1:4301",
-      exitCode: Effect.never,
+    Effect.gen(function* () {
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          runtimeMock.state.closeCalls += 1;
+        }),
+      );
+      return {
+        url: "http://127.0.0.1:4301",
+        exitCode: Effect.never,
+      };
     }),
   connectToOpenCodeServer: ({ serverUrl }) =>
     Effect.gen(function* () {
@@ -140,11 +148,29 @@ const makeOpenCodeSettings = (overrides?: Partial<OpenCodeSettings>): OpenCodeSe
     ...overrides,
   });
 
+const checkProvider = Effect.fn("checkProvider")(function* (
+  settings: OpenCodeSettings,
+  cwd = process.cwd(),
+  environment?: NodeJS.ProcessEnv,
+) {
+  return yield* Effect.scoped(
+    Effect.gen(function* () {
+      const serverOwner = yield* OpenCodeServerOwner.make({
+        binaryPath: settings.binaryPath,
+        ...(environment ? { environment } : {}),
+      });
+      return yield* checkOpenCodeProviderStatus(settings, cwd, environment).pipe(
+        Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner),
+      );
+    }),
+  );
+});
+
 it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
   it.effect("shows a codex-style missing binary message", () =>
     Effect.gen(function* () {
       runtimeMock.state.runVersionError = new Error("spawn opencode ENOENT");
-      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
 
       NodeAssert.equal(snapshot.status, "error");
       NodeAssert.equal(snapshot.installed, false);
@@ -158,7 +184,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
   it.effect("hides generic Effect.tryPromise text for local CLI probe failures", () =>
     Effect.gen(function* () {
       runtimeMock.state.runVersionError = new Error("An error occurred in Effect.tryPromise");
-      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
 
       NodeAssert.equal(snapshot.status, "error");
       NodeAssert.equal(snapshot.installed, true);
@@ -198,7 +224,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
         ],
       };
 
-      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
       const model = snapshot.models.find((entry) => entry.slug === "openai/gpt-5.4");
 
       NodeAssert.ok(model);
@@ -261,7 +287,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
         ],
       };
 
-      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
 
       NodeAssert.deepEqual(
         snapshot.skills.map((skill) => ({
@@ -290,10 +316,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
 
   it.effect("loads local inventory from a scoped OpenCode server", () =>
     Effect.gen(function* () {
-      yield* checkOpenCodeProviderStatus(
-        makeOpenCodeSettings({ serverPassword: "secret-password" }),
-        process.cwd(),
-      );
+      yield* checkProvider(makeOpenCodeSettings({ serverPassword: "secret-password" }));
 
       NodeAssert.deepEqual(runtimeMock.state.sdkClientInputs, [
         {
@@ -310,7 +333,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
   it.effect("reports local model inventory failures without treating them as empty", () =>
     Effect.gen(function* () {
       runtimeMock.state.inventoryError = new Error("opencode models failed");
-      const snapshot = yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
 
       NodeAssert.equal(snapshot.status, "error");
       NodeAssert.equal(snapshot.installed, true);
@@ -327,12 +350,11 @@ it.layer(testLayer)("checkOpenCodeProviderStatus with configured server URL", (i
   it.effect("surfaces a friendly auth error for configured servers", () =>
     Effect.gen(function* () {
       runtimeMock.state.inventoryError = new Error("401 Unauthorized");
-      const snapshot = yield* checkOpenCodeProviderStatus(
+      const snapshot = yield* checkProvider(
         makeOpenCodeSettings({
           serverUrl: "http://127.0.0.1:9999",
           serverPassword: "secret-password",
         }),
-        process.cwd(),
       );
 
       NodeAssert.equal(snapshot.status, "error");
@@ -349,12 +371,11 @@ it.layer(testLayer)("checkOpenCodeProviderStatus with configured server URL", (i
       runtimeMock.state.inventoryError = new Error(
         "fetch failed: connect ECONNREFUSED 127.0.0.1:9999",
       );
-      const snapshot = yield* checkOpenCodeProviderStatus(
+      const snapshot = yield* checkProvider(
         makeOpenCodeSettings({
           serverUrl: "http://127.0.0.1:9999",
           serverPassword: "secret-password",
         }),
-        process.cwd(),
       );
 
       NodeAssert.equal(snapshot.status, "error");

@@ -12,7 +12,7 @@ import {
   OpenCodeRuntimeError,
   type OpenCodeRuntimeShape,
 } from "./opencodeRuntime.ts";
-import { makeOpenCodeServerOwner } from "./OpenCodeServerOwner.ts";
+import * as OpenCodeServerOwner from "./OpenCodeServerOwner.ts";
 
 const unusedRuntimeMethod = () =>
   Effect.fail(
@@ -62,7 +62,7 @@ it.effect("shares concurrent borrowers and closes after the idle TTL", () =>
     const release = yield* Deferred.make<void>();
     yield* Effect.scoped(
       Effect.gen(function* () {
-        const owner = yield* makeOpenCodeServerOwner({ binaryPath: "opencode" });
+        const owner = yield* OpenCodeServerOwner.make({ binaryPath: "opencode" });
         const useServer = owner.withServer((server) =>
           Deferred.await(release).pipe(Effect.as(server.url)),
         );
@@ -87,7 +87,7 @@ it.effect("retries a failed start and closes on owner scope shutdown", () =>
     yield* Ref.set(testRuntime.failNextStart, true);
     yield* Effect.scoped(
       Effect.gen(function* () {
-        const owner = yield* makeOpenCodeServerOwner({ binaryPath: "opencode" });
+        const owner = yield* OpenCodeServerOwner.make({ binaryPath: "opencode" });
         expect(
           (yield* Effect.exit(owner.withServer((server) => Effect.succeed(server.url))))._tag,
         ).toBe("Failure");
@@ -126,7 +126,7 @@ it.effect("invalidates an exited process so the next borrower starts a new one",
 
     yield* Effect.scoped(
       Effect.gen(function* () {
-        const owner = yield* makeOpenCodeServerOwner({ binaryPath: "opencode" });
+        const owner = yield* OpenCodeServerOwner.make({ binaryPath: "opencode" });
         expect(yield* owner.withServer((server) => Effect.succeed(server.url))).toBe(
           "http://127.0.0.1:1",
         );
@@ -170,7 +170,7 @@ it.effect("cleans up an interrupted startup and allows a retry", () =>
 
     yield* Effect.scoped(
       Effect.gen(function* () {
-        const owner = yield* makeOpenCodeServerOwner({ binaryPath: "opencode" });
+        const owner = yield* OpenCodeServerOwner.make({ binaryPath: "opencode" });
         const firstBorrower = yield* owner
           .withServer((server) => Effect.succeed(server.url))
           .pipe(Effect.forkChild);
@@ -191,7 +191,7 @@ it.effect("releases an interrupted borrower and closes after the idle TTL", () =
     const borrowerEntered = yield* Deferred.make<void>();
     yield* Effect.scoped(
       Effect.gen(function* () {
-        const owner = yield* makeOpenCodeServerOwner({ binaryPath: "opencode" });
+        const owner = yield* OpenCodeServerOwner.make({ binaryPath: "opencode" });
         const borrower = yield* owner
           .withServer(() =>
             Deferred.succeed(borrowerEntered, undefined).pipe(Effect.andThen(Effect.never)),
