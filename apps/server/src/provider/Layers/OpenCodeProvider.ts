@@ -437,7 +437,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
           openCodeRuntime.createOpenCodeSdkClient({
             baseUrl: server.url,
             directory: cwd,
-            ...(server.external && openCodeSettings.serverPassword
+            ...(openCodeSettings.serverPassword
               ? { serverPassword: openCodeSettings.serverPassword }
               : {}),
           }),

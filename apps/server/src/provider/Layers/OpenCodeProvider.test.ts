@@ -290,12 +290,16 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
 
   it.effect("loads local inventory from a scoped OpenCode server", () =>
     Effect.gen(function* () {
-      yield* checkOpenCodeProviderStatus(makeOpenCodeSettings(), process.cwd());
+      yield* checkOpenCodeProviderStatus(
+        makeOpenCodeSettings({ serverPassword: "secret-password" }),
+        process.cwd(),
+      );
 
       NodeAssert.deepEqual(runtimeMock.state.sdkClientInputs, [
         {
           baseUrl: "http://127.0.0.1:4301",
           directory: process.cwd(),
+          serverPassword: "secret-password",
         },
       ]);
       NodeAssert.equal(runtimeMock.state.closeCalls, 1);

@@ -385,7 +385,7 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
         const client = openCodeRuntime.createOpenCodeSdkClient({
           baseUrl: server.url,
           directory: input.cwd,
-          ...(openCodeSettings.serverUrl.length > 0 && openCodeSettings.serverPassword
+          ...(openCodeSettings.serverPassword
             ? { serverPassword: openCodeSettings.serverPassword }
             : {}),
         });
