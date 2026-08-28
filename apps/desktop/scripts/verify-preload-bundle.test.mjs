@@ -29,4 +29,11 @@ describe("desktop preload bundle verifier", () => {
       /unsupported sandbox imports: node:fs/,
     );
   });
+
+  it("rejects unsupported optional require calls", () => {
+    assert.throws(
+      () => verifyPreloadBundle(`${validPreload}\nrequire?.("node:fs");`),
+      /unsupported sandbox imports: node:fs/,
+    );
+  });
 });

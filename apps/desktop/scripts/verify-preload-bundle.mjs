@@ -20,11 +20,14 @@ export const verifyPreloadBundle = (source) => {
 
   const triviaPattern = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`;
   const runtimeImportPattern = new RegExp(
-    String.raw`\brequire${triviaPattern}\(${triviaPattern}(["'])([^"']+)\1${triviaPattern}\)`,
+    String.raw`\brequire${triviaPattern}(?:\?\.)?${triviaPattern}\(${triviaPattern}(["'])([^"']+)\1${triviaPattern}\)`,
     "g",
   );
   const runtimeImports = [...source.matchAll(runtimeImportPattern)].map((match) => match[2]);
-  const runtimeRequirePattern = new RegExp(String.raw`\brequire${triviaPattern}\(`, "g");
+  const runtimeRequirePattern = new RegExp(
+    String.raw`\brequire${triviaPattern}(?:\?\.)?${triviaPattern}\(`,
+    "g",
+  );
   const runtimeRequireCount = [...source.matchAll(runtimeRequirePattern)].length;
 
   if (runtimeImports.length !== runtimeRequireCount) {
