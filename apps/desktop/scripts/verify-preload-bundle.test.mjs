@@ -26,6 +26,31 @@ describe("desktop preload bundle verifier", () => {
     );
   });
 
+  it("rejects a required API whose exposed value is not callable", () => {
+    assert.throws(
+      () =>
+        verifyPreloadBundle(
+          validPreload.replace(
+            "getClientPlatform: () => process.platform,",
+            "getClientPlatform: undefined,",
+          ),
+        ),
+      /missing executable APIs: getClientPlatform/,
+    );
+  });
+
+  it("accepts a required API exposed through a function alias", () => {
+    assert.doesNotThrow(() =>
+      verifyPreloadBundle(`
+        const readClientPlatform = () => process.platform;
+        ${validPreload.replace(
+          "getClientPlatform: () => process.platform,",
+          "getClientPlatform: readClientPlatform,",
+        )}
+      `),
+    );
+  });
+
   it("rejects dynamic imports with comments before the opening parenthesis", () => {
     assert.throws(
       () =>
@@ -51,6 +76,19 @@ describe("desktop preload bundle verifier", () => {
     assert.throws(
       () => verifyPreloadBundle(`${validPreload}\nrequire?.("node:fs");`),
       /unsupported sandbox imports: node:fs/,
+    );
+  });
+
+  it("accepts Electron sandbox module aliases", () => {
+    assert.doesNotThrow(() =>
+      verifyPreloadBundle(`
+        ${validPreload}
+        require("electron/common");
+        require("electron/renderer");
+        require("node:events");
+        require("node:timers");
+        require("node:url");
+      `),
     );
   });
 
