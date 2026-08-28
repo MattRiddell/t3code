@@ -4640,7 +4640,6 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     Effect.gen(function* () {
       const config = yield* buildAppUnderTest();
       const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
       const wsUrl = yield* getWsServerUrl("/ws");
 
       yield* Effect.scoped(
@@ -4652,20 +4651,41 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               mimeType: "application/octet-stream",
               sizeBytes: 6,
             });
-            // A chunked body carries no Content-Length, so only the streaming
-            // size cap can stop it. The route must answer, not stall.
-            const response = yield* HttpClient.post(issued.relativeUrl, {
-              body: HttpBody.stream(
-                Stream.make(new Uint8Array(4), new Uint8Array(4), new Uint8Array(4)),
-                "application/octet-stream",
-              ),
+            const NodeHttp = yield* Effect.promise(() => import("node:http"));
+            const uploadUrl = new URL(issued.relativeUrl, yield* getHttpServerUrl());
+            const status = yield* Effect.callback<number, Error>((resume) => {
+              let completed = false;
+              const complete = (result: Effect.Effect<number, Error>) => {
+                if (completed) return;
+                completed = true;
+                resume(result);
+              };
+              const request = NodeHttp.request(
+                uploadUrl,
+                {
+                  method: "POST",
+                  headers: {
+                    "content-type": "application/octet-stream",
+                    "transfer-encoding": "chunked",
+                  },
+                },
+                (response) => {
+                  request.end();
+                  response.resume();
+                  response.once("end", () => complete(Effect.succeed(response.statusCode ?? 0)));
+                  response.once("error", (error) => complete(Effect.fail(error)));
+                },
+              );
+              request.once("error", (error) => complete(Effect.fail(error)));
+              request.flushHeaders();
+              request.write(new Uint8Array(4), () => {
+                request.write(new Uint8Array(4));
+              });
+
+              return Effect.sync(() => request.destroy());
             });
-            assert.equal(response.status, 400);
-            assert.isFalse(
-              yield* fileSystem.exists(
-                path.join(config.attachmentsDir, `${issued.attachmentId}.bin`),
-              ),
-            );
+            assert.equal(status, 400);
+            assert.deepEqual(yield* fileSystem.readDirectory(config.attachmentsDir), []);
           }),
         ),
       );

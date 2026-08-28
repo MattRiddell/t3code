@@ -195,7 +195,6 @@ export const storeAttachmentUpload = Effect.fn("AttachmentUpload.store")(functio
       fileSystem.sink(partPath),
     );
     if (receivedBytes !== claims.sizeBytes) {
-      yield* fileSystem.remove(partPath, { force: true });
       return {
         ok: false,
         status: 400,
@@ -206,20 +205,19 @@ export const storeAttachmentUpload = Effect.fn("AttachmentUpload.store")(functio
     return { ok: true } satisfies StoreAttachmentUploadResult;
   }).pipe(
     Effect.catch((cause) =>
-      fileSystem.remove(partPath, { force: true }).pipe(
-        Effect.orElseSucceed(() => undefined),
-        Effect.andThen(
-          Effect.logError("Failed to persist attachment upload.", {
-            attachmentId: claims.attachmentId,
-            cause,
-          }),
-        ),
+      Effect.logError("Failed to persist attachment upload.", {
+        attachmentId: claims.attachmentId,
+        cause,
+      }).pipe(
         Effect.as({
           ok: false,
           status: 500,
           detail: "Failed to persist upload.",
         } satisfies StoreAttachmentUploadResult),
       ),
+    ),
+    Effect.ensuring(
+      fileSystem.remove(partPath, { force: true }).pipe(Effect.orElseSucceed(() => undefined)),
     ),
   );
 });

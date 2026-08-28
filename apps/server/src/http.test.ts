@@ -102,6 +102,9 @@ describe("downloadContentDisposition", () => {
     expect(downloadContentDisposition("répört.pdf")).toBe(
       `attachment; filename="r_p_rt.pdf"; filename*=UTF-8''r%C3%A9p%C3%B6rt.pdf`,
     );
+    expect(downloadContentDisposition("résumé'(*).pdf")).toBe(
+      `attachment; filename="r_sum_'(*).pdf"; filename*=UTF-8''r%C3%A9sum%C3%A9%27%28%2A%29.pdf`,
+    );
   });
 
   it("does not throw on unpaired surrogates in the filename", () => {

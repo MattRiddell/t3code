@@ -4,7 +4,9 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -194,6 +196,36 @@ describe("AttachmentUpload", () => {
         ok: false,
         status: 400,
       });
+      expect(NodeFS.readdirSync(config.attachmentsDir)).toEqual([]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("removes partial streamed uploads when the upload is interrupted", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const issued = yield* issueAttachmentUploadUrl(uploadInput);
+      const token = issued.relativeUrl.slice(`${ATTACHMENT_UPLOAD_ROUTE_PREFIX}/`.length);
+      const claims = yield* validateAttachmentUploadToken(token);
+      if (!claims) {
+        throw new Error("Expected valid upload claims.");
+      }
+
+      const nextChunkRequested = yield* Deferred.make<void>();
+      const body = Stream.make(new Uint8Array([1, 2, 3])).pipe(
+        Stream.concat(
+          Stream.fromEffect(
+            Deferred.succeed(nextChunkRequested, undefined).pipe(Effect.andThen(Effect.never)),
+          ),
+        ),
+      );
+      const upload = yield* storeAttachmentUpload(claims, body).pipe(Effect.forkScoped);
+
+      yield* Deferred.await(nextChunkRequested);
+      expect(
+        NodeFS.readdirSync(config.attachmentsDir).filter((entry) => entry.endsWith(".part")),
+      ).toHaveLength(1);
+
+      yield* Fiber.interrupt(upload);
       expect(NodeFS.readdirSync(config.attachmentsDir)).toEqual([]);
     }).pipe(Effect.provide(testLayer)),
   );

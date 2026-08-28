@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Stream from "effect/Stream";
 import { cast } from "effect/Function";
 import {
   HttpBody,
@@ -63,11 +64,16 @@ export function downloadContentDisposition(fileName?: string): string {
     return "attachment";
   }
   // toWellFormed: encodeURIComponent throws URIError on unpaired surrogates.
+  // eslint-disable-next-line no-control-regex -- Header filenames must strip ASCII controls.
   const sanitized = fileName.toWellFormed().replace(/[\u0000-\u001f"\\]/g, "_");
   const asciiFallback = sanitized.replace(/[^\u0020-\u007e]/g, "_");
   const needsExtended = asciiFallback !== sanitized;
+  const extendedName = encodeURIComponent(sanitized).replace(
+    /['()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
   return `attachment; filename="${asciiFallback}"${
-    needsExtended ? `; filename*=UTF-8''${encodeURIComponent(sanitized)}` : ""
+    needsExtended ? `; filename*=UTF-8''${extendedName}` : ""
   }`;
 }
 
@@ -311,7 +317,9 @@ export const attachmentUploadRouteLayer = HttpRouter.add(
       });
     }
 
-    const stored = yield* storeAttachmentUpload(claims, request.stream);
+    // Keep the request stream in the route scope until the response is sent.
+    const bodyPull = yield* Stream.toPull(request.stream);
+    const stored = yield* storeAttachmentUpload(claims, Stream.fromPull(Effect.succeed(bodyPull)));
     return stored.ok
       ? HttpServerResponse.empty({ status: 204 })
       : HttpServerResponse.text(stored.detail, { status: stored.status });

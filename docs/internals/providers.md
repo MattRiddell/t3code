@@ -71,6 +71,14 @@ restricted modes. Cursor and Grok use their own provider permission rules.
 The server does not copy attachments into a project or bypass provider approval rules. If an agent
 cannot read an attachment, the user must approve the access or select a runtime mode that permits it.
 
+Updated attachment schemas tolerate unknown attachment members, but old image-only clients still
+cannot decode messages that contain file attachments. Client file-picking rollouts must account for
+this limit.
+
+Do not run an old image-only server against state that contains file attachments. Replay decodes
+each persisted event before projection. A file-bearing event can make `ProjectionPipeline` bootstrap
+and `OrchestrationEngine` startup fail for the entire environment, not only the affected thread.
+
 ## How provider work is requested
 
 Clients never call a provider directly. They dispatch orchestration commands over the RPC method
