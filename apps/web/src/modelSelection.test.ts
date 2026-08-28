@@ -2,6 +2,8 @@ import { ProviderDriverKind, ProviderInstanceId, type ServerProvider } from "@t3
 import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@t3tools/contracts/settings";
 import { describe, expect, it } from "vite-plus/test";
 import { createModelSelection } from "@t3tools/shared/model";
+import { deriveEffectiveComposerModelState } from "./composerDraftStore";
+import { getComposerProviderState } from "./components/chat/composerProviderState";
 import { deriveProviderInstanceEntries } from "./providerInstances";
 import {
   getAppModelOptionsForInstance,
@@ -325,6 +327,74 @@ describe("instance-scoped model selection", () => {
         "opencode/kimi-k3",
       ),
     ).toBe("opencode/big-pickle");
+  });
+
+  it("preserves saved options through dispatch when the model is absent from the catalog", () => {
+    const instanceId = ProviderInstanceId.make("opencode");
+    const driver = ProviderDriverKind.make("opencode");
+    const providers = [provider({ provider: driver, instanceId, models: ["opencode/big-pickle"] })];
+    const saved = createModelSelection(instanceId, "opencode/kimi-k3", [
+      { id: "variant", value: "max" },
+      { id: "agent", value: "build" },
+    ]);
+    const state = deriveEffectiveComposerModelState({
+      draft: null,
+      providers,
+      selectedProvider: driver,
+      selectedInstanceId: instanceId,
+      threadModelSelection: saved,
+      projectModelSelection: null,
+      settings: settingsWithProviderInstances(),
+    });
+    const dispatch = getComposerProviderState({
+      provider: driver,
+      model: state.selectedModel,
+      models: providers[0]!.models,
+      modelOptions: state.modelOptions?.[instanceId],
+      planModeEnabled: false,
+    });
+
+    expect(
+      createModelSelection(instanceId, state.selectedModel, dispatch.modelOptionsForDispatch),
+    ).toEqual(saved);
+  });
+
+  it("keeps an intentional custom-instance draft override through dispatch", () => {
+    const instanceId = ProviderInstanceId.make("claude_openrouter");
+    const driver = ProviderDriverKind.make("claudeAgent");
+    const providers = [
+      provider({ provider: driver, instanceId: "claudeAgent", models: ["claude-opus-5"] }),
+      provider({ provider: driver, instanceId, models: ["claude-opus-5"] }),
+    ];
+    const threadSelection = createModelSelection(instanceId, "claude-opus-5", [
+      { id: "effort", value: "high" },
+    ]);
+    const draftSelection = createModelSelection(instanceId, "openai/draft-model", [
+      { id: "effort", value: "max" },
+    ]);
+    const state = deriveEffectiveComposerModelState({
+      draft: {
+        activeProvider: instanceId,
+        modelSelectionByProvider: { [instanceId]: draftSelection },
+      },
+      providers,
+      selectedProvider: driver,
+      selectedInstanceId: instanceId,
+      threadModelSelection: threadSelection,
+      projectModelSelection: null,
+      settings: settingsWithProviderInstances(),
+    });
+    const dispatch = getComposerProviderState({
+      provider: driver,
+      model: state.selectedModel,
+      models: providers[1]!.models,
+      modelOptions: state.modelOptions?.[instanceId],
+      planModeEnabled: false,
+    });
+
+    expect(
+      createModelSelection(instanceId, state.selectedModel, dispatch.modelOptionsForDispatch),
+    ).toEqual(draftSelection);
   });
 
   it("preserves custom provider instances in settings model selection", () => {
