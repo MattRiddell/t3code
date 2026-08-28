@@ -275,6 +275,7 @@ interface OpenCodeSessionContext {
   cancellation: OpenCodeCancellation | undefined;
   interruptedTurnId: TurnId | undefined;
   reconcileIdleStatus: boolean;
+  awaitingBusyAfterInterruption: boolean;
   /**
    * One-shot guard flipped by `stopOpenCodeContext` / `emitUnexpectedExit`.
    * The session lifecycle is owned by `sessionScope`; this Ref exists only
@@ -721,14 +722,19 @@ export function makeOpenCodeAdapter(
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
 
-    const isOpenCodeSessionCurrentlyIdle = Effect.fn("isOpenCodeSessionCurrentlyIdle")(function* (
+    const shouldAcceptOpenCodeIdleEvent = Effect.fn("shouldAcceptOpenCodeIdleEvent")(function* (
       context: OpenCodeSessionContext,
     ) {
       const response = yield* runOpenCodeSdk("session.status", () =>
         context.client.session.status(),
-      ).pipe(Effect.orElseSucceed(() => undefined));
+      ).pipe(
+        Effect.retry({ times: 1 }),
+        Effect.orElseSucceed(() => undefined),
+      );
       const status = response?.data?.[context.openCodeSessionId];
-      return response?.data !== undefined && (status?.type ?? "idle") === "idle";
+      // A streamed idle remains the fallback after the status request fails.
+      // The busy-event gate below already rejects stale idles from the stopped turn.
+      return response?.data === undefined || (status?.type ?? "idle") === "idle";
     });
 
     const completeOpenCodeTurn = Effect.fn("completeOpenCodeTurn")(function* (
@@ -742,6 +748,7 @@ export function makeOpenCodeAdapter(
       context.activeTurnId = undefined;
       context.activeAgent = undefined;
       context.activeVariant = undefined;
+      context.awaitingBusyAfterInterruption = false;
       yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
       yield* emit({
         ...(yield* buildEventBase({
@@ -766,6 +773,7 @@ export function makeOpenCodeAdapter(
       }
       context.interruptedTurnId = turnId;
       context.reconcileIdleStatus = true;
+      context.awaitingBusyAfterInterruption = false;
       if (context.cancellation?.turnId === turnId) {
         context.cancellation = undefined;
       }
@@ -1175,6 +1183,9 @@ export function makeOpenCodeAdapter(
 
         case "session.status": {
           if (event.properties.status.type === "busy") {
+            if (turnId !== undefined) {
+              context.awaitingBusyAfterInterruption = false;
+            }
             yield* updateProviderSession(context, {
               status: "running",
               activeTurnId: turnId,
@@ -1202,7 +1213,10 @@ export function makeOpenCodeAdapter(
               context.cancellation.deferredIdleEvent = event;
               break;
             }
-            if (context.reconcileIdleStatus && !(yield* isOpenCodeSessionCurrentlyIdle(context))) {
+            if (context.awaitingBusyAfterInterruption) {
+              break;
+            }
+            if (context.reconcileIdleStatus && !(yield* shouldAcceptOpenCodeIdleEvent(context))) {
               break;
             }
             context.interruptedTurnId = undefined;
@@ -1365,7 +1379,7 @@ export function makeOpenCodeAdapter(
               const client = openCodeRuntime.createOpenCodeSdkClient({
                 baseUrl: server.url,
                 directory,
-                ...(server.external && serverPassword ? { serverPassword } : {}),
+                ...(serverPassword ? { serverPassword } : {}),
               });
               const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
               if (mcpSession && !server.external) {
@@ -1542,6 +1556,7 @@ export function makeOpenCodeAdapter(
           cancellation: undefined,
           interruptedTurnId: undefined,
           reconcileIdleStatus: false,
+          awaitingBusyAfterInterruption: false,
           stopped: yield* Ref.make(false),
           sessionScope: started.sessionScope,
         };
@@ -1618,6 +1633,9 @@ export function makeOpenCodeAdapter(
       context.activeTurnId = turnId;
       context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
       context.activeVariant = variant;
+      if (steeringTurnId === undefined) {
+        context.awaitingBusyAfterInterruption = context.interruptedTurnId !== undefined;
+      }
       yield* updateProviderSession(
         context,
         {

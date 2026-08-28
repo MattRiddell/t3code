@@ -76,6 +76,7 @@ const runtimeMock = {
       answers: ReadonlyArray<ReadonlyArray<string>>;
     }>,
     sessionStatus: "idle" as "idle" | "busy",
+    sessionStatusFailures: 0,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -100,6 +101,7 @@ const runtimeMock = {
     this.state.permissionReplyCalls.length = 0;
     this.state.questionReplyCalls.length = 0;
     this.state.sessionStatus = "idle";
+    this.state.sessionStatusFailures = 0;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -190,12 +192,18 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           runtimeMock.state.abortCalls.push(sessionID);
           await runtimeMock.state.abortImplementation?.(sessionID);
         },
-        status: async () => ({
-          data:
-            runtimeMock.state.sessionStatus === "idle"
-              ? {}
-              : { "http://127.0.0.1:9999/session": { type: "busy" as const } },
-        }),
+        status: async () => {
+          if (runtimeMock.state.sessionStatusFailures > 0) {
+            runtimeMock.state.sessionStatusFailures -= 1;
+            throw new Error("status failed");
+          }
+          return {
+            data:
+              runtimeMock.state.sessionStatus === "idle"
+                ? {}
+                : { "http://127.0.0.1:9999/session": { type: "busy" as const } },
+          };
+        },
         promptAsync: async (input: unknown) => {
           runtimeMock.state.promptCalls.push(input);
           if (runtimeMock.state.promptAsyncError) {
@@ -1249,16 +1257,18 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect("ignores delayed stop events after the next turn becomes busy", () =>
+  it.effect("ignores delayed stop events around the next turn startup", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-delayed-interrupt-events");
+      const staleIdleBeforeBusy = promiseWithResolvers<unknown>();
       const nextBusy = promiseWithResolvers<unknown>();
       const staleAbort = promiseWithResolvers<unknown>();
       const staleIdle = promiseWithResolvers<unknown>();
       const secondStaleIdle = promiseWithResolvers<unknown>();
       const nextIdle = promiseWithResolvers<unknown>();
       runtimeMock.state.subscribedEvents = [
+        staleIdleBeforeBusy.promise,
         nextBusy.promise,
         staleAbort.promise,
         staleIdle.promise,
@@ -1294,6 +1304,24 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           "opencode/kimi-k3",
         ),
       });
+
+      staleIdleBeforeBusy.resolve({
+        id: "evt-delayed-idle-before-busy",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+      for (let index = 0; index < 2; index += 1) {
+        yield* Effect.yieldNow;
+      }
+      const sessionsBeforeBusy = yield* adapter.listSessions();
+      const sessionBeforeBusy = sessionsBeforeBusy.find(
+        (candidate) => candidate.threadId === threadId,
+      );
+      NodeAssert.equal(sessionBeforeBusy?.status, "running");
+      NodeAssert.equal(sessionBeforeBusy?.activeTurnId, secondTurn.turnId);
 
       runtimeMock.state.sessionStatus = "busy";
       nextBusy.resolve({
@@ -1340,6 +1368,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(sessionBeforeRealIdle?.activeTurnId, secondTurn.turnId);
 
       runtimeMock.state.sessionStatus = "idle";
+      runtimeMock.state.sessionStatusFailures = 2;
       nextIdle.resolve({
         id: "evt-next-idle",
         type: "session.status",
