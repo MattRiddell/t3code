@@ -12,6 +12,7 @@ describe("resolveHostedBrowserWebviewWrapperStyle", () => {
         active: true,
         rect: { x: 12, y: 34, width: 800, height: 600 },
         hiddenSize: { width: 1280, height: 800 },
+        interactive: true,
       }),
     ).toEqual({
       left: 12,
@@ -30,6 +31,7 @@ describe("resolveHostedBrowserWebviewWrapperStyle", () => {
         cornerRadius: 12,
         rect: { x: 12, y: 34, width: 360, height: 203 },
         hiddenSize: { width: 1280, height: 800 },
+        interactive: true,
       }),
     ).toMatchObject({
       left: 12,
@@ -47,15 +49,18 @@ describe("resolveHostedBrowserWebviewWrapperStyle", () => {
       active: true,
       rect,
       hiddenSize,
+      interactive: true,
     });
     const heldStyle = resolveHostedBrowserWebviewWrapperStyle({
       active: true,
       automationClickHeld: true,
       rect,
       hiddenSize,
+      interactive: false,
     });
 
     expect(heldStyle.zIndex).toBeGreaterThan(selectedStyle.zIndex);
+    expect(heldStyle.pointerEvents).toBe("none");
   });
 
   it("keeps an inactive webview paintable while moving it offscreen", () => {
@@ -63,6 +68,7 @@ describe("resolveHostedBrowserWebviewWrapperStyle", () => {
       active: false,
       rect: { x: 12, y: 34, width: 800, height: 600 },
       hiddenSize: { width: 393, height: 852 },
+      interactive: false,
     });
 
     expect(style).toEqual({

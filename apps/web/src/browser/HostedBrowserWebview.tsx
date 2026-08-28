@@ -254,7 +254,8 @@ export function HostedBrowserWebview(props: {
           height: hiddenContentSize?.height ?? lastRect?.height ?? 800,
         };
   const containerSize = active && lastRect ? lastRect : hiddenSize;
-  const deviceToolbarVisible = active && viewport._tag !== "fill" && !presentation.fitSourceContent;
+  const deviceToolbarVisible =
+    desiredActive && viewport._tag !== "fill" && !presentation.fitSourceContent;
   const {
     activeDrag,
     commitViewportChange,
@@ -316,6 +317,7 @@ export function HostedBrowserWebview(props: {
     cornerRadius: presentation.cornerRadius,
     rect: lastRect,
     hiddenSize,
+    interactive: desiredActive,
   });
 
   return (
@@ -361,7 +363,7 @@ export function HostedBrowserWebview(props: {
                 ? Math.max(1, Math.round(layout.viewportHeight / normalizedZoomFactor))
                 : effectiveViewport.height
           }
-          aria-hidden={active ? undefined : true}
+          aria-hidden={desiredActive ? undefined : true}
           className={cn(
             "absolute flex overflow-hidden bg-background",
             active && !layout.fillsPanel && "ring-1 ring-border/70 shadow-sm",
@@ -375,7 +377,7 @@ export function HostedBrowserWebview(props: {
             transformOrigin: "top left",
           }}
         />
-        {active && effectiveViewport._tag !== "fill" && !fittedSourceViewport ? (
+        {desiredActive && effectiveViewport._tag !== "fill" && !fittedSourceViewport ? (
           <>
             <BrowserViewportResizeHandles
               layout={layout}
