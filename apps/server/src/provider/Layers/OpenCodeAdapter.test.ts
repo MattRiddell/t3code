@@ -1184,6 +1184,171 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("shares one abort request across concurrent stops", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-concurrent-interrupt");
+      const abortStarted = promiseWithResolvers<void>();
+      const abortRelease = promiseWithResolvers<void>();
+      runtimeMock.state.abortImplementation = async () => {
+        abortStarted.resolve(undefined);
+        await abortRelease.promise;
+      };
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Keep working",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+
+      const firstInterrupt = yield* adapter
+        .interruptTurn(threadId, turn.turnId)
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => abortStarted.promise);
+      const secondInterrupt = yield* adapter
+        .interruptTurn(threadId, turn.turnId)
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      NodeAssert.equal(runtimeMock.state.abortCalls.length, 1);
+
+      abortRelease.resolve(undefined);
+      yield* Fiber.join(firstInterrupt);
+      yield* Fiber.join(secondInterrupt);
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events
+          .filter((event) => event.type === "turn.completed" || event.type === "turn.aborted")
+          .map((event) => event.type),
+        ["turn.aborted"],
+      );
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("ignores delayed stop events until the next turn becomes busy", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-delayed-interrupt-events");
+      const staleAbort = promiseWithResolvers<unknown>();
+      const staleIdle = promiseWithResolvers<unknown>();
+      const nextBusy = promiseWithResolvers<unknown>();
+      const nextIdle = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [
+        staleAbort.promise,
+        staleIdle.promise,
+        nextBusy.promise,
+        nextIdle.promise,
+      ];
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(6),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const firstTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "First turn",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      yield* adapter.interruptTurn(threadId, firstTurn.turnId);
+      const secondTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "Second turn",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+
+      staleAbort.resolve({
+        id: "evt-delayed-abort",
+        type: "session.error",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+        },
+      });
+      staleIdle.resolve({
+        id: "evt-delayed-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+      for (let index = 0; index < 4; index += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      const sessionsBeforeBusy = yield* adapter.listSessions();
+      const sessionBeforeBusy = sessionsBeforeBusy.find(
+        (candidate) => candidate.threadId === threadId,
+      );
+      NodeAssert.equal(sessionBeforeBusy?.status, "running");
+      NodeAssert.equal(sessionBeforeBusy?.activeTurnId, secondTurn.turnId);
+
+      nextBusy.resolve({
+        id: "evt-next-busy",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "busy" },
+        },
+      });
+      nextIdle.resolve({
+        id: "evt-next-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events
+          .filter(
+            (event) =>
+              event.type === "turn.completed" ||
+              event.type === "turn.aborted" ||
+              event.type === "runtime.error",
+          )
+          .map((event) => ({ type: event.type, turnId: event.turnId })),
+        [
+          { type: "turn.aborted", turnId: firstTurn.turnId },
+          { type: "turn.completed", turnId: secondTurn.turnId },
+        ],
+      );
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("keeps a genuine provider error visible during a pending user stop", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

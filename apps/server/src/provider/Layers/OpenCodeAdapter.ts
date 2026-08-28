@@ -15,6 +15,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -182,6 +183,7 @@ type OpenCodeSessionStatusEvent = Extract<
 
 interface OpenCodeCancellation {
   readonly turnId: TurnId;
+  readonly completion: Deferred.Deferred<void, ProviderAdapterRequestError>;
   deferredIdleEvent?: OpenCodeSessionStatusEvent;
 }
 
@@ -1195,6 +1197,9 @@ export function makeOpenCodeAdapter(
               context.cancellation.deferredIdleEvent = event;
               break;
             }
+            if (context.interruptedTurnId !== undefined && context.interruptedTurnId !== turnId) {
+              break;
+            }
             yield* completeOpenCodeTurn(context, turnId, event);
           }
           break;
@@ -1211,12 +1216,6 @@ export function makeOpenCodeAdapter(
           ) {
             if (activeTurnId !== undefined && cancellation?.turnId === activeTurnId) {
               yield* interruptOpenCodeTurn(context, activeTurnId, event);
-            } else {
-              yield* updateProviderSession(
-                context,
-                { status: "ready" },
-                { clearActiveTurnId: true, clearLastError: true },
-              );
             }
             break;
           }
@@ -1697,8 +1696,18 @@ export function makeOpenCodeAdapter(
           return;
         }
         const interruptedTurnId = turnId ?? activeTurnId;
+        if (interruptedTurnId && context.interruptedTurnId === interruptedTurnId) {
+          return;
+        }
+        const existingCancellation = context.cancellation;
+        if (interruptedTurnId && existingCancellation?.turnId === interruptedTurnId) {
+          return yield* Deferred.await(existingCancellation.completion);
+        }
         const cancellation: OpenCodeCancellation | undefined = interruptedTurnId
-          ? { turnId: interruptedTurnId }
+          ? {
+              turnId: interruptedTurnId,
+              completion: yield* Deferred.make<void, ProviderAdapterRequestError>(),
+            }
           : undefined;
         if (cancellation) {
           context.cancellation = cancellation;
@@ -1711,6 +1720,9 @@ export function makeOpenCodeAdapter(
         );
         if (Exit.isFailure(abortExit)) {
           if (interruptedTurnId && context.interruptedTurnId === interruptedTurnId) {
+            if (cancellation) {
+              yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
+            }
             return;
           }
           if (cancellation && context.cancellation === cancellation) {
@@ -1723,11 +1735,17 @@ export function makeOpenCodeAdapter(
               );
             }
           }
+          if (cancellation) {
+            yield* Deferred.done(cancellation.completion, abortExit).pipe(Effect.ignore);
+          }
           return yield* Effect.failCause(abortExit.cause);
         }
 
         if (cancellation && context.cancellation === cancellation) {
           yield* interruptOpenCodeTurn(context, cancellation.turnId);
+        }
+        if (cancellation) {
+          yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
         }
       },
     );
