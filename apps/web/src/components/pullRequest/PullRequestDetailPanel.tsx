@@ -51,7 +51,7 @@ import {
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { useNewThreadHandler } from "~/hooks/useHandleNewThread";
 import { useCopyToClipboard, writeTextToClipboard } from "~/hooks/useCopyToClipboard";
-import { changeRequestRepositoryUrl } from "~/lib/openPullRequestLink";
+import { changeRequestRepositoryUrl, pullRequestBrowserUrl } from "~/lib/openPullRequestLink";
 import { usePreparePullRequestThreadAction } from "~/lib/sourceControlActions";
 import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
@@ -590,6 +590,15 @@ export function PullRequestDetailPanel({
   const newThread = useNewThreadHandler();
   const { environments } = useEnvironments();
   const projects = useProjects();
+  const unavailableBrowserLink = useMemo(() => {
+    const identity = projects.find(
+      (project) => project.id === reference.projectId && project.environmentId === environmentId,
+    )?.repositoryIdentity;
+    const href = pullRequestBrowserUrl(identity, reference.repository, reference.number);
+    return href && identity?.provider
+      ? { href, label: openOnHostLabel(identity.provider) }
+      : undefined;
+  }, [environmentId, projects, reference.number, reference.projectId, reference.repository]);
   // Beside a thread there is nothing to pick: the hand-offs land in that thread's composer, and
   // the thread is already on one server's copy of the branch.
   const pickableEnvironments = useMemo(
@@ -1906,7 +1915,11 @@ export function PullRequestDetailPanel({
         }}
       >
         {detailQuery.error && !detail ? (
-          <PullRequestsUnavailableState error={detailQuery.error} onRetry={refreshDetail} />
+          <PullRequestsUnavailableState
+            error={detailQuery.error}
+            onRetry={refreshDetail}
+            {...(unavailableBrowserLink ? { browserLink: unavailableBrowserLink } : {})}
+          />
         ) : detail ? (
           <>
             {mountedTabs.has("summary") ? (

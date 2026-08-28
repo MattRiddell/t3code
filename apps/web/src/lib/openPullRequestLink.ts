@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   LocalApi,
+  RepositoryIdentity,
   ScopedThreadRef,
   ThreadLinkedPullRequest,
 } from "@t3tools/contracts";
@@ -50,6 +51,132 @@ export async function openPullRequestLink(
     await shell.openExternal(targetUrl);
   } catch (cause) {
     throw PullRequestLinkOpenError.fromCause(targetUrl, cause);
+  }
+}
+
+interface RemoteLocation {
+  readonly origin: string;
+  readonly path: readonly string[];
+}
+
+function remoteLocationOf(identity: RepositoryIdentity): RemoteLocation | null {
+  try {
+    const url = new URL(identity.locator.remoteUrl.trim());
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return {
+        origin: url.origin,
+        path: url.pathname.split("/").filter(Boolean),
+      };
+    }
+  } catch {
+    // SSH remotes commonly use SCP syntax, so use their normalized identity below.
+  }
+
+  const [hostname, ...path] = identity.canonicalKey.split("/");
+  if (!hostname || path.length === 0) return null;
+  try {
+    return { origin: new URL(`https://${hostname}`).origin, path };
+  } catch {
+    return null;
+  }
+}
+
+function repositoryPathOf(repository: string): readonly string[] | null {
+  const path = repository.split("/");
+  return path.length > 0 &&
+    path.every((segment) => segment.length > 0 && segment !== "." && segment !== "..")
+    ? path
+    : null;
+}
+
+function azureDevOpsRepositoryPath(
+  remote: RemoteLocation,
+  repository: readonly string[],
+): { readonly origin: string; readonly path: readonly string[] } | null {
+  const [format, organization, project, ...repositoryName] = repository;
+  if (format === "v3" && organization && project && repositoryName.length > 0) {
+    return {
+      origin: "https://dev.azure.com",
+      path: [organization, project, "_git", ...repositoryName],
+    };
+  }
+
+  const referenceGitMarker = repository.indexOf("_git");
+  if (referenceGitMarker > 0 && referenceGitMarker < repository.length - 1) {
+    const remoteGitMarker = remote.path.indexOf("_git");
+    const organization =
+      remote.path[0] === "v3" ? remote.path[1] : remoteGitMarker === 2 ? remote.path[0] : undefined;
+    return {
+      origin: remote.path[0] === "v3" ? "https://dev.azure.com" : remote.origin,
+      path: referenceGitMarker === 1 && organization ? [organization, ...repository] : repository,
+    };
+  }
+
+  const remoteGitMarker = remote.path.indexOf("_git");
+  if (repository.length === 1 && remoteGitMarker > 0) {
+    return {
+      origin: remote.origin,
+      path: [...remote.path.slice(0, remoteGitMarker + 1), ...repository],
+    };
+  }
+
+  if (repository.length === 1 && remote.path[0] === "v3" && remote.path.length >= 4) {
+    const organization = remote.path[1];
+    const project = remote.path[2];
+    if (organization && project) {
+      return {
+        origin: "https://dev.azure.com",
+        path: [organization, project, "_git", ...repository],
+      };
+    }
+  }
+
+  return null;
+}
+
+/** Builds the host URL available even when the pull request API cannot be read. */
+export function pullRequestBrowserUrl(
+  identity: RepositoryIdentity | null | undefined,
+  repository: string,
+  number: number,
+): string | null {
+  if (!identity || !Number.isSafeInteger(number) || number < 1) return null;
+  const remote = remoteLocationOf(identity);
+  const repositoryPath = repositoryPathOf(repository);
+  if (!remote || !repositoryPath) return null;
+
+  let origin = remote.origin;
+  let path: readonly string[];
+  switch (identity.provider) {
+    case "github":
+      if (repositoryPath.length < 2) return null;
+      path = [...repositoryPath, "pull", String(number)];
+      break;
+    case "gitlab":
+      if (repositoryPath.length < 2) return null;
+      path = [...repositoryPath, "-", "merge_requests", String(number)];
+      break;
+    case "bitbucket":
+      if (repositoryPath.length < 2) return null;
+      path = [...repositoryPath, "pull-requests", String(number)];
+      break;
+    case "azure-devops": {
+      const azureRepository = azureDevOpsRepositoryPath(remote, repositoryPath);
+      if (!azureRepository) return null;
+      origin = azureRepository.origin;
+      path = [...azureRepository.path, "pullrequest", String(number)];
+      break;
+    }
+    default:
+      return null;
+  }
+
+  try {
+    const url = new URL(origin);
+    url.pathname = `/${path.join("/")}`;
+    return url.toString();
+  } catch {
+    return null;
   }
 }
 
