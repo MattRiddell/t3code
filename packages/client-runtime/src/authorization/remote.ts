@@ -27,11 +27,16 @@ const DEFAULT_REMOTE_REQUEST_TIMEOUT_MS = 10_000;
 
 const clientMetadataTokenExchangeFields = (
   clientMetadata: AuthClientPresentationMetadata | undefined,
-) => ({
-  ...(clientMetadata?.label ? { client_label: clientMetadata.label } : {}),
-  ...(clientMetadata?.deviceType ? { client_device_type: clientMetadata.deviceType } : {}),
-  ...(clientMetadata?.os ? { client_os: clientMetadata.os } : {}),
-});
+) => {
+  const displayOs = clientMetadata?.os;
+  return {
+    ...(clientMetadata?.label ? { client_label: clientMetadata.label } : {}),
+    ...(clientMetadata?.deviceType ? { client_device_type: clientMetadata.deviceType } : {}),
+    ...(displayOs && displayOs !== "unknown" && displayOs !== "other"
+      ? { client_os: displayOs }
+      : {}),
+  };
+};
 
 // The server reads these off the /ws upgrade URL next to wsTicket. Optional on
 // both ends: old servers ignore unknown params, old clients never send them.
