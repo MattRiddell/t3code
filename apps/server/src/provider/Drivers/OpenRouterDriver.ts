@@ -38,11 +38,7 @@ import {
 } from "../ProviderDriver.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import {
-  makeManualOnlyProviderMaintenanceCapabilities,
-  makeStaticProviderMaintenanceResolver,
-  resolveProviderMaintenanceCapabilitiesEffect,
-} from "../providerMaintenance.ts";
+import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
   makeProviderSnapshotSettingsSource,
@@ -60,12 +56,13 @@ import {
 
 const decodeOpenRouterSettings = Schema.decodeSync(OpenRouterSettings);
 const SNAPSHOT_REFRESH_INTERVAL = Duration.minutes(5);
-const UPDATE = makeStaticProviderMaintenanceResolver(
-  makeManualOnlyProviderMaintenanceCapabilities({
-    provider: OPENROUTER_DRIVER_KIND,
-    packageName: null,
-  }),
-);
+// OpenRouter runs on the Claude Agent CLI, which the ClaudeDriver already
+// maintains. This driver never owns an install of its own, so its maintenance
+// capabilities are constant — the same shape GrokDriver uses.
+const MAINTENANCE_CAPABILITIES = makeManualOnlyProviderMaintenanceCapabilities({
+  provider: OPENROUTER_DRIVER_KIND,
+  packageName: null,
+});
 
 export type OpenRouterDriverEnv =
   | BackgroundPolicy.BackgroundPolicy
@@ -166,11 +163,6 @@ export const OpenRouterDriver: ProviderDriver<OpenRouterSettings, OpenRouterDriv
         accentColor,
         continuationGroupKey: continuationIdentity.continuationKey,
       });
-      const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
-        binaryPath: effectiveConfig.binaryPath,
-        env: processEnv,
-      });
-
       const adapter = withOpenRouterAdapterIdentity(
         yield* makeClaudeAdapter(claudeSettings, {
           instanceId,
@@ -222,7 +214,7 @@ export const OpenRouterDriver: ProviderDriver<OpenRouterSettings, OpenRouterDriv
       const snapshot = yield* makeManagedServerProvider<
         ProviderSnapshotSettings<OpenRouterSettings>
       >({
-        maintenanceCapabilities,
+        resolveMaintenance: () => Effect.succeed(MAINTENANCE_CAPABILITIES),
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
