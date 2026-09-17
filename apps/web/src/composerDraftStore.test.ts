@@ -1963,6 +1963,39 @@ describe("composerDraftStore modelSelection", () => {
     }
   });
 
+  it("records the thread pin behind an explicit pick and persists it", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useComposerDraftStore.getState();
+      store.setModelSelection(threadRef, modelSelection(CODEX_DRIVER, "gpt-5.4"), {
+        explicit: true,
+        threadInstanceId: CLAUDE_AGENT_INSTANCE,
+      });
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionThreadInstanceId).toBe(
+        CLAUDE_AGENT_INSTANCE,
+      );
+      await vi.advanceTimersByTimeAsync(300);
+
+      resetComposerDraftStore();
+      await useComposerDraftStore.persist.rehydrate();
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionThreadInstanceId).toBe(
+        CLAUDE_AGENT_INSTANCE,
+      );
+
+      // A seeding write (the refresh after a seat move) drops the record.
+      useComposerDraftStore
+        .getState()
+        .setModelSelection(threadRef, modelSelection(CODEX_DRIVER, "gpt-5.4"), {
+          replaceOptions: true,
+        });
+      expect(
+        draftFor(threadId, TEST_ENVIRONMENT_ID)?.modelSelectionThreadInstanceId,
+      ).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("replaces only the targeted provider options on the current model selection", () => {
     const store = useComposerDraftStore.getState();
 

@@ -284,7 +284,10 @@ import {
   preventRepeatedTerminalCloseShortcut,
   preventTerminalCloseShortcut,
 } from "../lib/terminalCloseShortcut";
-import { resolveNewDraftStartFromOrigin } from "../lib/chatThreadActions";
+import {
+  resolveMovedThreadDraftSelection,
+  resolveNewDraftStartFromOrigin,
+} from "../lib/chatThreadActions";
 import {
   derivePhysicalProjectKey,
   deriveLogicalProjectKeyFromSettings,
@@ -1918,6 +1921,26 @@ export default function ChatView(props: ChatViewProps) {
   // depend on which route is mounted.
   const isServerThread = activeServerThread !== null;
   const activeThread = activeServerThread ?? localDraftThread;
+  // A seat move pins the server thread to another instance while this
+  // browser's draft still names the old one. Refresh the draft from the pin
+  // so the picker shows where the turn will run and a typed send does not
+  // move the thread back. A pick made after the pin still wins.
+  const movedThreadDraftSelection = useComposerDraftStore((store) =>
+    routeKind === "server" && activeServerThread
+      ? resolveMovedThreadDraftSelection({
+          draft: store.getComposerDraft(composerDraftTarget),
+          threadModelSelection: activeServerThread.modelSelection,
+        })
+      : null,
+  );
+  useEffect(() => {
+    if (movedThreadDraftSelection === null) {
+      return;
+    }
+    setComposerDraftModelSelection(composerDraftTarget, movedThreadDraftSelection, {
+      replaceOptions: true,
+    });
+  }, [composerDraftTarget, movedThreadDraftSelection, setComposerDraftModelSelection]);
   const threadError = isServerThread
     ? (localServerError ?? activeServerThread?.session?.lastError ?? null)
     : localDraftError;
@@ -9388,12 +9411,13 @@ export default function ChatView(props: ChatViewProps) {
       setComposerDraftModelSelection(
         scopeThreadRef(activeThread.environmentId, activeThread.id),
         nextModelSelection,
-        { explicit: true },
+        { explicit: true, threadInstanceId: activeServerThread?.modelSelection.instanceId ?? null },
       );
       setStickyComposerModelSelection(nextModelSelection);
       if (options?.focusComposer !== false) scheduleComposerFocus();
     },
     [
+      activeServerThread?.modelSelection.instanceId,
       activeThread,
       lockedProvider,
       scheduleComposerFocus,

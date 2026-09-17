@@ -9,7 +9,10 @@ import type { ComposerThreadDraftState, DraftThreadEnvMode } from "../composerDr
 
 type ComposerModelSelectionState = Pick<
   ComposerThreadDraftState,
-  "activeProvider" | "modelSelectionByProvider" | "modelSelectionExplicit"
+  | "activeProvider"
+  | "modelSelectionByProvider"
+  | "modelSelectionExplicit"
+  | "modelSelectionThreadInstanceId"
 >;
 
 interface ThreadContextLike {
@@ -66,6 +69,35 @@ export function hasExplicitComposerModelSelection(
     activeProvider !== undefined &&
     draft.modelSelectionByProvider[activeProvider] !== undefined
   );
+}
+
+/**
+ * A server thread's pinned instance can change outside this browser (a
+ * server-side seat move). The composer draft outranks the thread when a turn
+ * is sent, so a stale draft would silently move the thread back. Returns the
+ * thread's selection when the draft must be refreshed from it, or null when
+ * the draft stands: it already matches, or a human picked it after the thread
+ * reached its current pin.
+ */
+export function resolveMovedThreadDraftSelection(input: {
+  readonly draft: ComposerModelSelectionState | null | undefined;
+  readonly threadModelSelection: ModelSelection | null | undefined;
+}): ModelSelection | null {
+  const { draft, threadModelSelection } = input;
+  const draftInstanceId = draft?.activeProvider ?? null;
+  if (!draft || draftInstanceId === null || !threadModelSelection) {
+    return null;
+  }
+  if (draftInstanceId === threadModelSelection.instanceId) {
+    return null;
+  }
+  if (
+    draft.modelSelectionExplicit === true &&
+    draft.modelSelectionThreadInstanceId === threadModelSelection.instanceId
+  ) {
+    return null;
+  }
+  return threadModelSelection;
 }
 
 export function resolveThreadActionProjectRef(

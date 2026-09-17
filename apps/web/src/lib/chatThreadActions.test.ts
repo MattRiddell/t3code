@@ -10,6 +10,7 @@ import {
   resolveThreadActionProjectRef,
   hasExplicitComposerModelSelection,
   resolveNewDraftStartFromOrigin,
+  resolveMovedThreadDraftSelection,
   resolveNewThreadModelSelectionOverride,
   startNewThreadFromContext,
   type ChatThreadActionContext,
@@ -52,6 +53,78 @@ describe("chatThreadActions", () => {
       false,
     );
     expect(hasExplicitComposerModelSelection({ ...draft, activeProvider: null })).toBe(false);
+  });
+
+  describe("resolveMovedThreadDraftSelection", () => {
+    const OLD_HOME: ModelSelection = {
+      instanceId: ProviderInstanceId.make("claude8"),
+      model: "claude-opus-5",
+    };
+    const NEW_HOME: ModelSelection = {
+      instanceId: ProviderInstanceId.make("claude7"),
+      model: "claude-opus-5",
+    };
+    const draftOn = (
+      selection: ModelSelection,
+      extra: { explicit?: boolean; threadInstanceId?: ModelSelection["instanceId"] } = {},
+    ) => ({
+      activeProvider: selection.instanceId,
+      modelSelectionByProvider: { [selection.instanceId]: selection },
+      ...(extra.explicit ? { modelSelectionExplicit: true } : {}),
+      ...(extra.threadInstanceId ? { modelSelectionThreadInstanceId: extra.threadInstanceId } : {}),
+    });
+
+    it("refreshes a draft picked before the thread was moved to another home", () => {
+      // Incident shape: picked claude8 while pinned to claude8, then moved to claude7.
+      expect(
+        resolveMovedThreadDraftSelection({
+          draft: draftOn(OLD_HOME, { explicit: true, threadInstanceId: OLD_HOME.instanceId }),
+          threadModelSelection: NEW_HOME,
+        }),
+      ).toBe(NEW_HOME);
+    });
+
+    it("refreshes seeded and legacy drafts that name another home", () => {
+      expect(
+        resolveMovedThreadDraftSelection({
+          draft: draftOn(OLD_HOME),
+          threadModelSelection: NEW_HOME,
+        }),
+      ).toBe(NEW_HOME);
+      expect(
+        resolveMovedThreadDraftSelection({
+          draft: draftOn(OLD_HOME, { explicit: true }),
+          threadModelSelection: NEW_HOME,
+        }),
+      ).toBe(NEW_HOME);
+    });
+
+    it("keeps a pick the user made after the thread reached its current pin", () => {
+      expect(
+        resolveMovedThreadDraftSelection({
+          draft: draftOn(OLD_HOME, { explicit: true, threadInstanceId: NEW_HOME.instanceId }),
+          threadModelSelection: NEW_HOME,
+        }),
+      ).toBeNull();
+    });
+
+    it("leaves matching or empty drafts alone", () => {
+      expect(
+        resolveMovedThreadDraftSelection({
+          draft: draftOn(NEW_HOME),
+          threadModelSelection: NEW_HOME,
+        }),
+      ).toBeNull();
+      expect(
+        resolveMovedThreadDraftSelection({ draft: null, threadModelSelection: NEW_HOME }),
+      ).toBeNull();
+      expect(
+        resolveMovedThreadDraftSelection({
+          draft: { ...draftOn(OLD_HOME), activeProvider: null },
+          threadModelSelection: NEW_HOME,
+        }),
+      ).toBeNull();
+    });
   });
 
   it("does not carry a non-explicit model from the destination draft back into itself", () => {
