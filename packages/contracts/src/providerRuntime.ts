@@ -219,6 +219,7 @@ export type ProviderRuntimeEventBase = typeof ProviderRuntimeEventBase.Type;
 const SessionStartedPayload = Schema.Struct({
   message: Schema.optional(TrimmedNonEmptyStringSchema),
   resume: Schema.optional(Schema.Unknown),
+  activityHistory: Schema.optional(Schema.Literals(["empty", "unknown"])),
 });
 export type SessionStartedPayload = typeof SessionStartedPayload.Type;
 

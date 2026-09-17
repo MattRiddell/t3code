@@ -88,6 +88,13 @@ export interface ProviderServiceShape {
     input: ProviderStopSessionInput,
   ) => Effect.Effect<void, ProviderServiceError>;
 
+  /** Internal automatic-reaper boundary; false means no stop was attempted. */
+  readonly stopSessionIfInactive: (input: {
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly inactivityThresholdMs: number;
+  }) => Effect.Effect<boolean, ProviderServiceError>;
+
   /**
    * List active provider sessions.
    *

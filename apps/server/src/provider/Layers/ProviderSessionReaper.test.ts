@@ -11,6 +11,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
@@ -121,6 +122,19 @@ function makeReadModel(
 }
 
 describe("ProviderSessionReaper", () => {
+  // Flat message-part capture provided around the reaper's start effect (and
+  // inherited by its forked sweep), so tests observe the log/receipt boundary
+  // instead of trusting console side effects (same idiom as
+  // providerStatusCache.test.ts).
+  const logMessages: Array<unknown> = [];
+  const capturingLogger = Logger.make<unknown, void>((options) => {
+    if (Array.isArray(options.message)) {
+      logMessages.push(...options.message);
+    } else {
+      logMessages.push(options.message);
+    }
+  });
+
   let runtime: ManagedRuntime.ManagedRuntime<
     ProviderSessionReaper | ProviderSessionRuntime.ProviderSessionRuntimeRepository,
     unknown
@@ -145,7 +159,12 @@ describe("ProviderSessionReaper", () => {
       Effect.gen(function* () {
         const reaper = yield* ProviderSessionReaper;
         scope = yield* Scope.make("sequential");
-        yield* reaper.start().pipe(Scope.provide(scope));
+        yield* reaper
+          .start()
+          .pipe(
+            Scope.provide(scope),
+            Effect.provide(Logger.layer([capturingLogger], { mergeWithExisting: false })),
+          );
       }),
     );
   }
@@ -180,6 +199,19 @@ describe("ProviderSessionReaper", () => {
     }) => ReturnType<ProviderServiceShape["stopSession"]>;
   }) {
     const stoppedThreadIds = new Set<ThreadId>();
+    logMessages.length = 0;
+    // The reaped decision (Effect.tap on the boundary result) evaluates in the
+    // same synchronous chain as the boundary effect itself, one scheduler turn
+    // after the mock is constructed. Counting evaluations inside the returned
+    // effect gives tests a receipt for "the boundary verdict has been acted
+    // on", so log-absence assertions cannot race the sweep fiber.
+    let boundaryEvaluatedCount = 0;
+    const stopSessionIfInactive = vi.fn<ProviderServiceShape["stopSessionIfInactive"]>(() =>
+      Effect.sync(() => {
+        boundaryEvaluatedCount += 1;
+        return false;
+      }),
+    );
     const stopSession = vi.fn<ProviderServiceShape["stopSession"]>(
       (request) =>
         (input.stopSessionImplementation
@@ -197,6 +229,7 @@ describe("ProviderSessionReaper", () => {
       respondToRequest: () => unsupported(),
       respondToUserInput: () => unsupported(),
       stopSession,
+      stopSessionIfInactive,
       listSessions: () => Effect.succeed([]),
       getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" }),
       assertConversationRollbackSupported: () => unsupported(),
@@ -269,7 +302,13 @@ describe("ProviderSessionReaper", () => {
     );
 
     runtime = ManagedRuntime.make(layer);
-    return { stopSession, stoppedThreadIds };
+    return {
+      stopSession,
+      stopSessionIfInactive,
+      stoppedThreadIds,
+      logMessages,
+      boundaryEvaluatedCount: () => boundaryEvaluatedCount,
+    };
   }
 
   it("reaps stale persisted sessions without active turns", async () => {
@@ -365,6 +404,132 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).not.toHaveBeenCalled();
     const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
     expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  it("refuses opencode automatic stop when the guarded boundary declines", async () => {
+    const threadId = ThreadId.make("thread-reaper-opencode-refusal");
+    const providerInstanceId = ProviderInstanceId.make("opencode-local");
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "opencode",
+        providerInstanceId,
+        adapterKey: "opencode",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-opencode-refusal",
+        },
+        runtimePayload: null,
+      }),
+    );
+
+    await startReaper();
+    // Wait for the boundary to be EVALUATED (not merely constructed): the
+    // reaped decision evaluates in the same synchronous chain, so publication
+    // — if any — is already captured when this receipt lands.
+    await waitFor(() => harness.boundaryEvaluatedCount() === 1);
+
+    expect(harness.stopSessionIfInactive.mock.calls[0]?.[0]).toEqual({
+      threadId,
+      providerInstanceId,
+      inactivityThresholdMs: 1_000,
+    });
+    expect(harness.stopSessionIfInactive).toHaveBeenCalledTimes(1);
+    expect(harness.stopSession).not.toHaveBeenCalled();
+    expect(harness.stoppedThreadIds.has(threadId)).toBe(false);
+    // Observe the log/receipt boundary itself: a declined boundary must never
+    // publish the reaped receipt, nor the sweep-complete receipt that is only
+    // logged after an actual reap.
+    expect(
+      harness.logMessages.some((message) => String(message).includes("provider.session.reaped")),
+    ).toBe(false);
+    expect(
+      harness.logMessages.some((message) =>
+        String(message).includes("provider.session.reaper.sweep-complete"),
+      ),
+    ).toBe(false);
+    const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
+    expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  it("publishes provider.session.reaped when the boundary permits (forced-publication control)", async () => {
+    // Mirror of the refusal scenario with a permitting boundary: the reaped
+    // receipt IS observable on the true path, proving the refusal test's
+    // absence assertion is not vacuous.
+    const threadId = ThreadId.make("thread-reaper-forced-publication");
+    const now = "2026-01-01T00:00:00.000Z";
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        providerInstanceId: null,
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-forced-publication",
+        },
+        runtimePayload: null,
+      }),
+    );
+
+    await startReaper();
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+
+    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId });
+    expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
+    await waitFor(() =>
+      harness.logMessages.some((message) => String(message).includes("provider.session.reaped")),
+    );
+    expect(
+      harness.logMessages.some((message) =>
+        String(message).includes("provider.session.reaper.sweep-complete"),
+      ),
+    ).toBe(true);
   });
 
   it("skips stale sessions while background work is still live", async () => {

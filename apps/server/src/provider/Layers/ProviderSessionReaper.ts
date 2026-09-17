@@ -94,16 +94,25 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
           continue;
         }
 
-        const reaped = yield* providerService.stopSession({ threadId: binding.threadId }).pipe(
-          Effect.tap(() =>
+        // OpenCode READY does not prove ordinary tools have finished. Other adapters
+        // retain their installed policy; they do not inherit an unqualified idle proof.
+        if (binding.provider === "opencode" && binding.providerInstanceId === undefined) continue;
+        const stop = binding.provider === "opencode"
+          ? providerService.stopSessionIfInactive({
+              threadId: binding.threadId,
+              providerInstanceId: binding.providerInstanceId!,
+              inactivityThresholdMs,
+            })
+          : providerService.stopSession({ threadId: binding.threadId }).pipe(Effect.as(true));
+        const reaped = yield* stop.pipe(
+          Effect.tap((stopped) => stopped ?
             Effect.logInfo("provider.session.reaped", {
               threadId: binding.threadId,
               provider: binding.provider,
               idleDurationMs,
               reason: "inactivity_threshold",
-            }),
+            }) : Effect.void,
           ),
-          Effect.as(true),
           Effect.catchCause((cause) =>
             Effect.logWarning("provider.session.reaper.stop-failed", {
               threadId: binding.threadId,

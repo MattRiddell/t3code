@@ -1,3 +1,5 @@
+import * as Semaphore from "effect/Semaphore";
+import { makeInactivityGuard } from "../InactivityGuard.ts";
 /**
  * ProviderServiceLive - Cross-provider orchestration layer.
  *
@@ -487,6 +489,32 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const pathService = yield* Path.Path;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const inactivityGuard = makeInactivityGuard(() => performance.now());
+  const commandPermits = new Map<ThreadId, { permit: Semaphore.Semaphore; users: number }>();
+  const withThreadPermit = <A, E, R>(threadId: ThreadId, operation: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const entry = commandPermits.get(threadId) ?? { permit: Semaphore.makeUnsafe(1), users: 0 };
+        entry.users += 1; // Includes waiters, so an in-use permit cannot be replaced.
+        commandPermits.set(threadId, entry);
+        return entry;
+      }),
+      (entry) => entry.permit.withPermit(operation),
+      (entry) =>
+        Effect.sync(() => {
+          entry.users -= 1;
+          if (entry.users === 0) commandPermits.delete(threadId);
+        }),
+    );
+  const protectCommand = <A, E, R>(threadId: ThreadId, operation: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      withThreadPermit(
+        threadId,
+        Effect.sync(() => inactivityGuard.beginCommand(threadId)),
+      ),
+      () => operation,
+      () => Effect.sync(() => inactivityGuard.endCommand(threadId)),
+    );
   const pendingCompactions = new Map<ThreadId, PendingCompaction>();
   const timedOutNativeCompactions = new Set<ThreadId>();
   const settleCompaction = (threadId: ThreadId, pending: PendingCompaction, terminal: string) =>
@@ -1080,6 +1108,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     source: {
       readonly instanceId: ProviderInstanceId;
       readonly provider: ProviderDriverKind;
+      readonly adapter: object;
     },
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
@@ -1087,6 +1116,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const canonicalEvent = yield* Effect.sync(() =>
         correlateRuntimeEventWithInstance(source, event),
       );
+      if (source.provider === "opencode") {
+        // exactOptionalPropertyTypes: omitted-identity stays omitted. An event
+        // without a turn/item/request id reaches the guard as absent, which
+        // tombstones identity-required histories instead of inventing one.
+        const canonical = canonicalEvent;
+        inactivityGuard.observe(canonical.threadId, source.instanceId, source.adapter, {
+          type: canonical.type,
+          payload: canonical.payload,
+          ...(canonical.turnId !== undefined ? { turnId: canonical.turnId } : {}),
+          ...(canonical.itemId !== undefined ? { itemId: canonical.itemId } : {}),
+          ...(canonical.requestId !== undefined ? { requestId: canonical.requestId } : {}),
+        });
+      }
       yield* increment(providerRuntimeEventsTotal, {
         provider: canonicalEvent.provider,
         eventType: canonicalEvent.type,
@@ -1208,11 +1250,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             {
               instanceId: id,
               provider: adapter.provider,
+              adapter,
             },
             event,
           ),
         ).pipe(Effect.forkScoped);
       }
+    }
+    for (const [id, adapter] of previous) {
+      if (next.get(id) !== adapter) inactivityGuard.retireAdapter(adapter);
     }
     yield* Ref.set(subscribedAdapters, next);
   });
@@ -2029,70 +2075,106 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const stopSession: ProviderServiceMethod<"stopSession"> = Effect.fn("stopSession")(
-    function* (rawInput) {
-      const input = yield* decodeInputOrValidationError({
+  const stopSessionWithGuard = Effect.fn("stopSessionWithGuard")(function* (
+    rawInput: Parameters<ProviderServiceMethod<"stopSession">>[0],
+    beforeStop?: (instance: ProviderInstanceId, adapter: object) => boolean,
+  ) {
+    const input = yield* decodeInputOrValidationError({
+      operation: "ProviderService.stopSession",
+      schema: ProviderStopSessionInput,
+      payload: rawInput,
+    });
+    let metricProvider = "unknown";
+    return yield* Effect.gen(function* () {
+      const routed = yield* resolveRoutableSession({
+        threadId: input.threadId,
         operation: "ProviderService.stopSession",
-        schema: ProviderStopSessionInput,
-        payload: rawInput,
+        allowRecovery: false,
       });
-      let metricProvider = "unknown";
-      return yield* Effect.gen(function* () {
-        const routed = yield* resolveRoutableSession({
-          threadId: input.threadId,
-          operation: "ProviderService.stopSession",
-          allowRecovery: false,
-        });
-        metricProvider = routed.adapter.provider;
-        yield* Effect.annotateCurrentSpan({
-          "provider.operation": "stop-session",
-          "provider.kind": routed.adapter.provider,
-          "provider.thread_id": input.threadId,
-        });
-        if (routed.isActive) {
-          const session = (yield* routed.adapter.listSessions()).find(
-            (session) => session.threadId === routed.threadId,
+      metricProvider = routed.adapter.provider;
+      yield* Effect.annotateCurrentSpan({
+        "provider.operation": "stop-session",
+        "provider.kind": routed.adapter.provider,
+        "provider.thread_id": input.threadId,
+      });
+      if (beforeStop && !beforeStop(routed.instanceId, routed.adapter)) return false;
+      if (routed.isActive) {
+        const session = (yield* routed.adapter.listSessions()).find(
+          (session) => session.threadId === routed.threadId,
+        );
+        if (session) {
+          yield* upsertSessionBinding(
+            { ...session, providerInstanceId: routed.instanceId },
+            input.threadId,
           );
-          if (session) {
-            yield* upsertSessionBinding(
-              { ...session, providerInstanceId: routed.instanceId },
+        }
+        yield* routed.adapter.stopSession(routed.threadId);
+      }
+      const pendingCompaction = pendingCompactions.get(input.threadId);
+      if (pendingCompaction !== undefined) {
+        yield* settleCompaction(input.threadId, pendingCompaction, "turn.aborted");
+      }
+      timedOutNativeCompactions.delete(input.threadId);
+      yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
+      yield* clearMcpSession(input.threadId);
+      yield* directory.upsert({
+        threadId: input.threadId,
+        provider: routed.adapter.provider,
+        providerInstanceId: routed.instanceId,
+        status: "stopped",
+        runtimePayload: {
+          activeTurnId: null,
+          continueAfterServerUpdate: null,
+          continueAfterServerUpdatePrepared: null,
+        },
+      });
+      yield* analytics.record("provider.session.stopped", {
+        provider: routed.adapter.provider,
+      });
+      return true;
+    }).pipe(
+      withMetrics({
+        counter: providerSessionsTotal,
+        outcomeAttributes: () =>
+          providerMetricAttributes(metricProvider, {
+            operation: "stop",
+          }),
+      }),
+    );
+  });
+
+  const stopSession: ProviderServiceMethod<"stopSession"> = (input) =>
+    protectCommand(input.threadId, stopSessionWithGuard(input).pipe(Effect.asVoid));
+
+  const stopSessionIfInactive: ProviderServiceMethod<"stopSessionIfInactive"> = (input) =>
+    withThreadPermit(
+      input.threadId,
+      Effect.gen(function* () {
+        if (Option.isNone(projectionQuery)) return false;
+        const shell = yield* projectionQuery.value
+          .getThreadShellById(input.threadId)
+          .pipe(Effect.orElseSucceed(() => Option.none()));
+        if (
+          Option.isNone(shell) ||
+          shell.value.session?.activeTurnId != null ||
+          shell.value.backgroundLiveness != null ||
+          shell.value.hasPendingApprovals ||
+          shell.value.hasPendingUserInput
+        )
+          return false;
+        return yield* stopSessionWithGuard(
+          { threadId: input.threadId },
+          (instance, adapter) =>
+            instance === input.providerInstanceId &&
+            inactivityGuard.commitStop(
               input.threadId,
-            );
-          }
-          yield* routed.adapter.stopSession(routed.threadId);
-        }
-        const pendingCompaction = pendingCompactions.get(input.threadId);
-        if (pendingCompaction !== undefined) {
-          yield* settleCompaction(input.threadId, pendingCompaction, "turn.aborted");
-        }
-        timedOutNativeCompactions.delete(input.threadId);
-        yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
-        yield* clearMcpSession(input.threadId);
-        yield* directory.upsert({
-          threadId: input.threadId,
-          provider: routed.adapter.provider,
-          providerInstanceId: routed.instanceId,
-          status: "stopped",
-          runtimePayload: {
-            activeTurnId: null,
-            continueAfterServerUpdate: null,
-            continueAfterServerUpdatePrepared: null,
-          },
-        });
-        yield* analytics.record("provider.session.stopped", {
-          provider: routed.adapter.provider,
-        });
-      }).pipe(
-        withMetrics({
-          counter: providerSessionsTotal,
-          outcomeAttributes: () =>
-            providerMetricAttributes(metricProvider, {
-              operation: "stop",
-            }),
-        }),
-      );
-    },
-  );
+              instance,
+              adapter,
+              input.inactivityThresholdMs,
+            ),
+        );
+      }),
+    );
 
   const listSessions: ProviderServiceMethod<"listSessions"> = Effect.fn("listSessions")(
     function* () {
@@ -2399,19 +2481,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
 
   return {
-    startSession,
-    sendTurn,
-    compactThread,
-    interruptTurn,
-    respondToRequest,
-    respondToUserInput,
+    startSession: (threadId, input) => protectCommand(threadId, startSession(threadId, input)),
+    sendTurn: (input) => protectCommand(input.threadId, sendTurn(input)),
+    compactThread: (threadId, selection, requestId) =>
+      protectCommand(threadId, compactThread(threadId, selection, requestId)),
+    interruptTurn: (input) => protectCommand(input.threadId, interruptTurn(input)),
+    respondToRequest: (input) => protectCommand(input.threadId, respondToRequest(input)),
+    respondToUserInput: (input) => protectCommand(input.threadId, respondToUserInput(input)),
     stopSession,
+    stopSessionIfInactive,
     listSessions,
     getCapabilities,
     getInstanceInfo,
     assertConversationRollbackSupported,
-    rollbackConversation,
-    uploadFeedback,
+    rollbackConversation: (input) => protectCommand(input.threadId, rollbackConversation(input)),
+    uploadFeedback: (input) => protectCommand(input.threadId, uploadFeedback(input)),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.
