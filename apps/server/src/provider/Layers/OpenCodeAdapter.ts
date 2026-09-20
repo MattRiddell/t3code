@@ -1480,6 +1480,57 @@ export function makeOpenCodeAdapter(
       promptAdmission.recoveryFiber = yield* recover.pipe(Effect.forkIn(context.sessionScope));
     });
 
+    const resyncResumedOpenCodeTurn = Effect.fn("resyncResumedOpenCodeTurn")(function* (
+      context: OpenCodeSessionContext,
+      turnId: TurnId,
+    ) {
+      const response = yield* runOpenCodeSdk("session.status", (signal) =>
+        context.client.session.status(undefined, { signal }),
+      ).pipe(Effect.timeout("1 second"), Effect.option);
+      const statuses = Option.isSome(response)
+        ? Option.getOrUndefined(decodeOpenCodeSessionStatusMap(response.value.data))
+        : undefined;
+      if (statuses === undefined) {
+        return;
+      }
+      const status = statuses[context.openCodeSessionId];
+      const running = status?.type === "busy" || status?.type === "retry";
+      if (status !== undefined && !running && status.type !== "idle") {
+        return;
+      }
+
+      const updatedAt = yield* nowIso;
+      if (running) {
+        context.activeTurnId = turnId;
+        applyProviderSessionUpdate(
+          context,
+          { status: "running", activeTurnId: turnId },
+          { clearLastError: true },
+          updatedAt,
+        );
+      } else {
+        applyProviderSessionUpdate(
+          context,
+          { status: "ready" },
+          { clearActiveTurnId: true, clearLastError: true },
+          updatedAt,
+        );
+      }
+
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          createdAt: updatedAt,
+        })),
+        type: "session.state.changed",
+        payload: {
+          state: running ? "running" : "ready",
+          detail: { source: "resume-status-resync" },
+        },
+      });
+    });
+
     const interruptOpenCodeTurn = Effect.fn("interruptOpenCodeTurn")(function* (
       context: OpenCodeSessionContext,
       turnId: TurnId,
@@ -3046,6 +3097,9 @@ export function makeOpenCodeAdapter(
         }
         yield* awaitOpenCodeContextReady(context);
         if (!started.created) {
+          if (input.resumedActiveTurnId !== undefined) {
+            yield* resyncResumedOpenCodeTurn(context, input.resumedActiveTurnId);
+          }
           yield* schedulePendingRequestRecovery(context);
         }
 

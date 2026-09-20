@@ -30,6 +30,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
@@ -1061,6 +1062,76 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(runtimeMock.state.sessionUpdateCalls.length, 1);
       NodeAssert.equal(runtimeMock.state.sessionUpdateCalls[0]?.sessionID, "ses_persisted");
       NodeAssert.equal(runtimeMock.state.sessionUpdateCalls[0]?.permission != null, true);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  for (const liveStatus of ["idle", "busy"] as const) {
+    it.effect(`resyncs a resumed open turn from confirmed ${liveStatus} provider status`, () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId(`thread-opencode-resume-${liveStatus}`);
+        const turnId = TurnId.make(`turn-opencode-resume-${liveStatus}`);
+        runtimeMock.state.sessionStatusImplementation = async () => ({
+          data: liveStatus === "busy" ? { ses_persisted: { type: "busy" } } : {},
+        });
+        const stateChanged = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.threadId === threadId && event.type === "session.state.changed",
+          ),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+
+        const session = yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_persisted" },
+          resumedActiveTurnId: turnId,
+        });
+        const event = Option.getOrThrow(yield* Fiber.join(stateChanged));
+
+        NodeAssert.equal(event.type, "session.state.changed");
+        if (event.type === "session.state.changed") {
+          NodeAssert.equal(event.payload.state, liveStatus === "busy" ? "running" : "ready");
+          NodeAssert.equal(event.turnId, turnId);
+        }
+        NodeAssert.equal(session.status, liveStatus === "busy" ? "running" : "ready");
+        NodeAssert.equal(session.activeTurnId, liveStatus === "busy" ? turnId : undefined);
+
+        yield* adapter.stopSession(threadId);
+      }),
+    );
+  }
+
+  it.effect("leaves a resumed open turn untouched when live status cannot be qualified", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-resume-unknown");
+      runtimeMock.state.sessionStatusImplementation = async () => ({ data: null });
+      const lifecycle = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "ses_persisted" },
+        resumedActiveTurnId: TurnId.make("turn-opencode-resume-unknown"),
+      });
+      const events = Array.from(yield* Fiber.join(lifecycle));
+
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["session.started", "thread.started"],
+      );
+      NodeAssert.equal(runtimeMock.state.sessionStatusCalls, 1);
 
       yield* adapter.stopSession(threadId);
     }),
