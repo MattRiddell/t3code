@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -1112,9 +1113,14 @@ it.effect("memoizes editor discovery and refreshes after the cache window", () =
     assert.deepEqual([...second], [...first]);
     assert.equal(statCalls, statCallsAfterFirstScan);
 
-    // Past the discovery cache window the next call rescans.
+    // Past the discovery cache window the next call answers at once with the
+    // previous set and rescans in the background.
     yield* TestClock.adjust("30 seconds");
-    yield* launcher.resolveAvailableEditors();
+    const third = yield* launcher.resolveAvailableEditors();
+    assert.deepEqual([...third], [...first]);
+    for (let i = 0; i < 10 && statCalls === statCallsAfterFirstScan; i++) {
+      yield* Effect.yieldNow;
+    }
     assert.isAbove(statCalls, statCallsAfterFirstScan);
   }).pipe(
     Effect.provide(
@@ -1135,13 +1141,16 @@ it.effect("memoizes editor discovery and refreshes after the cache window", () =
   );
 });
 
-// A client that disconnects mid-scan interrupts the shared discovery effect on
-// the connection fiber. The cache must not retain that interrupt: doing so
-// replayed it to every later connect for the whole TTL, so `server.getConfig`
-// failed and no client could reconnect until the server restarted.
-it.effect("rescans after an interrupted discovery instead of caching the interrupt", () => {
+// A client that disconnects mid-scan, or whose 5 s config timeout fires on a
+// loaded host, interrupts its wait on the connection fiber. That must neither
+// cache the interrupt (which replayed it to every later connect for the whole
+// TTL, so `server.getConfig` failed until the server restarted) nor cancel the
+// scan (board #14962: every connect then paid the full timeout again and the
+// cache never filled). The scan finishes on its own and the next connect gets
+// its result without starting another.
+it.effect("finishes and caches a discovery whose caller was interrupted", () => {
   const fileInfo = { type: "File" } as FileSystem.File.Info;
-  let blockFirstScan = true;
+  const release = Deferred.makeUnsafe<void>();
   let scans = 0;
   const launcherLayer = ExternalLauncher.layer.pipe(
     Layer.provide(
@@ -1153,9 +1162,7 @@ it.effect("rescans after an interrupted discovery instead of caching the interru
           stat: () =>
             Effect.gen(function* () {
               scans += 1;
-              if (blockFirstScan) {
-                return yield* Effect.never;
-              }
+              yield* Deferred.await(release);
               return fileInfo;
             }),
         }),
@@ -1174,13 +1181,20 @@ it.effect("rescans after an interrupted discovery instead of caching the interru
     const fiber = yield* Effect.forkChild(launcher.resolveAvailableEditors());
     yield* Effect.yieldNow;
     yield* Fiber.interrupt(fiber);
+    assert.isAbove(scans, 0);
+    const scansBeforeRelease = scans;
 
-    // The next connect must still get a real answer well inside the TTL.
-    blockFirstScan = false;
-    scans = 0;
+    // The scan the interrupted caller started is still running; let it end.
+    yield* Deferred.succeed(release, undefined);
     const editors = yield* launcher.resolveAvailableEditors();
     assert.equal(editors.includes("vscode"), true);
-    assert.isAbove(scans, 0);
+
+    // The answer came from that scan, now cached: no second scan began.
+    const scansAfterFirstAnswer = scans;
+    const again = yield* launcher.resolveAvailableEditors();
+    assert.deepEqual([...again], [...editors]);
+    assert.equal(scans, scansAfterFirstAnswer);
+    assert.isAtLeast(scansAfterFirstAnswer, scansBeforeRelease);
   }).pipe(
     Effect.provide(
       Layer.mergeAll(

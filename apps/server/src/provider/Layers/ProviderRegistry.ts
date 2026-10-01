@@ -80,7 +80,15 @@ const makeManualProviderMaintenanceCapabilities = (provider: ProviderDriverKind)
 const hasModelCapabilities = (model: ServerProvider["models"][number]): boolean =>
   (model.capabilities?.optionDescriptors?.length ?? 0) > 0;
 
-const MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER = 16;
+// Every provider snapshot is sent whole to each client on connect and on every
+// provider change, and each workspace entry repeats that cwd's full skill and
+// slash-command lists (tens of KB). At 16 entries across a dozen provider
+// instances the config snapshot reached 13.8 MB: about 6 s to encode and send,
+// during which the connection's Pong waits behind it and the client drops the
+// socket after its 5 s ping timeout. A client asks for the snapshot of the cwd
+// it is showing when that entry is missing, so the few most recently requested
+// cwds cover the threads open on screen.
+export const MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER = 3;
 
 export function upsertProviderWorkspaceSnapshot(
   provider: ServerProvider,
