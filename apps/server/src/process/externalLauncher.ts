@@ -24,6 +24,7 @@ import { isCommandAvailable, resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
@@ -463,8 +464,16 @@ const resolveFileManagerRevealKind = Effect.fn("externalLauncher.resolveFileMana
 // on the connection fiber under a timeout (`resolveAvailableEditorsForConfig`),
 // so one client disconnecting mid-scan would cache the interrupt and replay it
 // to every later connect for the whole TTL, breaking `server.getConfig`
-// permanently. Storing only on success means an interrupted scan leaves the
-// cache untouched and the next connect simply rescans.
+// permanently. Storing only on success means a failed scan leaves the cache
+// untouched and the next connect simply rescans.
+//
+// The scan itself runs detached from the caller. On a loaded host a cold scan
+// can take longer than the caller's 5 s config timeout; when the scan ran on
+// the caller's fiber, that timeout interrupted it, nothing was ever cached,
+// and every connect paid the full 5 s again and reported no editors. Detached,
+// a timed-out caller only stops waiting: the scan finishes, fills the cache,
+// and the next connect is instant. Once a set has been discovered, an expired
+// entry is still returned at once while a single background scan refreshes it.
 // Expiry uses the monotonic clock (Clock.currentTimeNanos), matching the
 // command-resolution cache in @t3tools/shared/shell, so a backward wall-clock
 // adjustment cannot keep an expired entry alive.
@@ -473,6 +482,11 @@ const EDITOR_DISCOVERY_CACHE_TTL_NANOS = 60_000_000_000n;
 interface EditorDiscoveryCacheEntry {
   readonly editors: ReadonlyArray<EditorId>;
   readonly expiresAtNanos: bigint;
+}
+
+interface EditorDiscoveryState {
+  readonly cached: Option.Option<EditorDiscoveryCacheEntry>;
+  readonly inFlight: Option.Option<Deferred.Deferred<ReadonlyArray<EditorId>>>;
 }
 
 /**
@@ -756,26 +770,59 @@ export const make = Effect.gen(function* () {
       Effect.provideService(Path.Path, path),
     );
 
-  const editorDiscoveryCache = yield* Ref.make<Option.Option<EditorDiscoveryCacheEntry>>(
-    Option.none(),
+  const editorDiscovery = yield* Ref.make<EditorDiscoveryState>({
+    cached: Option.none(),
+    inFlight: Option.none(),
+  });
+  const scanAvailableEditors = provideCommandResolutionServices(resolveAvailableEditors()).pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
   );
+  // Returns the scan in flight, starting one if none is running. The scan is
+  // detached, so interrupting a waiter never interrupts the scan.
+  const ensureEditorScan = Effect.gen(function* () {
+    const fresh = yield* Deferred.make<ReadonlyArray<EditorId>>();
+    const [deferred, started] = yield* Ref.modify(
+      editorDiscovery,
+      (state): readonly [readonly [Deferred.Deferred<ReadonlyArray<EditorId>>, boolean], EditorDiscoveryState] =>
+        Option.isSome(state.inFlight)
+          ? [[state.inFlight.value, false], state]
+          : [[fresh, true], { ...state, inFlight: Option.some(fresh) }],
+    );
+    if (started) {
+      yield* scanAvailableEditors.pipe(
+        Effect.tap((editors) =>
+          Effect.flatMap(Clock.currentTimeNanos, (nowNanos) =>
+            Ref.update(editorDiscovery, (state) => ({
+              ...state,
+              cached: Option.some({
+                editors,
+                expiresAtNanos: nowNanos + EDITOR_DISCOVERY_CACHE_TTL_NANOS,
+              }),
+            })),
+          ),
+        ),
+        Effect.exit,
+        Effect.flatMap((exit) =>
+          Ref.update(editorDiscovery, (state) => ({ ...state, inFlight: Option.none() })).pipe(
+            Effect.andThen(Deferred.done(deferred, exit)),
+          ),
+        ),
+        Effect.forkDetach({ startImmediately: true }),
+      );
+    }
+    return deferred;
+  });
   const cachedAvailableEditors = Effect.gen(function* () {
     const nowNanos = yield* Clock.currentTimeNanos;
-    const entry = yield* Ref.get(editorDiscoveryCache);
-    if (Option.isSome(entry) && entry.value.expiresAtNanos > nowNanos) {
-      return entry.value.editors;
+    const { cached } = yield* Ref.get(editorDiscovery);
+    if (Option.isSome(cached) && cached.value.expiresAtNanos > nowNanos) {
+      return cached.value.editors;
     }
-    const editors = yield* provideCommandResolutionServices(resolveAvailableEditors()).pipe(
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    );
-    yield* Ref.set(
-      editorDiscoveryCache,
-      Option.some({
-        editors,
-        expiresAtNanos: nowNanos + EDITOR_DISCOVERY_CACHE_TTL_NANOS,
-      }),
-    );
-    return editors;
+    const scan = yield* ensureEditorScan;
+    if (Option.isSome(cached)) {
+      return cached.value.editors;
+    }
+    return yield* Deferred.await(scan);
   });
 
   return ExternalLauncher.of({

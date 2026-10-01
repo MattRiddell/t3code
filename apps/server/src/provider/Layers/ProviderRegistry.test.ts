@@ -45,6 +45,7 @@ import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
 import {
   mergeProviderSnapshot,
+  MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER,
   upsertProviderWorkspaceSnapshot,
   ProviderRegistryLive,
 } from "./ProviderRegistry.ts";
@@ -610,6 +611,38 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             skills: scopedSnapshot.skills,
           },
         ]);
+      });
+
+      it("keeps only the most recently refreshed workspace snapshots", () => {
+        const provider = {
+          instanceId: ProviderInstanceId.make("codex"),
+          driver: ProviderDriverKind.make("codex"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-03-25T00:00:00.000Z",
+          version: "1.0.0",
+          models: [],
+          slashCommands: [],
+          skills: [],
+        } satisfies ServerProvider;
+        const cwds = Array.from(
+          { length: MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER + 2 },
+          (_, index) => `/project-${index}`,
+        );
+        let result: ServerProvider = provider;
+        for (const cwd of cwds) {
+          result = upsertProviderWorkspaceSnapshot(result, cwd, provider);
+        }
+        // Refreshing an older cwd again moves it to the most recent slot.
+        const revisited = cwds[cwds.length - MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER]!;
+        result = upsertProviderWorkspaceSnapshot(result, revisited, provider);
+
+        assert.deepStrictEqual(
+          result.workspaceSnapshots?.map((snapshot) => snapshot.cwd),
+          [...cwds.slice(-(MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER - 1)), revisited],
+        );
       });
 
       it("preserves previously discovered provider models when a refresh returns none", () => {
