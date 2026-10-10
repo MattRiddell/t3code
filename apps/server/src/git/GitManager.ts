@@ -165,8 +165,19 @@ const SHORT_SHA_LENGTH = 7;
 const TOAST_DESCRIPTION_MAX = 72;
 const STATUS_RESULT_CACHE_TTL = Duration.seconds(1);
 const STATUS_RESULT_CACHE_CAPACITY = 2_048;
-const PR_LOOKUP_CACHE_TTL = Duration.seconds(60);
-const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(5);
+// Fork patch (MattRiddell/t3code, board #15036): an open PR's lookup is kept
+// for ten minutes, not one. Upstream matched the one-minute settlement sweep
+// so an external merge settled within about a minute, but that re-asked
+// GitHub for every open-PR branch every minute (500 to 1,100 GraphQL calls an
+// hour on the fleet box). A PR badge or an external merge can now lag up to
+// ten minutes. Git actions, turn ends and user refreshes still bypass this
+// cache, and failed lookups still back off via prLookupFailureTtl.
+const PR_LOOKUP_CACHE_TTL = Duration.minutes(10);
+// Answers without an open PR ("no PR yet", merged, closed) only change when
+// someone opens a PR, and the paths that do that in-app (turn end, push,
+// create PR, user refresh) bypass this cache. They wait at least as long as
+// an open PR's answer (fork patch, board #15036; upstream: five minutes).
+const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(10);
 const PR_LOOKUP_FAILURE_BASE_TTL = Duration.seconds(20);
 const PR_LOOKUP_FAILURE_MAX_TTL = Duration.minutes(15);
 const PR_LOOKUP_CACHE_CAPACITY = 2_048;

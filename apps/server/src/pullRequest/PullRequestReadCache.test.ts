@@ -99,6 +99,10 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
     ),
   );
 
+  it("keeps an entry for ten minutes (fork patch #15036)", () => {
+    assert.strictEqual(Duration.toMillis(PullRequestReadCache.ENTRY_TTL), 600_000);
+  });
+
   it.effect("reuses files after restart and respects the original expiry", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -108,7 +112,9 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
       const first = yield* cacheLayer(directory);
       const key = "long/repository/key".repeat(100);
       assert.strictEqual(yield* first.get(key, lookup), "1");
-      yield* TestClock.adjust("59 seconds");
+      yield* TestClock.adjust(
+        Duration.subtract(PullRequestReadCache.ENTRY_TTL, Duration.seconds(1)),
+      );
       const restarted = yield* cacheLayer(directory);
       assert.strictEqual(yield* restarted.get(key, lookup), "1");
       yield* TestClock.adjust("1 second");
@@ -222,7 +228,9 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
       for (let index = 0; index < 100; index++) yield* cache.invalidate(`pr-${index}`);
       assert.strictEqual((yield* fs.readDirectory(directory)).length, 2);
       const before = (yield* fs.stat(`${directory}/revisions`)).size;
-      yield* TestClock.adjust("59 seconds");
+      yield* TestClock.adjust(
+        Duration.subtract(PullRequestReadCache.ENTRY_TTL, Duration.seconds(1)),
+      );
       assert.strictEqual(yield* cache.get("summary", Effect.succeed("fresh"), ["pr"]), "fresh");
       yield* TestClock.adjust("1 second");
       yield* cache.invalidate("other-pr");
