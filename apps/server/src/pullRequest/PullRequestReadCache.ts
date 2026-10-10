@@ -30,11 +30,19 @@ const STORE_ID = "pr-v2";
 // An entry file is the store id followed by the SHA-256 hex digest of its key.
 const ENTRY_FILE_NAME = new RegExp(`^${STORE_ID}[0-9a-f]{64}$`);
 /**
- * Entries expire a minute after they are written, and a write sets the file's
+ * Entries expire ENTRY_TTL after they are written, and a write sets the file's
  * mtime. A file untouched for a day is long expired; the day only leaves slack
  * for clock changes. Pruning a live entry would cost one refetch.
  */
 export const ENTRY_FILE_MAX_AGE = Duration.days(1);
+/**
+ * Fork patch (MattRiddell/t3code, board #15036): a pull request read is kept
+ * for ten minutes, not one, so the settlement and sync sweeps stop re-reading
+ * every PR from GitHub each minute. A scope invalidation lasts as long as an
+ * entry, so an entry read before the invalidation can never outlive it.
+ */
+export const ENTRY_TTL = Duration.minutes(10);
+const ENTRY_TTL_MILLIS = Duration.toMillis(ENTRY_TTL);
 type ReadError = PullRequestOperationError | PullRequestUnavailableError;
 const revisionCodec = Schema.fromJsonString(
   Schema.Record(
@@ -107,7 +115,7 @@ export const make = Effect.gen(function* () {
       request.lookup.pipe(
         Effect.map((payload) => ({
           payload,
-          expiresAt: clock.currentTimeMillisUnsafe() + 60_000,
+          expiresAt: clock.currentTimeMillisUnsafe() + ENTRY_TTL_MILLIS,
           revision: request.revision,
         })),
       ),
@@ -162,7 +170,7 @@ export const make = Effect.gen(function* () {
         const next = Object.fromEntries(
           Object.entries(current).filter(([, value]) => value.expiresAt > now),
         );
-        next[scope] = { revision: yield* crypto.randomUUIDv4, expiresAt: now + 60_000 };
+        next[scope] = { revision: yield* crypto.randomUUIDv4, expiresAt: now + ENTRY_TTL_MILLIS };
         const encoded = yield* Schema.encodeEffect(revisionCodec)(next);
         yield* backing.set("revisions", encoded);
         yield* Cache.set(revisions, undefined, next);
