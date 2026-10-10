@@ -664,6 +664,119 @@ describe("XAiAcpExtension", () => {
     ]);
   });
 
+  it("hydrates an auto-backgrounded shell command whose task id is its call id (#16214)", () => {
+    // Live 2026-10-08 (lcr-bench fe-14222 grok-4.7): Grok moved a foreground
+    // run_terminal_command to the background after 15s and reused the tool
+    // call id as the task id. The UUID-only match dropped this TaskOutput, the
+    // tool row stayed running and deferred finalize never ended the turn.
+    const taskId = "call-586d8645-9bbb-44f9-a337-ed45d3b87124-70";
+    expect(
+      extractXAiMonitorTaskId({
+        toolCallId: taskId,
+        title: "[bg] yarn compile (call-586)",
+        status: "completed",
+        data: {
+          rawOutput: {
+            type: "BackgroundTaskStarted",
+            task_id: taskId,
+            task_type: "bash",
+            status: "running",
+            command: "yarn compile",
+          },
+        },
+      }),
+    ).toBe(taskId);
+    expect(
+      extractXAiBackgroundTaskCompletion({
+        toolCallId: "call-fe86669b-694a-434d-b9b2-c7ef58375311-71",
+        title: "yarn compile (call-586)",
+        status: "completed",
+        data: {
+          rawInput: { variant: "TaskOutput", task_ids: [taskId], timeout_ms: 300000 },
+          rawOutput: {
+            type: "TaskOutput",
+            Result: {
+              task_id: taskId,
+              command: "yarn compile",
+              status: "failed",
+              exit_code: 2,
+              output: "error TS2304: Cannot find name 'x'.\n",
+            },
+          },
+        },
+      }),
+    ).toEqual([{ taskId, status: "failed", appendOutput: "error TS2304: Cannot find name 'x'." }]);
+  });
+
+  it("hydrates a call-id task from the request list and the task header (#16214)", () => {
+    const taskId = "call-586d8645-9bbb-44f9-a337-ed45d3b87124-70";
+    expect(
+      extractXAiBackgroundTaskCompletion({
+        toolCallId: "call-get-call-id-request",
+        title: "get_command_or_subagent_output",
+        status: "completed",
+        data: {
+          rawInput: { variant: "TaskOutput", task_ids: [taskId] },
+          rawOutput: { type: "TaskOutput", Result: { status: "completed", output: "done\n" } },
+        },
+      }),
+    ).toMatchObject([{ taskId, status: "completed" }]);
+    expect(
+      extractXAiBackgroundTaskCompletion({
+        toolCallId: "call-get-call-id-header",
+        title: "get_command_or_subagent_output",
+        status: "completed",
+        data: {
+          rawInput: { variant: "TaskOutput" },
+          content: [
+            {
+              type: "content",
+              content: { type: "text", text: `=== Task ${taskId} ===\nStatus: completed\ndone` },
+            },
+          ],
+        },
+      }),
+    ).toMatchObject([{ taskId }]);
+  });
+
+  it("still ignores TaskOutput ids that are neither a UUID nor a Grok call id", () => {
+    for (const taskId of [
+      "call-get-mon",
+      "not-a-task",
+      "call-586d8645-9bbb-44f9-a337-ed45d3b87124-x",
+    ]) {
+      expect(
+        extractXAiBackgroundTaskCompletion({
+          toolCallId: "call-get-bogus",
+          title: "get_command_or_subagent_output",
+          status: "completed",
+          data: {
+            rawInput: { variant: "TaskOutput", task_ids: [taskId] },
+            rawOutput: { type: "TaskOutput", Result: { task_id: taskId, status: "completed" } },
+          },
+        }),
+      ).toEqual([]);
+    }
+  });
+
+  it("does not report a call-id TaskOutput as a subagent (#16214)", () => {
+    const taskId = "call-586d8645-9bbb-44f9-a337-ed45d3b87124-70";
+    expect(
+      extractXAiAcpSubagentUpdate({
+        toolCallId: "call-fe86669b-694a-434d-b9b2-c7ef58375311-71",
+        title: "yarn compile (call-586)",
+        status: "completed",
+        data: {
+          rawInput: { variant: "TaskOutput", task_ids: [taskId] },
+          rawOutput: {
+            type: "TaskOutput",
+            Result: { task_id: taskId, status: "failed", exit_code: 2, output: "x\n" },
+          },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
   it("hydrates monitor completion from a standalone TaskOutput frame without rawInput", () => {
     // Post-settle shape observed live (2026-07-12): the final
     // get_command_or_subagent_output update carries only rawOutput; the frame
