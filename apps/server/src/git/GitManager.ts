@@ -166,19 +166,19 @@ const SHORT_SHA_LENGTH = 7;
 const TOAST_DESCRIPTION_MAX = 72;
 const STATUS_RESULT_CACHE_TTL = Duration.seconds(1);
 const STATUS_RESULT_CACHE_CAPACITY = 2_048;
-// Matches the automatic settlement sweep cadence so every background sweep
-// reads fresh branch state: an external merge settles within about a minute
-// instead of waiting out a longer cache. Unpublished branches never reach the
-// host (a local probe answers first), and failed lookups still back off
-// exponentially via prLookupFailureTtl, so throttling pressure still drops
-// under 429s instead of amplifying it.
-const PR_LOOKUP_CACHE_TTL = Duration.seconds(60);
+// Fork patch (MattRiddell/t3code, board #15036): an open PR's lookup is kept
+// for ten minutes, not one. Upstream matched the one-minute settlement sweep
+// so an external merge settled within about a minute, but that re-asked
+// GitHub for every open-PR branch every minute (500 to 1,100 GraphQL calls an
+// hour on the fleet box). A PR badge or an external merge can now lag up to
+// ten minutes. Git actions, turn ends and user refreshes still bypass this
+// cache, and failed lookups still back off via prLookupFailureTtl.
+const PR_LOOKUP_CACHE_TTL = Duration.minutes(10);
 // Answers without an open PR ("no PR yet", merged, closed) only change when
 // someone opens a PR, and the paths that do that in-app (turn end, push,
-// create PR, user refresh) bypass this cache. Re-asking every minute for each
-// idle branch was the bulk of background GitHub quota use, so these wait out
-// a longer TTL and a PR opened outside the app shows up within minutes.
-const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(5);
+// create PR, user refresh) bypass this cache. They wait at least as long as
+// an open PR's answer (fork patch, board #15036; upstream: five minutes).
+const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(10);
 const PR_LOOKUP_FAILURE_BASE_TTL = Duration.seconds(20);
 const PR_LOOKUP_FAILURE_MAX_TTL = Duration.minutes(15);
 const PR_LOOKUP_CACHE_CAPACITY = 2_048;

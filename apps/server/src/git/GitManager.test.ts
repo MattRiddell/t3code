@@ -1717,59 +1717,55 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
-  it.effect("branch PR lookup rechecks open PRs every minute and settled answers less often", () =>
-    Effect.gen(function* () {
-      const repoDir = yield* makeTempDir("t3code-git-manager-");
-      yield* initRepo(repoDir);
-      const remoteDir = yield* createBareRemote();
-      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
-      for (const branch of ["feature/open-pr", "feature/merged-pr", "feature/no-pr"]) {
-        yield* runGit(repoDir, ["checkout", "-b", branch, "main"]);
-        yield* runGit(repoDir, ["push", "-u", "origin", branch]);
-      }
-      const pullRequest = (number: number, headRefName: string, state: string) => ({
-        number,
-        title: headRefName,
-        url: `https://github.com/pingdotgg/codething-mvp/pull/${number}`,
-        baseRefName: "main",
-        headRefName,
-        state,
-        updatedAt: "2026-04-07T15:00:00Z",
-      });
-      const { manager, ghCalls } = yield* makeManager({
-        ghScenario: {
-          prListByHeadSelector: {
-            "feature/open-pr": encodeCliJson([pullRequest(301, "feature/open-pr", "OPEN")]),
-            "feature/merged-pr": encodeCliJson([pullRequest(302, "feature/merged-pr", "MERGED")]),
+  it.effect(
+    "branch PR lookup keeps open and settled answers for ten minutes (fork patch #15036)",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        yield* initRepo(repoDir);
+        const remoteDir = yield* createBareRemote();
+        yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+        for (const branch of ["feature/open-pr", "feature/merged-pr", "feature/no-pr"]) {
+          yield* runGit(repoDir, ["checkout", "-b", branch, "main"]);
+          yield* runGit(repoDir, ["push", "-u", "origin", branch]);
+        }
+        const pullRequest = (number: number, headRefName: string, state: string) => ({
+          number,
+          title: headRefName,
+          url: `https://github.com/pingdotgg/codething-mvp/pull/${number}`,
+          baseRefName: "main",
+          headRefName,
+          state,
+          updatedAt: "2026-04-07T15:00:00Z",
+        });
+        const { manager, ghCalls } = yield* makeManager({
+          ghScenario: {
+            prListByHeadSelector: {
+              "feature/open-pr": encodeCliJson([pullRequest(301, "feature/open-pr", "OPEN")]),
+              "feature/merged-pr": encodeCliJson([pullRequest(302, "feature/merged-pr", "MERGED")]),
+            },
           },
-        },
-      });
-      const lookupAll = Effect.forEach(
-        ["feature/open-pr", "feature/merged-pr", "feature/no-pr"],
-        (branch) => manager.branchPullRequest({ cwd: repoDir, branch }),
-      );
-      const prListCalls = () => ghCalls.filter((call) => call.startsWith("pr list "));
+        });
+        const lookupAll = Effect.forEach(
+          ["feature/open-pr", "feature/merged-pr", "feature/no-pr"],
+          (branch) => manager.branchPullRequest({ cwd: repoDir, branch }),
+        );
+        const prListCalls = () => ghCalls.filter((call) => call.startsWith("pr list "));
 
-      yield* lookupAll;
-      expect(prListCalls()).toHaveLength(3);
+        yield* lookupAll;
+        expect(prListCalls()).toHaveLength(3);
 
-      yield* TestClock.adjust("61 seconds");
-      yield* lookupAll;
-      expect(prListCalls()).toHaveLength(4);
-      expect(prListCalls().at(-1)).toContain("--head feature/open-pr");
+        // Just inside ten minutes nothing is asked again, not even the open PR.
+        yield* TestClock.adjust("599 seconds");
+        yield* lookupAll;
+        expect(prListCalls()).toHaveLength(3);
 
-      // Just inside the 5-minute window only the open PR is asked again.
-      yield* TestClock.adjust("238 seconds");
-      yield* lookupAll;
-      expect(prListCalls()).toHaveLength(5);
-      expect(prListCalls().at(-1)).toContain("--head feature/open-pr");
-
-      // Just past it the settled answers expire too.
-      yield* TestClock.adjust("2 seconds");
-      yield* lookupAll;
-      expect(prListCalls()).toHaveLength(7);
-      expect(prListCalls().slice(-2).join("\n")).not.toContain("--head feature/open-pr");
-    }),
+        // Just past it all three answers expire.
+        yield* TestClock.adjust("2 seconds");
+        yield* lookupAll;
+        expect(prListCalls()).toHaveLength(6);
+        expect(prListCalls().slice(-3).join("\n")).toContain("--head feature/open-pr");
+      }),
   );
 
   it.effect("branch PR lookup announces a pull request when it reads it merged", () =>
@@ -1811,8 +1807,8 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
 
         yield* lookup("feature/merges-later");
         yield* lookup("feature/already-merged");
-        // Open answers are re-read after a minute.
-        yield* TestClock.adjust("61 seconds");
+        // Open answers are re-read after ten minutes (fork patch #15036).
+        yield* TestClock.adjust("601 seconds");
         expect((yield* lookup("feature/merges-later"))?.state).toBe("merged");
 
         const announced = yield* Stream.runCollect(Stream.take(changes, 2));
