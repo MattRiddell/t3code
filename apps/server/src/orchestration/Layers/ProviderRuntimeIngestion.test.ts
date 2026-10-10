@@ -1026,6 +1026,42 @@ describe("ProviderRuntimeIngestion", () => {
     }),
   );
 
+  it("settles an active turn when the provider session exits without completion", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-provider-exit");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-before-provider-exit"),
+      provider: ProviderDriverKind.make("opencode"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      payload: {},
+    });
+    await waitForThread(harness.readModel, (entry) => entry.session?.activeTurnId === turnId);
+
+    harness.emit({
+      type: "session.exited",
+      eventId: asEventId("evt-provider-exited-without-completion"),
+      provider: ProviderDriverKind.make("opencode"),
+      threadId,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      payload: {
+        reason: "Provider child process exited.",
+        recoverable: false,
+        exitKind: "error",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "stopped" && entry.session.activeTurnId === null,
+    );
+    expect(thread.session?.activeTurnId).toBeNull();
+  });
+
   it("does not clear active turn when session/thread started arrives mid-turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

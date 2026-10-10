@@ -27,6 +27,12 @@ import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
+export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
+  /** An orchestration turn remembered across provider-session loss. Adapters
+      may adopt it only after reconciling against live provider state. */
+  readonly resumedActiveTurnId?: TurnId;
+};
+
 /**
  * How ProviderService runs manual context compaction for an adapter.
  * Native adapters expose a start call and must emit a compacted thread state
@@ -75,7 +81,7 @@ export interface ProviderAdapterShape<TError> {
    * Start a provider-backed session.
    */
   readonly startSession: (
-    input: ProviderSessionStartInput,
+    input: ProviderAdapterSessionStartInput,
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**
