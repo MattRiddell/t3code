@@ -141,6 +141,11 @@ export interface XAiAcpSubagentEndNotice {
 }
 
 const XAI_UUID_RE = "[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}";
+// Background task ids: a bare UUID (monitors, subagents) or, when Grok
+// auto-backgrounds a foreground shell command, its tool call id
+// (`call-<uuid>-<n>`). Matching only the UUID form left those commands running
+// forever, so deferred finalize never ended the turn (board #16214).
+const XAI_BACKGROUND_TASK_ID_RE = `(?:call-)?${XAI_UUID_RE}(?:-\\d+)?`;
 
 function unknownRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -360,14 +365,14 @@ export function extractXAiBackgroundTaskCompletion(toolCall: AcpToolCallState): 
   const appendOutput = resultFromGetOutputTool(toolCall, text) ?? "";
   // Prefer the completed identity from the result/header over the request list
   // (one call can poll multiple task_ids).
-  const resultTaskId = resultTaskIdFromGetOutputTool(toolCall, text);
+  const resultTaskId = resultTaskIdFromGetOutputTool(toolCall, text, XAI_BACKGROUND_TASK_ID_RE);
   if (resultTaskId !== undefined) {
     return [{ taskId: resultTaskId, status, appendOutput }];
   }
   const requestIds: string[] = [];
   const push = (value: unknown) => {
     const id = nonEmptyString(value);
-    if (id !== undefined && new RegExp(`^${XAI_UUID_RE}$`, "i").test(id)) {
+    if (id !== undefined && new RegExp(`^${XAI_BACKGROUND_TASK_ID_RE}$`, "i").test(id)) {
       requestIds.push(id);
     }
   };
@@ -813,6 +818,7 @@ function taskIdsFromGetOutputTool(
 function resultTaskIdFromGetOutputTool(
   toolCall: AcpToolCallState,
   output: string | undefined,
+  idPattern: string = XAI_UUID_RE,
 ): string | undefined {
   const rawOutput = unknownRecord(toolCall.data.rawOutput);
   const result = unknownRecord(rawOutput?.Result) ?? unknownRecord(rawOutput?.result);
@@ -821,13 +827,13 @@ function resultTaskIdFromGetOutputTool(
     nonEmptyString(result?.taskId) ??
     nonEmptyString(rawOutput?.task_id) ??
     nonEmptyString(rawOutput?.taskId);
-  if (structured !== undefined && new RegExp(`^${XAI_UUID_RE}$`, "i").test(structured)) {
+  if (structured !== undefined && new RegExp(`^${idPattern}$`, "i").test(structured)) {
     return structured;
   }
   if (output === undefined) return undefined;
   const taskHeader = firstUuidMatch(
     output,
-    new RegExp(`===\\s*Task\\s+(${XAI_UUID_RE})\\s*===`, "i"),
+    new RegExp(`===\\s*Task\\s+(${idPattern})\\s*===`, "i"),
   );
   return taskHeader;
 }
