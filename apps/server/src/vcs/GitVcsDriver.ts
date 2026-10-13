@@ -464,7 +464,8 @@ function parseGitRemoteVerboseOutput(
       continue;
     }
 
-    const match = /^(\S+)\s+(\S+)\s+\((fetch|push)\)$/.exec(trimmed);
+    // A partial clone's lines end with its filter, e.g. `origin <url> (fetch) [blob:none]`.
+    const match = /^(\S+)\s+(\S+)\s+\((fetch|push)\)(?:\s+\[[^\]]*\])?$/.exec(trimmed);
     if (!match) {
       continue;
     }

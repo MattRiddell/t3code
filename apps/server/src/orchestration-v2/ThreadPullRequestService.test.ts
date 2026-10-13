@@ -307,7 +307,8 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           yield* Deferred.succeed(activation, undefined);
           expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: false });
           yield* service.drain;
-          yield* TestClock.adjust("1 minute");
+          // Its project is gone, so backfill finishes it on the first pass.
+          yield* TestClock.adjust(ThreadPullRequestService.PERIODIC_PASS_INTERVAL);
           expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: true });
           yield* service.drain;
         }).pipe(Effect.provide(layerDependencies));
