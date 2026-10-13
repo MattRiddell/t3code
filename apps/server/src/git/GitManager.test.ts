@@ -1250,7 +1250,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
-  it.effect("turn-end refresh finds a new PR and keeps known PRs cached", () =>
+  it.effect("turn-end refresh keeps a no-PR answer until its TTL, then finds the new PR", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
@@ -1282,6 +1282,14 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         (yield* manager.remoteStatus({ cwd: repoDir }, { refreshUpstream: false }))?.pr,
       ).toBeNull();
 
+      // Fork patch (board #15036): the run end reads the cached answer, no GitHub call.
+      const atRunEnd = yield* manager.remoteStatus(
+        { cwd: repoDir },
+        { refreshUpstream: false, refreshMissingPullRequest: true },
+      );
+      expect(atRunEnd?.pr).toBeNull();
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+      yield* TestClock.adjust("10 minutes");
       const refreshed = yield* manager.remoteStatus(
         { cwd: repoDir },
         { refreshUpstream: false, refreshMissingPullRequest: true },

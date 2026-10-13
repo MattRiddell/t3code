@@ -1282,14 +1282,11 @@ export const make = Effect.gen(function* () {
     // `push -u`) must not orphan the fallback value for the same branch.
     const branchKey = `${cwd}\u0000${details.branch}`;
     const cacheKey = prLookupCacheKey(cwd, details);
-    if (refreshMissingPullRequest) {
-      const cached = yield* Cache.getOption(prLookupCache, cacheKey).pipe(
-        Effect.orElseSucceed(() => Option.none()),
-      );
-      if (Option.isSome(cached) && cached.value.latest === null) {
-        yield* Cache.invalidate(prLookupCache, cacheKey);
-      }
-    }
+    // Fork patch (board #15036): a finished run no longer drops a cached "no pull request"
+    // answer. Every run end cost one GitHub read; a pull request opened during the run now
+    // shows when the answer's PR_LOOKUP_NO_OPEN_PR_CACHE_TTL ends (Matt, q3440: PR badges
+    // can lag up to 10 min). A user-driven refresh still bumps the epoch (invalidateStatus).
+    void refreshMissingPullRequest;
     return yield* getPrLookup(cacheKey).pipe(
       Effect.map(({ latest, headContext }) => {
         if (!latest) return { pr: null, headContext };
