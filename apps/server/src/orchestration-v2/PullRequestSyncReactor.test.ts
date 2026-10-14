@@ -23,6 +23,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -296,7 +297,7 @@ const sweepAgain = Effect.fn("sweepPullRequestSyncHarness")(function* (
   fixture: Harness,
   reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
 ) {
-  yield* TestClock.adjust("1 minute");
+  yield* TestClock.adjust(PullRequestSyncReactor.nextPassDelay(yield* Clock.currentTimeMillis));
   yield* Queue.take(fixture.snapshotReads);
   yield* reactor.drain;
 });
@@ -686,7 +687,7 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           yield* Ref.set(state, "merged");
 
-          // The clock stays put: the next sweep is still a minute away.
+          // The clock stays put: the next sweep is still ten minutes away.
           yield* Queue.offer(fixture.stateChanges, {
             host: "github.com",
             repository: "owner/repository",
@@ -699,6 +700,37 @@ describe("PullRequestSyncReactor", () => {
           assert.deepStrictEqual(
             (yield* Ref.get(fixture.syncCommands)).map((command) => command.snapshot.state),
             ["merged"],
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("sweeps just after each ten-minute tick, not every minute", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Starts three minutes past a tick: the next pass waits for the tick, not ten minutes.
+        yield* TestClock.setTime(Date.parse(NOW) + 3 * 60_000);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("agent", { pullRequests: [makeLink(7, { state: "open" })] }),
+          ]),
+        });
+        const reads = Ref.get(fixture.summaryCalls).pipe(Effect.map((calls) => calls.length));
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          assert.strictEqual(yield* reads, 1);
+          yield* TestClock.adjust("1 minute");
+          assert.strictEqual(yield* reads, 1);
+          yield* TestClock.adjust("6 minutes");
+          assert.strictEqual(yield* reads, 1);
+          yield* TestClock.adjust("1 second");
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.strictEqual(yield* reads, 2);
+          assert.strictEqual(
+            Duration.toMillis(PullRequestSyncReactor.nextPassDelay(yield* Clock.currentTimeMillis)),
+            10 * 60_000,
           );
         }).pipe(Effect.provide(fixture.layer));
       }),
@@ -721,7 +753,8 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
           yield* Ref.set(state, "open");
-          for (let index = 0; index < 14; index += 1) yield* sweepAgain(fixture, reactor);
+          // The pass ten minutes later is too soon; the next one, past fifteen, reads it.
+          yield* sweepAgain(fixture, reactor);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
           yield* sweepAgain(fixture, reactor);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
@@ -987,7 +1020,7 @@ describe("PullRequestSyncReactor", () => {
       const parts = Array.isArray(message) ? message : [message];
       if (logLevel === "Warn" && parts[0] === "pull request sync skipped") skips.push(parts);
     });
-    const retryAt = Date.parse(NOW) + 3 * 60_000;
+    const retryAt = Date.parse(NOW) + 25 * 60_000;
     return Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
@@ -1068,7 +1101,7 @@ describe("PullRequestSyncReactor", () => {
     Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
-        const retryAt = Date.parse(NOW) + 3 * 60_000;
+        const retryAt = Date.parse(NOW) + 25 * 60_000;
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([makeThread("one", { pullRequests: [makeLink(7, null)] })]),
           summary: (input) => Effect.succeed(makeSummary(input, { state: "open" })),
