@@ -20,16 +20,17 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as GitManager from "../git/GitManager.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
+import { entryExpiresAt } from "../pullRequest/PullRequestReadCache.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -37,6 +38,20 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import { isTerminalRunStatus } from "./ThreadManagementService.ts";
 
 const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
+/**
+ * Fork patch (board #15036): the periodic pass runs just after each tick of the PR cache's
+ * ten-minute clock (`entryExpiresAt`), not every minute. A one-minute pass found a few stale
+ * pull requests each minute (entries expired one by one, and every finished run invalidates its
+ * project's entries) and sent each handful as its own GraphQL document: about 50 an hour, 1,213
+ * on 2026-10-13. Every entry now expires on the tick, so the pass finds them stale together and
+ * they share one document of 25. Requested reads (a new link, a merge a reader saw, a run that
+ * ran `gh pr merge`) still run at once. A badge's data is at most one tick old when the pass
+ * writes it (Matt, q3440: PR badges can lag up to 10 min).
+ */
+const PASS_AFTER_TICK_MS = 1_000;
+export const nextPassDelay = (nowMs: number): Duration.Duration =>
+  Duration.millis(entryExpiresAt(nowMs) - nowMs + PASS_AFTER_TICK_MS);
+/** Shell commands that can merge or close a pull request without a merge notification. */
 const PULL_REQUEST_CLOSE_COMMAND = /\b(?:gh\s+pr|glab\s+mr)\s+(?:merge|close)\b/u;
 
 const isPullRequestProviderError = Schema.is(PullRequestProviderError);
@@ -452,7 +467,8 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* worker.enqueue("all");
         yield* worker.drain;
-      }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),
+        yield* Effect.sleep(nextPassDelay(yield* Clock.currentTimeMillis));
+      }).pipe(Effect.forever, Effect.asVoid),
     );
   });
 
