@@ -44,14 +44,24 @@ const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
  * pull requests each minute (entries expired one by one, and every finished run invalidates its
  * project's entries) and sent each handful as its own GraphQL document: about 50 an hour, 1,213
  * on 2026-10-13. Every entry now expires on the tick, so the pass finds them stale together and
- * they share one document of 25. Requested reads (a new link, a merge a reader saw, a run that
- * ran `gh pr merge`) still run at once. A badge's data is at most one tick old when the pass
+ * they share one document of 25. Background requests wait for the pass too
+ * (`DEFER_BACKGROUND_SYNC_TO_PASS`); a client's own refresh reads at once. A badge's data is at most one tick old when the pass
  * writes it (Matt, q3440: PR badges can lag up to 10 min).
  */
 const PASS_AFTER_TICK_MS = 1_000;
 export const nextPassDelay = (nowMs: number): Duration.Duration =>
   Duration.millis(entryExpiresAt(nowMs) - nowMs + PASS_AFTER_TICK_MS);
 /** Shell commands that can merge or close a pull request without a merge notification. */
+/**
+ * Fork patch (board #15036): background reasons to re-read a pull request (a state change a
+ * branch lookup or detail read saw, a new link with no snapshot, a run that ran `gh pr merge`)
+ * mark it for the next periodic pass instead of reading it at once. Each read at once was its
+ * own GraphQL document between ticks: about 160 a day on 2026-10-14, most in bursts while
+ * batches merged. The pass reads them with every other due pull request, at most one tick
+ * later (Matt, q3440: PR badges can lag up to 10 min). A client's own refresh still reads at
+ * once through `requestSync`.
+ */
+export const DEFER_BACKGROUND_SYNC_TO_PASS = true;
 const PULL_REQUEST_CLOSE_COMMAND = /\b(?:gh\s+pr|glab\s+mr)\s+(?:merge|close)\b/u;
 
 const isPullRequestProviderError = Schema.is(PullRequestProviderError);
@@ -429,7 +439,7 @@ export const make = Effect.gen(function* () {
               (link) => link.snapshot?.state === "open",
             ),
           ),
-          requestSync,
+          deferSync,
           { discard: true },
         ),
       ),
@@ -441,13 +451,13 @@ export const make = Effect.gen(function* () {
   )(function* () {
     const events = engine.streamDomainEvents;
     // A client reading a pull request, or its branch status, can see it merge or close before
-    // the next sweep does.
+    // the next sweep does. The next pass reads it fresh.
     const stateChanges = Stream.merge(
       yield* pullRequests.subscribeStateChanges,
       yield* git.subscribePullRequestStateChanges,
     );
     yield* forkParked(
-      Stream.runForEach(stateChanges, requestSync).pipe(
+      Stream.runForEach(stateChanges, deferSync).pipe(
         Effect.catchCause(logSkipped("pull request state change stream failed", {})),
       ),
     );
@@ -459,13 +469,13 @@ export const make = Effect.gen(function* () {
               visibleThreadPullRequests(event.payload.pullRequests ?? []).filter(
                 (link) => link.snapshot === null,
               ),
-              requestSync,
+              deferSync,
               { discard: true },
             );
           // An agent can merge or close its pull request from a shell (`gh pr merge`), which
-          // sends no merge notification. When a run that ran such a command ends, read the
-          // thread's open links fresh, so settlement does not wait for the next sweep and the
-          // cached summary. Other runs add no host reads.
+          // sends no merge notification. When a run that ran such a command ends, the next pass
+          // reads the thread's open links fresh rather than from the cached summary. Other runs
+          // add no host reads.
           case "turn-item.updated":
             if (
               event.payload.type === "command_execution" &&
@@ -500,6 +510,14 @@ export const make = Effect.gen(function* () {
       requestedSweepQueued = true;
       return worker.enqueue("requested");
     });
+
+  // Marks the key for the next periodic pass, which reads requested keys with the rest.
+  const deferSync = (key: ThreadPullRequestKey): Effect.Effect<void> =>
+    DEFER_BACKGROUND_SYNC_TO_PASS
+      ? Effect.sync(() => {
+          requested.set(threadPullRequestKeyOf(key), ++requestGeneration);
+        })
+      : requestSync(key);
 
   return { start, drain: worker.drain, requestSync } satisfies PullRequestSyncReactor["Service"];
 });
