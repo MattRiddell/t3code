@@ -400,8 +400,14 @@ const STAT_REQUEST_CONCURRENCY = 4;
  * How long a summary read waits for company. The background sync asks for every linked pull
  * request at once, and each read reaches the resolver after its own cache check, so a batch
  * needs a moment longer than one scheduler tick to gather them.
+ *
+ * Fork patch (board #15036): 250 ms, not 10. Reads whose repository identity was cached reach
+ * the resolver about 65 ms before reads that resolve it with git, so a 10 ms window split one
+ * pass into two documents on a third of the ticks of 2026-10-14. A summary read that reaches
+ * the host takes a second or more, so the wait adds little.
  */
-const SUMMARY_BATCH_WINDOW = "10 millis";
+export const SUMMARY_BATCH_WINDOW_MILLIS = 250;
+const SUMMARY_BATCH_WINDOW = `${SUMMARY_BATCH_WINDOW_MILLIS} millis` as const;
 
 class PullRequestSummaryRead extends Request.Class<
   {

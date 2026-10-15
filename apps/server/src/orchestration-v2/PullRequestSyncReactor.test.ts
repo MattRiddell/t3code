@@ -663,7 +663,7 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
-  it.effect("syncs a pull request a reader saw merge without waiting for the sweep", () =>
+  it.effect("syncs a pull request a reader saw merge, fresh, on the next pass", () =>
     Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
@@ -687,12 +687,19 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           yield* Ref.set(state, "merged");
 
-          // The clock stays put: the next sweep is still ten minutes away.
           yield* Queue.offer(fixture.stateChanges, {
             host: "github.com",
             repository: "owner/repository",
             number: 7,
           });
+          // Fork patch (board #15036): the change waits for the next pass, not a read of its own.
+          yield* TestClock.adjust("1 minute");
+          yield* reactor.drain;
+          assert.deepStrictEqual(yield* Ref.get(invalidated), []);
+          assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
+
+          yield* TestClock.adjust("9 minutes");
+          yield* TestClock.adjust("1 second");
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
 
@@ -1142,7 +1149,7 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
-  it.effect("reads open links fresh only when a run that ran a merge command ends", () =>
+  it.effect("reads open links fresh on the next pass only when a run that ran a merge command ends", () =>
     Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
@@ -1156,7 +1163,10 @@ describe("PullRequestSyncReactor", () => {
           summary: (input) =>
             Ref.get(state).pipe(
               Effect.map((current) =>
-                makeSummary(input, current === "merged" ? { state: current, mergedAt: NOW } : {}),
+                makeSummary(
+                  input,
+                  current === "merged" && input.number === 7 ? { state: current, mergedAt: NOW } : {},
+                ),
               ),
             ),
           invalidate: ({ reference }) =>
@@ -1176,15 +1186,23 @@ describe("PullRequestSyncReactor", () => {
             commandRan(ThreadId.make("agent"), "gh pr merge 7 --squash 2>&1 | tail -3"),
             runUpdated(ThreadId.make("agent"), "completed"),
           ]);
-          // The agent thread's lookup, then the requested sweep.
+          // The agent thread's lookup. Fork patch (board #15036): no read of its own; the links
+          // wait for the next pass.
           yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.deepStrictEqual(yield* Ref.get(invalidated), []);
+          assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
+
+          yield* TestClock.adjust("10 minutes");
+          yield* TestClock.adjust("1 second");
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
 
+          // Only the merged link is read fresh; the pass reads the other open link as usual.
           assert.deepStrictEqual(yield* Ref.get(invalidated), [7]);
           assert.deepStrictEqual(
-            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
-            [7],
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number).toSorted(),
+            [7, 9],
           );
           assert.deepStrictEqual(
             (yield* Ref.get(fixture.syncCommands)).map((command) => [
