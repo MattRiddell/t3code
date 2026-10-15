@@ -953,7 +953,12 @@ layer("GitHubPullRequestApi.layer", (it) => {
         number,
         title: `Pull request ${number}`,
         url: `https://github.com/acme/web/pull/${number}`,
-        author: { __typename: "User", login: "octocat", name: "Octo Cat", avatarUrl: null },
+        author: {
+          __typename: "User",
+          login: "octocat",
+          name: "Octo Cat",
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        },
         baseRefName: "main",
         headRefName: `feat/${number}`,
         state: "OPEN",
@@ -973,7 +978,10 @@ layer("GitHubPullRequestApi.layer", (it) => {
         Effect.succeed(
           output(
             encodeJson({
-              data: { s0: { pullRequest: node(7) }, s1: { pullRequest: node(8) } },
+              data: {
+                _0_repository: { pullRequest: node(7) },
+                _1_repository: { pullRequest: node(8) },
+              },
             }),
           ),
         ),
@@ -992,7 +1000,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
       assert.strictEqual((yield* Fiber.join(early))?.headBranch, "feat/7");
       assert.strictEqual((yield* Fiber.join(late))?.headBranch, "feat/8");
       expect(mockedExecute).toHaveBeenCalledOnce();
-      expect(varsAt(0)).toMatchObject({ s0_number: 7, s1_number: 8 });
+      expect(varsAt(0)).toMatchObject({ _0_number: 7, _1_number: 8 });
     }),
   );
 

@@ -333,6 +333,22 @@ export function extractXAiBackgroundTaskCompletion(toolCall: AcpToolCallState): 
 }> {
   const rawInput = unknownRecord(toolCall.data.rawInput);
   if (!isXAiGetSubagentOutputTool(toolCall, rawInput)) return [];
+  // Caller matches taskId against registered background tools (monitors).
+  // Subagent hydration stays on extractXAiAcpSubagentUpdate.
+  // One call can wait on several task_ids; Grok then reports each task in its
+  // own MultiResult entry and sends no Result or task header (board #16214).
+  const multiResults = multiResultsFromGetOutputTool(toolCall);
+  if (multiResults !== undefined) {
+    return multiResults.flatMap((entry) => {
+      const taskId = nonEmptyString(entry.task_id) ?? nonEmptyString(entry.taskId);
+      if (taskId === undefined || !new RegExp(`^${XAI_BACKGROUND_TASK_ID_RE}$`, "i").test(taskId)) {
+        return [];
+      }
+      const status =
+        toolCall.status === "failed" ? "failed" : (structuredTaskStatus(entry) ?? "running");
+      return [{ taskId, status, appendOutput: structuredTaskOutput(entry) ?? "" }];
+    });
+  }
   const text = xAiToolOutputText(toolCall);
   const status = statusFromGetOutputTool(toolCall, text);
   const appendOutput = resultFromGetOutputTool(toolCall, text) ?? "";
@@ -770,24 +786,61 @@ function resultTaskIdFromGetOutputTool(
   return taskHeader;
 }
 
+/** The per-task entries of a multi-task get_output envelope, when present. */
+function multiResultsFromGetOutputTool(
+  toolCall: AcpToolCallState,
+): ReadonlyArray<Record<string, unknown>> | undefined {
+  const rawOutput = unknownRecord(toolCall.data.rawOutput);
+  const multi = unknownRecord(rawOutput?.MultiResult) ?? unknownRecord(rawOutput?.multiResult);
+  if (!Array.isArray(multi?.results)) return undefined;
+  return multi.results.flatMap((entry: unknown) => {
+    const record = unknownRecord(entry);
+    return record === undefined ? [] : [record];
+  });
+}
+
+/**
+ * Output text of one structured task result. `undefined` when the result has no
+ * output field; `null` when it has one that is empty after cleaning.
+ */
+function structuredTaskOutput(
+  result: Record<string, unknown> | undefined,
+): string | null | undefined {
+  const structured =
+    nonEmptyString(result?.output) ??
+    nonEmptyString(result?.text) ??
+    decodeByteText(result?.output);
+  if (structured === undefined) return undefined;
+  // Drop trailing machine meta blocks when present.
+  const cleaned = structured
+    .replace(/<subagent_meta>[\s\S]*?<\/subagent_meta>/gi, "")
+    .replace(/<subagent_result>[\s\S]*?<\/subagent_result>/gi, "")
+    .trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+/** Task status from a structured result's status or exit code, if it has one. */
+function structuredTaskStatus(
+  result: Record<string, unknown> | undefined,
+): "running" | "completed" | "failed" | undefined {
+  const structuredStatus = nonEmptyString(result?.status)?.toLowerCase();
+  if (structuredStatus === "completed" || structuredStatus === "success") return "completed";
+  if (structuredStatus === "failed" || structuredStatus === "error") return "failed";
+  if (structuredStatus === "running" || structuredStatus === "pending") return "running";
+  if (typeof result?.exit_code === "number") {
+    return result.exit_code === 0 ? "completed" : "failed";
+  }
+  return undefined;
+}
+
 function resultFromGetOutputTool(
   toolCall: AcpToolCallState,
   output: string | undefined,
 ): string | null {
   const rawOutput = unknownRecord(toolCall.data.rawOutput);
   const result = unknownRecord(rawOutput?.Result) ?? unknownRecord(rawOutput?.result);
-  const structured =
-    nonEmptyString(result?.output) ??
-    nonEmptyString(result?.text) ??
-    decodeByteText(result?.output);
-  if (structured !== undefined) {
-    const cleaned = structured
-      .replace(/<subagent_meta>[\s\S]*?<\/subagent_meta>/gi, "")
-      .replace(/<subagent_result>[\s\S]*?<\/subagent_result>/gi, "")
-      .trim();
-    if (cleaned.length > 0) return cleaned;
-    return null;
-  }
+  const structured = structuredTaskOutput(result);
+  if (structured !== undefined) return structured;
   if (output === undefined) return null;
   const marker = output.match(/=== Output ===\s*([\s\S]*)$/i);
   const body = (marker?.[1] ?? output).trim();
@@ -801,13 +854,8 @@ function statusFromGetOutputTool(
   if (toolCall.status === "failed") return "failed";
   const rawOutput = unknownRecord(toolCall.data.rawOutput);
   const result = unknownRecord(rawOutput?.Result) ?? unknownRecord(rawOutput?.result);
-  const structuredStatus = nonEmptyString(result?.status)?.toLowerCase();
-  if (structuredStatus === "completed" || structuredStatus === "success") return "completed";
-  if (structuredStatus === "failed" || structuredStatus === "error") return "failed";
-  if (structuredStatus === "running" || structuredStatus === "pending") return "running";
-  if (typeof result?.exit_code === "number") {
-    return result.exit_code === 0 ? "completed" : "failed";
-  }
+  const structuredStatus = structuredTaskStatus(result);
+  if (structuredStatus !== undefined) return structuredStatus;
   if (output !== undefined) {
     if (/Status:\s*failed/i.test(output) || /Exit Code:\s*-?(?!0\b)\d+/i.test(output)) {
       return "failed";
