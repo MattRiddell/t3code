@@ -91,6 +91,24 @@ export function projectWorkspaceMatchesSnapshot(
   );
 }
 
+/**
+ * Fork patch (board #15036): the periodic pass skips a thread whose branch pull request is
+ * known and open. The pull request sync pass already reads that pull request every ten minutes,
+ * and a head with an open pull request gets no new one until it merges or closes, which that
+ * pass sees. Looking the branch up again cost a GraphQL document on most passes. Threads with
+ * no known pull request, or a merged or closed one, are still looked up every pass.
+ */
+export const hasOpenBranchPullRequest = (thread: OrchestrationV2ThreadShell): boolean => {
+  const known = thread.branchPullRequest;
+  if (known == null) return false;
+  return (thread.pullRequests ?? []).some(
+    (link) =>
+      link.number === known.number &&
+      link.repository.toLowerCase() === known.repository.toLowerCase() &&
+      link.snapshot?.state === "open",
+  );
+};
+
 const BACKFILL_ATTEMPTS = 5;
 /**
  * Fork patch (board #15036): the periodic pass over every unsettled thread runs every ten
@@ -187,6 +205,7 @@ export const make = Effect.gen(function* () {
       (thread) =>
         thread.archivedAt === null &&
         (request.threadId !== null || !isLeftBehindSubagent(thread, activeThreadIds)) &&
+        (request.threadId !== null || !hasOpenBranchPullRequest(thread)) &&
         ((thread.settledOverride !== "settled" && thread.settledAt === null) ||
           request.threadId !== null ||
           pendingBackfill.has(thread.id)) &&

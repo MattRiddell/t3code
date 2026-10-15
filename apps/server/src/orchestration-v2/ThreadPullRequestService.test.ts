@@ -257,6 +257,57 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     ),
   );
 
+  it("periodic passes skip a branch whose pull request is known and open", () => {
+    // Fork patch (board #15036): the pull request sync pass already reads that pull request.
+    const link = (number: number, state: "open" | "merged" | "closed" | null) => ({
+      host: "github.com",
+      repository: "Owner/Repo",
+      number,
+      url: `https://github.com/Owner/Repo/pull/${number}`,
+      source: "created" as const,
+      linkedAt: "2026-09-20T00:00:00.000Z",
+      snapshot:
+        state === null
+          ? null
+          : {
+              state,
+              title: `Pull request ${number}`,
+              headBranch: "feature/x",
+              baseBranch: "main",
+              isDraft: false,
+              updatedAt: "2026-09-20T00:00:00.000Z",
+              syncedAt: "2026-09-20T00:00:00.000Z",
+            },
+      stack: null,
+    });
+    const thread = (
+      branchNumber: number | null,
+      links: ReadonlyArray<ReturnType<typeof link>>,
+    ): OrchestrationV2ThreadShell => ({
+      ...threadShell("thread"),
+      branch: "feature/x",
+      branchPullRequest:
+        branchNumber === null
+          ? null
+          : {
+              projectId: ProjectId.make("project-1"),
+              repository: "owner/repo",
+              number: branchNumber,
+              url: `https://github.com/Owner/Repo/pull/${branchNumber}`,
+            },
+      pullRequests: links,
+    });
+    const skips = ThreadPullRequestService.hasOpenBranchPullRequest;
+    expect(skips(thread(7, [link(7, "open")]))).toBe(true);
+    // Must say no: anything a new lookup could still change.
+    expect(skips(thread(7, [link(7, "merged")]))).toBe(false);
+    expect(skips(thread(7, [link(7, "closed")]))).toBe(false);
+    expect(skips(thread(7, [link(7, null)]))).toBe(false);
+    expect(skips(thread(7, [link(8, "open")]))).toBe(false);
+    expect(skips(thread(null, [link(7, "open")]))).toBe(false);
+    expect(skips(thread(7, []))).toBe(false);
+  });
+
   it.effect("periodic sweeps read only unsettled threads once backfill is done", () =>
     Effect.scoped(
       Effect.gen(function* () {
