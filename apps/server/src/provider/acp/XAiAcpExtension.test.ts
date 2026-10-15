@@ -747,6 +747,68 @@ describe("XAiAcpExtension", () => {
     ).toMatchObject([{ taskId }]);
   });
 
+  it("hydrates each task of a wait_all MultiResult from its own entry (#16214)", () => {
+    // Live 2026-10-14 (lcr-bench fe-10784 grok-4.7-medium): one TaskOutput
+    // waited on two auto-backgrounded commands. Grok answered with
+    // MultiResult.results[] and no Result or text header, so both tasks were
+    // reported running and the turn never ended.
+    const first = "call-c0b011f1-de42-43de-ac33-a3417c0a748f-117";
+    const second = "call-c0b011f1-de42-43de-ac33-a3417c0a748f-118";
+    expect(
+      extractXAiBackgroundTaskCompletion({
+        toolCallId: "call-5ef78a10-7efb-43a2-9820-bf461bb83e6c-119",
+        title: "multi-wait (wait_all)",
+        status: "completed",
+        data: {
+          rawInput: { variant: "TaskOutput", task_ids: [first, second], timeout_ms: 300000 },
+          rawOutput: {
+            type: "TaskOutput",
+            MultiResult: {
+              mode: "wait_all",
+              results: [
+                { task_id: first, status: "completed", exit_code: 0, output: "tests ok\n" },
+                { task_id: second, status: "failed", exit_code: 1, output: "catalog drift\n" },
+              ],
+              summary: "2/2 tasks completed (wait_all)",
+            },
+          },
+        },
+      }),
+    ).toEqual([
+      { taskId: first, status: "completed", appendOutput: "tests ok" },
+      { taskId: second, status: "failed", appendOutput: "catalog drift" },
+    ]);
+  });
+
+  it("keeps a MultiResult entry without a terminal status running (#16214)", () => {
+    const done = "019f44a6-4820-7402-925d-bc862ee711dd";
+    const open = "call-c0b011f1-de42-43de-ac33-a3417c0a748f-118";
+    expect(
+      extractXAiBackgroundTaskCompletion({
+        toolCallId: "call-get-multi-any",
+        title: "multi-wait (wait_any)",
+        status: "completed",
+        data: {
+          rawInput: { variant: "TaskOutput", task_ids: [done, open, "not-a-task"] },
+          rawOutput: {
+            type: "TaskOutput",
+            MultiResult: {
+              mode: "wait_any",
+              results: [
+                { task_id: done, exit_code: 0, output: "" },
+                { task_id: open, status: "running", output: "still going\n" },
+                { task_id: "not-a-task", status: "completed" },
+              ],
+            },
+          },
+        },
+      }),
+    ).toEqual([
+      { taskId: done, status: "completed", appendOutput: "" },
+      { taskId: open, status: "running", appendOutput: "still going" },
+    ]);
+  });
+
   it("still ignores TaskOutput ids that are neither a UUID nor a Grok call id", () => {
     for (const taskId of [
       "call-get-mon",
