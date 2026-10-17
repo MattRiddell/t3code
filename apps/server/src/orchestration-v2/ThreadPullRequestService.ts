@@ -4,6 +4,7 @@ import {
 } from "@t3tools/shared/sourceControl";
 import {
   CommandId,
+  isProviderNativeSubagentThread,
   type OrchestrationProjectShell,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
@@ -90,7 +91,43 @@ export function projectWorkspaceMatchesSnapshot(
   );
 }
 
+/**
+ * Fork patch (board #15036): the periodic pass skips a thread whose branch pull request is
+ * known and open. The pull request sync pass already reads that pull request every ten minutes,
+ * and a head with an open pull request gets no new one until it merges or closes, which that
+ * pass sees. Looking the branch up again cost a GraphQL document on most passes. Threads with
+ * no known pull request, or a merged or closed one, are still looked up every pass.
+ */
+export const hasOpenBranchPullRequest = (thread: OrchestrationV2ThreadShell): boolean => {
+  const known = thread.branchPullRequest;
+  if (known == null) return false;
+  return (thread.pullRequests ?? []).some(
+    (link) =>
+      link.number === known.number &&
+      link.repository.toLowerCase() === known.repository.toLowerCase() &&
+      link.snapshot?.state === "open",
+  );
+};
+
 const BACKFILL_ATTEMPTS = 5;
+/**
+ * Fork patch (board #15036): the periodic pass over every unsettled thread runs every ten
+ * minutes, not every minute. Branch lookups are cached for ten minutes, so a one-minute pass
+ * found a few expired branches each minute and sent each handful to GitHub as its own GraphQL
+ * document. A ten-minute pass finds them expired together, and they share documents.
+ */
+export const PERIODIC_PASS_INTERVAL = "10 minutes";
+
+/**
+ * Fork patch (board #15036): a provider's own subagent works on its root thread's branch. Once
+ * the root is archived or settled the subagent is left behind, unarchived and unsettled, and
+ * every pass looked up its branch again. The fleet's daily bench archived its roots and left
+ * 493 such threads, 231 of the 267 branch lookups a pass made.
+ */
+const isLeftBehindSubagent = (
+  thread: Pick<OrchestrationV2ThreadShell, "lineage" | "creationSource">,
+  activeThreadIds: ReadonlySet<ThreadId>,
+) => isProviderNativeSubagentThread(thread) && !activeThreadIds.has(thread.lineage.rootThreadId);
 
 interface RefreshRequest {
   readonly threadId: ThreadId | null;
@@ -161,9 +198,14 @@ export const make = Effect.gen(function* () {
     for (const threadId of checkedIds) {
       if (!visibleThreadIds.has(threadId)) pendingBackfill.delete(threadId);
     }
+    // A pass over all threads reads only active ones, so a root missing from it is archived
+    // or settled. A single-thread request cannot tell, and keeps its thread.
+    const activeThreadIds = new Set(threadSnapshot.threads.map((thread) => thread.id));
     const threads = threadSnapshot.threads.filter(
       (thread) =>
         thread.archivedAt === null &&
+        (request.threadId !== null || !isLeftBehindSubagent(thread, activeThreadIds)) &&
+        (request.threadId !== null || !hasOpenBranchPullRequest(thread)) &&
         ((thread.settledOverride !== "settled" && thread.settledAt === null) ||
           request.threadId !== null ||
           pendingBackfill.has(thread.id)) &&
@@ -367,8 +409,12 @@ export const make = Effect.gen(function* () {
       case "thread.metadata-updated":
         return worker.enqueue({ threadId: event.threadId, refresh: false });
       case "thread.unsettled":
-      case "checkpoint.captured":
         return worker.enqueue({ threadId: event.threadId, refresh: true });
+      // Fork patch (board #15036): a checkpoint or a finished run reads the cached branch
+      // lookup. Forcing a fresh read cost one GitHub document per run end; a pull request
+      // opened during the run shows within the cache's ten minutes (Matt, q3440).
+      case "checkpoint.captured":
+        return worker.enqueue({ threadId: event.threadId, refresh: false });
       case "run.updated":
         if (
           event.payload.status === "completed" ||
@@ -376,7 +422,7 @@ export const make = Effect.gen(function* () {
           event.payload.status === "cancelled" ||
           event.payload.status === "interrupted"
         ) {
-          return worker.enqueue({ threadId: event.threadId, refresh: true });
+          return worker.enqueue({ threadId: event.threadId, refresh: false });
         }
         break;
     }
@@ -394,7 +440,10 @@ export const make = Effect.gen(function* () {
         yield* Effect.gen(function* () {
           yield* worker.enqueue({ threadId: null, refresh: false });
           yield* worker.drain;
-        }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.delay("1 minute"));
+        }).pipe(
+          Effect.repeat(Schedule.spaced(PERIODIC_PASS_INTERVAL)),
+          Effect.delay(PERIODIC_PASS_INTERVAL),
+        );
       }).pipe(Effect.asVoid),
     );
   });

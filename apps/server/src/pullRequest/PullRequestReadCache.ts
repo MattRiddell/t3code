@@ -29,10 +29,29 @@ const CONCURRENT_READS = 512;
 const STORE_ID = "pr-v2";
 const ENTRY_FILE_NAME = new RegExp(`^${STORE_ID}[0-9a-f]{64}$`);
 /**
- * A file untouched for a day is long expired; the day only leaves slack for
- * clock changes.
+ * Entries expire at most ENTRY_TTL after they are written, and a write sets the file's
+ * mtime. A file untouched for a day is long expired; the day only leaves slack
+ * for clock changes. Pruning a live entry would cost one refetch.
  */
 export const ENTRY_FILE_MAX_AGE = Duration.days(1);
+/**
+ * Fork patch (MattRiddell/t3code, board #15036): a pull request read is kept
+ * for ten minutes, not one, so the settlement and sync sweeps stop re-reading
+ * every PR from GitHub each minute. A scope invalidation lasts as long as an
+ * entry, so an entry read before the invalidation can never outlive it.
+ */
+export const ENTRY_TTL = Duration.minutes(10);
+const ENTRY_TTL_MILLIS = Duration.toMillis(ENTRY_TTL);
+/**
+ * Fork patch (MattRiddell/t3code, board #15036): an entry expires at the next
+ * multiple of ENTRY_TTL since the epoch, not ENTRY_TTL after its own read.
+ * Entries read at different times then go stale together, so the sync
+ * reactor's pass just after each tick reads them together, in shared GraphQL
+ * documents. No entry lives longer than ENTRY_TTL, so a scope invalidation
+ * still outlives every entry read before it.
+ */
+export const entryExpiresAt = (nowMillis: number): number =>
+  (Math.floor(nowMillis / ENTRY_TTL_MILLIS) + 1) * ENTRY_TTL_MILLIS;
 type ReadError = PullRequestOperationError | PullRequestUnavailableError;
 const revisionCodec = Schema.fromJsonString(
   Schema.Record(
@@ -105,7 +124,7 @@ export const make = Effect.gen(function* () {
       request.lookup.pipe(
         Effect.map((payload) => ({
           payload,
-          expiresAt: clock.currentTimeMillisUnsafe() + 60_000,
+          expiresAt: entryExpiresAt(clock.currentTimeMillisUnsafe()),
           revision: request.revision,
         })),
       ),
@@ -160,7 +179,7 @@ export const make = Effect.gen(function* () {
         const next = Object.fromEntries(
           Object.entries(current).filter(([, value]) => value.expiresAt > now),
         );
-        next[scope] = { revision: yield* crypto.randomUUIDv4(), expiresAt: now + 60_000 };
+        next[scope] = { revision: yield* crypto.randomUUIDv4(), expiresAt: now + ENTRY_TTL_MILLIS };
         const encoded = yield* Schema.encodeEffect(revisionCodec)(next);
         yield* backing.set("revisions", encoded);
         yield* Cache.set(revisions, undefined, next);

@@ -24,6 +24,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -295,7 +296,7 @@ const sweepAgain = Effect.fn("sweepPullRequestSyncHarness")(function* (
   fixture: Harness,
   reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
 ) {
-  yield* TestClock.adjust("1 minute");
+  yield* TestClock.adjust(PullRequestSyncReactor.nextPassDelay(yield* Clock.currentTimeMillis));
   yield* Queue.take(fixture.snapshotReads);
   yield* reactor.drain;
 });
@@ -658,7 +659,7 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
-  it.effect("syncs a pull request a reader saw merge without waiting for the sweep", () =>
+  it.effect("syncs a pull request a reader saw merge, fresh, on the next pass", () =>
     Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
@@ -687,6 +688,14 @@ describe("PullRequestSyncReactor", () => {
             repository: "owner/repository",
             number: 7,
           });
+          // Fork patch (board #15036): the change waits for the next pass, not a read of its own.
+          yield* TestClock.adjust("1 minute");
+          yield* reactor.drain;
+          assert.deepStrictEqual(yield* Ref.get(invalidated), []);
+          assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
+
+          yield* TestClock.adjust("9 minutes");
+          yield* TestClock.adjust("1 second");
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
 
@@ -694,6 +703,37 @@ describe("PullRequestSyncReactor", () => {
           assert.deepStrictEqual(
             (yield* Ref.get(fixture.syncCommands)).map((command) => command.snapshot.state),
             ["merged"],
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("sweeps just after each ten-minute tick, not every minute", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Starts three minutes past a tick: the next pass waits for the tick, not ten minutes.
+        yield* TestClock.setTime(Date.parse(NOW) + 3 * 60_000);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("agent", { pullRequests: [makeLink(7, { state: "open" })] }),
+          ]),
+        });
+        const reads = Ref.get(fixture.summaryCalls).pipe(Effect.map((calls) => calls.length));
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          assert.strictEqual(yield* reads, 1);
+          yield* TestClock.adjust("1 minute");
+          assert.strictEqual(yield* reads, 1);
+          yield* TestClock.adjust("6 minutes");
+          assert.strictEqual(yield* reads, 1);
+          yield* TestClock.adjust("1 second");
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.strictEqual(yield* reads, 2);
+          assert.strictEqual(
+            Duration.toMillis(PullRequestSyncReactor.nextPassDelay(yield* Clock.currentTimeMillis)),
+            10 * 60_000,
           );
         }).pipe(Effect.provide(fixture.layer));
       }),
@@ -716,7 +756,8 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
           yield* Ref.set(state, "open");
-          for (let index = 0; index < 14; index += 1) yield* sweepAgain(fixture, reactor);
+          // The pass ten minutes later is too soon; the next one, past fifteen, reads it.
+          yield* sweepAgain(fixture, reactor);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
           yield* sweepAgain(fixture, reactor);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
@@ -981,7 +1022,7 @@ describe("PullRequestSyncReactor", () => {
       const parts = Array.isArray(message) ? message : [message];
       if (logLevel === "Warn" && parts[0] === "pull request sync skipped") skips.push(parts);
     });
-    const retryAt = Date.parse(NOW) + 3 * 60_000;
+    const retryAt = Date.parse(NOW) + 25 * 60_000;
     return Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
@@ -1059,7 +1100,7 @@ describe("PullRequestSyncReactor", () => {
     Effect.scoped(
       Effect.gen(function* () {
         yield* TestClock.setTime(Date.parse(NOW));
-        const retryAt = Date.parse(NOW) + 3 * 60_000;
+        const retryAt = Date.parse(NOW) + 25 * 60_000;
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([makeThread("one", { pullRequests: [makeLink(7, null)] })]),
           summary: (input) => Effect.succeed(makeSummary(input, { state: "open" })),
@@ -1099,56 +1140,72 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
-  it.effect("reads open links fresh only when a run that ran a merge command ends", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
-        const state = yield* Ref.make<PullRequestSummary["state"]>("open");
-        const invalidated = yield* Ref.make<ReadonlyArray<number>>([]);
-        const fixture = yield* makeHarness({
-          snapshot: makeSnapshot([
-            makeThread("agent", { pullRequests: [makeLink(7, { state: "open" })] }),
-            makeThread("other", { pullRequests: [makeLink(9, { state: "open" })] }),
-          ]),
-          summary: (input) =>
-            Ref.get(state).pipe(
-              Effect.map((current) =>
-                makeSummary(input, current === "merged" ? { state: current, mergedAt: NOW } : {}),
-              ),
-            ),
-          invalidate: ({ reference }) =>
-            Ref.update(invalidated, (numbers) => [...numbers, reference?.number ?? -1]),
-        });
-
-        yield* Effect.gen(function* () {
-          const reactor = yield* startAndSweep(fixture);
-          yield* Ref.set(state, "merged");
-          yield* Ref.set(fixture.summaryCalls, []);
-
-          yield* Queue.offerAll(fixture.domainEvents, [
-            commandRan(ThreadId.make("other"), "gh pr view 9"),
-            runUpdated(ThreadId.make("other"), "completed"),
-            commandRan(ThreadId.make("agent"), "gh pr merge 7 --squash 2>&1 | tail -3"),
-            runUpdated(ThreadId.make("agent"), "completed"),
-          ]);
-          yield* Queue.take(fixture.snapshotReads);
-          yield* Queue.take(fixture.snapshotReads);
-          yield* reactor.drain;
-
-          assert.deepStrictEqual(yield* Ref.get(invalidated), [7]);
-          assert.deepStrictEqual(
-            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
-            [7],
-          );
-          assert.deepStrictEqual(
-            (yield* Ref.get(fixture.syncCommands)).map((command) => [
-              command.number,
-              command.snapshot.state,
+  it.effect(
+    "reads open links fresh on the next pass only when a run that ran a merge command ends",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const state = yield* Ref.make<PullRequestSummary["state"]>("open");
+          const invalidated = yield* Ref.make<ReadonlyArray<number>>([]);
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([
+              makeThread("agent", { pullRequests: [makeLink(7, { state: "open" })] }),
+              makeThread("other", { pullRequests: [makeLink(9, { state: "open" })] }),
             ]),
-            [[7, "merged"]],
-          );
-        }).pipe(Effect.provide(fixture.layer));
-      }),
-    ),
+            summary: (input) =>
+              Ref.get(state).pipe(
+                Effect.map((current) =>
+                  makeSummary(
+                    input,
+                    current === "merged" && input.number === 7
+                      ? { state: current, mergedAt: NOW }
+                      : {},
+                  ),
+                ),
+              ),
+            invalidate: ({ reference }) =>
+              Ref.update(invalidated, (numbers) => [...numbers, reference?.number ?? -1]),
+          });
+
+          yield* Effect.gen(function* () {
+            const reactor = yield* startAndSweep(fixture);
+            yield* Ref.set(state, "merged");
+            yield* Ref.set(fixture.summaryCalls, []);
+
+            yield* Queue.offerAll(fixture.domainEvents, [
+              commandRan(ThreadId.make("other"), "gh pr view 9"),
+              runUpdated(ThreadId.make("other"), "completed"),
+              commandRan(ThreadId.make("agent"), "gh pr merge 7 --squash 2>&1 | tail -3"),
+              runUpdated(ThreadId.make("agent"), "completed"),
+            ]);
+            // The agent thread's lookup. Fork patch (board #15036): no read of its own; the links
+            // wait for the next pass.
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+            assert.deepStrictEqual(yield* Ref.get(invalidated), []);
+            assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
+
+            yield* TestClock.adjust("10 minutes");
+            yield* TestClock.adjust("1 second");
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+
+            // Only the merged link is read fresh; the pass reads the other open link as usual.
+            assert.deepStrictEqual(yield* Ref.get(invalidated), [7]);
+            assert.deepStrictEqual(
+              (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number).toSorted(),
+              [7, 9],
+            );
+            assert.deepStrictEqual(
+              (yield* Ref.get(fixture.syncCommands)).map((command) => [
+                command.number,
+                command.snapshot.state,
+              ]),
+              [[7, "merged"]],
+            );
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
   );
 });

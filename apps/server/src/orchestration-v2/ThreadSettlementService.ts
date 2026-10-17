@@ -3,6 +3,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import {
   CommandId,
+  isProviderNativeSubagentThread,
   type ThreadId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ThreadShell,
@@ -37,6 +38,18 @@ export interface SettlementPullRequest {
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+/**
+ * Fork patch (board #15036): the full sweep ran every minute and each pass read
+ * GitHub for every branch candidate whose cached answer had expired. PR answers
+ * now live ten minutes (Matt, q3440: PR badges can lag up to 10 min), so a
+ * faster sweep only finds the same answers.
+ */
+export const SETTLEMENT_SWEEP_INTERVAL = "10 minutes";
+/**
+ * Branch lookups per sweep run together so GitHub's batched head lookups fill a
+ * document (25 per background document) instead of eight at a time.
+ */
+const SETTLEMENT_LOOKUP_CONCURRENCY = 25;
 
 function toMillis(value: DateTime.Utc | null | undefined): number | null {
   return value == null ? null : DateTime.toEpochMillis(value);
@@ -351,13 +364,40 @@ export const make = Effect.gen(function* () {
         ),
     );
 
-    const lookupCandidates = (yield* Effect.forEach(
+    // Inactivity is entirely projection-backed. Complete those decisions before
+    // a source-control lookup can delay or fail an otherwise eligible thread.
+    const settledCandidates = (yield* Effect.forEach(
       candidates,
       (thread) => settleThread(thread, null),
       { concurrency: 8 },
     ))
       .filter((thread) => thread !== null)
       .filter((thread) => visibleThreadPullRequests(thread.pullRequests ?? []).length === 0);
+    // Fork patch (board #15036): a provider-native subagent whose root thread is
+    // archived, settled or gone stays unarchived and unsettled (493 of 547 candidates on
+    // 2026-10-12). Nobody sees its pull request, so it settles by age above and
+    // costs no GitHub read here.
+    const rootLeftBehind = new Map<ThreadId, boolean>();
+    const isLeftBehind = (thread: (typeof settledCandidates)[number]) =>
+      Effect.gen(function* () {
+        if (!isProviderNativeSubagentThread(thread)) return false;
+        const rootThreadId = thread.lineage.rootThreadId;
+        if (rootThreadId === thread.id) return false;
+        const known = rootLeftBehind.get(rootThreadId);
+        if (known !== undefined) return known;
+        const root = yield* projections.getThreadShell(rootThreadId);
+        const leftBehind =
+          root === null ||
+          root.archivedAt !== null ||
+          root.settledOverride === "settled" ||
+          root.settledAt !== null;
+        rootLeftBehind.set(rootThreadId, leftBehind);
+        return leftBehind;
+      });
+    const lookupCandidates = yield* Effect.filter(settledCandidates, (thread) =>
+      Effect.map(isLeftBehind(thread), (leftBehind) => !leftBehind),
+    );
+    // Use the same cwd as the sidebar so both paths share GitManager's PR cache.
     const lookupCwdByThreadId = new Map<string, string>();
     yield* Effect.forEach(
       lookupCandidates,
@@ -512,7 +552,7 @@ export const make = Effect.gen(function* () {
                 }),
           ),
         ),
-      { concurrency: 8, discard: true },
+      { concurrency: SETTLEMENT_LOOKUP_CONCURRENCY, discard: true },
     );
   });
 
@@ -609,7 +649,7 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* worker.enqueue(undefined);
         yield* worker.drain;
-      }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),
+      }).pipe(Effect.repeat(Schedule.spaced(SETTLEMENT_SWEEP_INTERVAL)), Effect.asVoid),
     );
     yield* forkParked(
       Stream.runForEach(settingsChanges, (settings) => {

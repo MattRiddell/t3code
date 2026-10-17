@@ -906,7 +906,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
           }),
         { concurrency: "unbounded" },
       ).pipe(Effect.forkChild);
-      yield* TestClock.adjust("10 millis");
+      yield* TestClock.adjust(`${GitHubPullRequestApi.SUMMARY_BATCH_WINDOW_MILLIS} millis`);
       const [seven, eight] = yield* Fiber.join(reads);
 
       assert.deepStrictEqual(
@@ -946,6 +946,64 @@ layer("GitHubPullRequestApi.layer", (it) => {
     }),
   );
 
+  it.effect("reads summaries that reach the resolver 65 ms apart in one document", () =>
+    Effect.gen(function* () {
+      // Fork patch (board #15036): a pass's reads arrive spread out by their git lookups.
+      const node = (number: number) => ({
+        number,
+        title: `Pull request ${number}`,
+        url: `https://github.com/acme/web/pull/${number}`,
+        author: {
+          __typename: "User",
+          login: "octocat",
+          name: "Octo Cat",
+          avatarUrl: "https://avatars.githubusercontent.com/u/1",
+        },
+        baseRefName: "main",
+        headRefName: `feat/${number}`,
+        state: "OPEN",
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        reviewDecision: null,
+        latestReviews: { nodes: [] },
+        additions: 1,
+        deletions: 1,
+        changedFiles: 1,
+        updatedAt: "2026-08-24T12:34:56.000Z",
+        mergedAt: null,
+        closedAt: null,
+        commits: { nodes: [{ commit: { statusCheckRollup: { state: "SUCCESS" } } }] },
+      });
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            encodeJson({
+              data: {
+                _0_repository: { pullRequest: node(7) },
+                _1_repository: { pullRequest: node(8) },
+              },
+            }),
+          ),
+        ),
+      );
+      const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      const read = (number: number) =>
+        cli
+          .getPullRequestSummary({ cwd: "/w", repository: "acme/web", host: "github.com", number })
+          .pipe(Effect.forkChild);
+
+      const early = yield* read(7);
+      yield* TestClock.adjust("65 millis");
+      const late = yield* read(8);
+      yield* TestClock.adjust(`${GitHubPullRequestApi.SUMMARY_BATCH_WINDOW_MILLIS} millis`);
+
+      assert.strictEqual((yield* Fiber.join(early))?.headBranch, "feat/7");
+      assert.strictEqual((yield* Fiber.join(late))?.headBranch, "feat/8");
+      expect(mockedExecute).toHaveBeenCalledOnce();
+      expect(varsAt(0)).toMatchObject({ _0_number: 7, _1_number: 8 });
+    }),
+  );
+
   it.effect("fingerprints watched pull requests on one host in one read", () =>
     Effect.gen(function* () {
       const node = (comments: number) => ({
@@ -982,7 +1040,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
           }),
         { concurrency: "unbounded" },
       ).pipe(Effect.forkChild);
-      yield* TestClock.adjust("10 millis");
+      yield* TestClock.adjust(`${GitHubPullRequestApi.SUMMARY_BATCH_WINDOW_MILLIS} millis`);
       const [seven, eight] = yield* Fiber.join(reads);
 
       expect(seven?.remarks.startsWith("1 ")).toBe(true);
@@ -1056,7 +1114,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
               .pipe(Effect.result),
           { concurrency: "unbounded" },
         ).pipe(Effect.forkChild);
-        yield* TestClock.adjust("10 millis");
+        yield* TestClock.adjust(`${GitHubPullRequestApi.SUMMARY_BATCH_WINDOW_MILLIS} millis`);
         const [seven, eight] = yield* Fiber.join(reads);
 
         expect(Result.isFailure(seven!) ? seven.failure._tag : null).toBe("GitHubApiNotFoundError");

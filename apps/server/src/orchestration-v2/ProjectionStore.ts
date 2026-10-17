@@ -178,6 +178,8 @@ export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
   | "id"
   | "projectId"
+  | "lineage"
+  | "creationSource"
   | "branch"
   | "worktreePath"
   | "pullRequests"

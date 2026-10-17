@@ -636,6 +636,12 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
               : snapshot.threads.filter((thread) => thread.id === threadId),
           ),
         ),
+      getThreadShell: (threadId) =>
+        Ref.get(snapshots).pipe(
+          Effect.map(
+            (snapshot) => snapshot.threads.find((thread) => thread.id === threadId) ?? null,
+          ),
+        ),
       getThread: (threadId) => {
         const thread = options.currentThreads?.find((candidate) => candidate.id === threadId);
         return thread
@@ -1054,6 +1060,49 @@ describe("ThreadSettlementServiceV2 worker", () => {
               { cwd: "/workspace/project-root/.worktrees/live", branch: "feature/live" },
               { cwd: "/workspace/project-root", branch: "feature/deleted" },
             ]),
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("skips the branch lookup for a provider subagent whose root is gone", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const subagent = (id: string, rootThreadId: string, creationSource: "provider" | "mcp") =>
+          makeThread(id, {
+            branch: `feature/${id}`,
+            creationSource,
+            lineage: {
+              rootThreadId: ThreadId.make(rootThreadId),
+              parentThreadId: ThreadId.make(rootThreadId),
+              relationshipToParent: "subagent",
+            },
+          });
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("live-root", { branch: "feature/live-root" }),
+            subagent("live-child", "live-root", "provider"),
+            subagent("orphan-child", "archived-root", "provider"),
+            makeThread("settled-root", { settledOverride: "settled" }),
+            subagent("settled-root-child", "settled-root", "provider"),
+            subagent("delegated-child", "archived-root", "mcp"),
+          ]),
+          settings: {
+            ...DEFAULT_SERVER_SETTINGS,
+            sidebarAutoSettleAfterDays: null,
+            sidebarAutoSettleOnMerge: true,
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+
+          assert.deepStrictEqual(
+            new Set((yield* Ref.get(fixture.branchCalls)).map((call) => call.branch)),
+            new Set(["feature/live-root", "feature/live-child", "feature/delegated-child"]),
           );
         }).pipe(Effect.provide(fixture.layer));
       }),

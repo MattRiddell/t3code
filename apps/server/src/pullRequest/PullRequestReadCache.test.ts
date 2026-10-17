@@ -99,6 +99,10 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
     ),
   );
 
+  it("keeps an entry for ten minutes (fork patch #15036)", () => {
+    assert.strictEqual(Duration.toMillis(PullRequestReadCache.ENTRY_TTL), 600_000);
+  });
+
   it.effect("reuses files after restart and respects the original expiry", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -108,7 +112,9 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
       const first = yield* cacheLayer(directory);
       const key = "long/repository/key".repeat(100);
       assert.strictEqual(yield* first.get(key, lookup), "1");
-      yield* TestClock.adjust("59 seconds");
+      yield* TestClock.adjust(
+        Duration.subtract(PullRequestReadCache.ENTRY_TTL, Duration.seconds(1)),
+      );
       const restarted = yield* cacheLayer(directory);
       assert.strictEqual(yield* restarted.get(key, lookup), "1");
       yield* TestClock.adjust("1 second");
@@ -117,6 +123,36 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
       assert.strictEqual((yield* fs.readDirectory(directory)).length, 1);
     }),
   );
+
+  it.effect("expires entries read at different times together at the ten-minute tick", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pr-cache-" });
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-01T00:03:00Z")));
+      const cache = yield* cacheLayer(directory);
+      let reads = 0;
+      const lookup = Effect.sync(() => String(++reads));
+      assert.strictEqual(yield* cache.get("early", lookup), "1");
+      yield* TestClock.adjust("6 minutes");
+      assert.strictEqual(yield* cache.get("late", lookup), "2");
+      // 00:09:59: both are still fresh.
+      yield* TestClock.adjust("59 seconds");
+      assert.strictEqual(yield* cache.get("early", lookup), "1");
+      assert.strictEqual(yield* cache.get("late", lookup), "2");
+      // 00:10:00: both went stale at the tick, though "late" is one minute old.
+      yield* TestClock.adjust("1 second");
+      assert.strictEqual(yield* cache.get("early", lookup), "3");
+      assert.strictEqual(yield* cache.get("late", lookup), "4");
+    }),
+  );
+
+  it("never keeps an entry longer than ENTRY_TTL", () => {
+    const ttl = Duration.toMillis(PullRequestReadCache.ENTRY_TTL);
+    const tick = Date.parse("2026-10-01T00:10:00Z");
+    assert.strictEqual(PullRequestReadCache.entryExpiresAt(tick), tick + ttl);
+    assert.strictEqual(PullRequestReadCache.entryExpiresAt(tick - 1), tick);
+    assert.strictEqual(PullRequestReadCache.entryExpiresAt(tick + 1), tick + ttl);
+  });
 
   it.effect("clears in-flight reads before a new service can reuse them", () =>
     Effect.gen(function* () {
@@ -216,13 +252,17 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pr-cache-" });
+      // Off the ten-minute grid, so the scopes expire (at 00:15) before the fresh entry (00:20).
+      yield* TestClock.setTime(5 * 60_000);
       const cache = yield* cacheLayer(directory);
       yield* cache.get("summary", Effect.succeed("old"), ["pr"]);
       yield* cache.invalidate("pr");
       for (let index = 0; index < 100; index++) yield* cache.invalidate(`pr-${index}`);
       assert.strictEqual((yield* fs.readDirectory(directory)).length, 2);
       const before = (yield* fs.stat(`${directory}/revisions`)).size;
-      yield* TestClock.adjust("59 seconds");
+      yield* TestClock.adjust(
+        Duration.subtract(PullRequestReadCache.ENTRY_TTL, Duration.seconds(1)),
+      );
       assert.strictEqual(yield* cache.get("summary", Effect.succeed("fresh"), ["pr"]), "fresh");
       yield* TestClock.adjust("1 second");
       yield* cache.invalidate("other-pr");
