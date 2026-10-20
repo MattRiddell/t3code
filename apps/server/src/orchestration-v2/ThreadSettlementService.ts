@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -50,6 +51,15 @@ export const SETTLEMENT_SWEEP_INTERVAL = "10 minutes";
  * document (25 per background document) instead of eight at a time.
  */
 const SETTLEMENT_LOOKUP_CONCURRENCY = 25;
+/**
+ * Fork patch (board #15036): the sweep re-reads a closed pull request at most once an hour.
+ * A merged answer is already held in memory, but a closed one was read from GitHub on every
+ * ten-minute sweep, one GraphQL document each time, often for a pull request no other pass
+ * reads (2026-10-20: one closed pull request cost 144 documents a day). A closed pull request
+ * changes only if someone reopens it. A thread on a branch still confirms its settlement with
+ * a fresh branch lookup, so a reopened pull request on that branch stops the settlement.
+ */
+export const CLOSED_PULL_REQUEST_RECHECK_MS = 60 * 60 * 1_000;
 
 function toMillis(value: DateTime.Utc | null | undefined): number | null {
   return value == null ? null : DateTime.toEpochMillis(value);
@@ -305,6 +315,49 @@ export const make = Effect.gen(function* () {
   // Settling a settled thread re-emits thread.settled with the same settledAt,
   // so this keeps the settle action to one run per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
+  const closedPullRequestReads = new Map<
+    string,
+    { readonly readAtMs: number; readonly pullRequest: SettlementPullRequest }
+  >();
+  const settlementSummary = Effect.fn("ThreadSettlementServiceV2.settlementSummary")(function* (
+    reference: NonNullable<
+      | ProjectionStore.ProjectionSettlementCandidate["linkedPullRequest"]
+      | ProjectionStore.ProjectionSettlementCandidate["branchPullRequest"]
+    >,
+  ) {
+    const key = [reference.projectId, reference.repository.toLowerCase(), reference.number].join(
+      "\u0000",
+    );
+    const nowMs = yield* Clock.currentTimeMillis;
+    const held = closedPullRequestReads.get(key);
+    if (held !== undefined && nowMs - held.readAtMs < CLOSED_PULL_REQUEST_RECHECK_MS) {
+      return held.pullRequest;
+    }
+    const summary = yield* pullRequests.summary(
+      {
+        projectId: reference.projectId,
+        repository: reference.repository,
+        number: reference.number,
+      },
+      { recoverTransientFailure: false },
+    );
+    const pullRequest = {
+      state: summary.state,
+      closedAt: summary.closedAt ?? null,
+      mergedAt: summary.mergedAt ?? null,
+    } satisfies SettlementPullRequest;
+    for (const [heldKey, entry] of closedPullRequestReads) {
+      if (nowMs - entry.readAtMs >= CLOSED_PULL_REQUEST_RECHECK_MS) {
+        closedPullRequestReads.delete(heldKey);
+      }
+    }
+    if (pullRequest.state === "closed") {
+      closedPullRequestReads.set(key, { readAtMs: nowMs, pullRequest });
+    } else {
+      closedPullRequestReads.delete(key);
+    }
+    return pullRequest;
+  });
 
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
@@ -494,14 +547,7 @@ export const make = Effect.gen(function* () {
               closedAt: null,
               mergedAt: mergedPullRequest.mergedAt,
             } satisfies SettlementPullRequest)
-          : yield* pullRequests.summary(
-              {
-                projectId: reference.projectId,
-                repository: reference.repository,
-                number: reference.number,
-              },
-              { recoverTransientFailure: false },
-            );
+          : yield* settlementSummary(reference);
         const terminal = {
           state: summary.state,
           closedAt: summary.closedAt ?? null,

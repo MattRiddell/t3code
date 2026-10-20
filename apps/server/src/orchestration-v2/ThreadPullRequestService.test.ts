@@ -1,5 +1,6 @@
 import {
   EventId,
+  GitManagerError,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -307,6 +308,153 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     expect(skips(thread(null, [link(7, "open")]))).toBe(false);
     expect(skips(thread(7, []))).toBe(false);
   });
+
+  it.effect("periodic passes look up only pushed branches; a thread sync still looks up", () =>
+    // Fork patch (board #15036): a branch with no pushed head costs no GitHub read per pass.
+    Effect.scoped(
+      Effect.gen(function* () {
+        const withBranch = (id: string, branch: string): OrchestrationV2ThreadShell => ({
+          ...threadShell(id),
+          branch,
+        });
+        const pushed = withBranch("pushed-thread", "feature/pushed");
+        const local = withBranch("local-thread", "feature/local");
+        const unknown = withBranch("unknown-thread", "feature/unknown");
+        const project: OrchestrationProjectShell = {
+          id: ProjectId.make("project-1"),
+          title: "Project",
+          workspaceRoot: "/workspace/project",
+          defaultModelSelection: null,
+          scripts: [],
+          repositoryIdentity: null,
+          createdAt: "2026-08-01T00:00:00.000Z",
+          updatedAt: "2026-08-01T00:00:00.000Z",
+        };
+        const activation = yield* Deferred.make<void>();
+        const events = yield* PubSub.unbounded<OrchestrationV2DomainEvent>();
+        const lookups: Array<string> = [];
+        const pushedChecks: Array<string> = [];
+        const passes = yield* Queue.unbounded<void>();
+        const layerDependencies = Layer.mergeAll(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            streamDomainEvents: Stream.fromPubSub(events),
+            getShellSnapshot: () =>
+              Queue.offer(passes, undefined).pipe(
+                Effect.as({
+                  schemaVersion: 2,
+                  snapshotSequence: 1,
+                  threads: [pushed, local, unknown],
+                  archivedThreads: [],
+                }),
+              ),
+            getThreadEventSequence: () => Effect.succeed(1),
+            getThreadShell: (threadId) =>
+              Effect.succeed(
+                [pushed, local, unknown].find((candidate) => candidate.id === threadId) ?? null,
+              ),
+          }),
+          Layer.mock(ProjectStore.ProjectStoreV2)({
+            listShells: () => Effect.succeed([project]),
+          }),
+          Layer.mock(GitManager.GitManager)({
+            branchHasPushedHead: ({ branch }) => {
+              pushedChecks.push(branch);
+              // Must say yes when the check fails: an unreadable checkout keeps its lookup.
+              return branch === "feature/unknown"
+                ? Effect.fail(
+                    new GitManagerError({
+                      operation: "test",
+                      cwd: "/workspace/project",
+                      detail: "unreadable",
+                    }),
+                  )
+                : Effect.succeed(branch === "feature/pushed");
+            },
+            branchPullRequest: ({ branch }) => {
+              lookups.push(branch);
+              return Effect.succeed(null);
+            },
+          }),
+          Layer.mock(PullRequestService.PullRequestService)({}),
+          Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+            resolve: () =>
+              Effect.succeed({
+                canonicalKey: "github.com/owner/repo",
+                locator: {
+                  source: "git-remote" as const,
+                  remoteName: "origin",
+                  remoteUrl: "git@github.com:owner/repo.git",
+                },
+                provider: "github" as const,
+                displayName: "owner/repo",
+                owner: "owner",
+                name: "repo",
+              }),
+          }),
+          Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
+          Layer.succeed(
+            Crypto.Crypto,
+            Crypto.make({
+              randomBytes: (size) => new Uint8Array(size).fill(1),
+              digest: (_algorithm, data) => Effect.succeed(data),
+            }),
+          ),
+          FileSystem.layerNoop({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadPullRequestService.make;
+          yield* service.start();
+          yield* Deferred.succeed(activation, undefined);
+          yield* Queue.take(passes);
+          yield* service.drain;
+          expect(pushedChecks.toSorted()).toEqual([
+            "feature/local",
+            "feature/pushed",
+            "feature/unknown",
+          ]);
+          // Must say no: the pass does not look up the never-pushed branch.
+          expect(lookups.toSorted()).toEqual(["feature/pushed", "feature/unknown"]);
+
+          lookups.length = 0;
+          pushedChecks.length = 0;
+          yield* PubSub.publish(events, {
+            type: "thread.metadata-updated",
+            id: EventId.make("event:metadata"),
+            threadId: local.id,
+            occurredAt: NOW,
+            payload: {
+              createdBy: local.createdBy,
+              creationSource: local.creationSource,
+              id: local.id,
+              projectId: local.projectId,
+              title: local.title,
+              providerInstanceId: local.providerInstanceId,
+              modelSelection: local.modelSelection,
+              runtimeMode: local.runtimeMode,
+              interactionMode: local.interactionMode,
+              branch: local.branch,
+              worktreePath: local.worktreePath,
+              activeProviderThreadId: local.activeProviderThreadId,
+              lineage: local.lineage,
+              forkedFrom: null,
+              createdAt: local.createdAt,
+              updatedAt: local.updatedAt,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          });
+          yield* Effect.yieldNow;
+          yield* service.drain;
+          expect(pushedChecks).toEqual([]);
+          expect(lookups).toEqual(["feature/local"]);
+        }).pipe(Effect.provide(layerDependencies));
+      }),
+    ),
+  );
 
   it.effect("periodic sweeps read only unsettled threads once backfill is done", () =>
     Effect.scoped(

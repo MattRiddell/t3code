@@ -858,6 +858,65 @@ describe("ThreadSettlementServiceV2 worker", () => {
     ),
   );
 
+  it.effect("rereads a closed pull request at most hourly across sweeps", () =>
+    // Fork patch (board #15036): one closed pull request cost a GitHub read every sweep.
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const fixtureFor = (state: "open" | "closed") =>
+          makeHarness({
+            snapshot: makeSnapshot(
+              [
+                makeThread(`linked-${state}`, {
+                  branch: "main",
+                  linkedPullRequest: {
+                    projectId: PROJECT_ID,
+                    repository: "owner/repository",
+                    number: 1,
+                    url: "https://example.test/owner/repository/pull/1",
+                  },
+                  latestUserMessageAt: DateTime.makeUnsafe("2026-08-28T00:00:00.000Z"),
+                }),
+              ],
+              [makeProject()],
+            ),
+            settings: {
+              ...DEFAULT_SERVER_SETTINGS,
+              sidebarAutoSettleAfterDays: null,
+              sidebarAutoSettleOnMerge: true,
+            },
+            branchPullRequest: () => Effect.succeed(null),
+            pullRequestSummary: (input) =>
+              Effect.succeed({
+                ...makePullRequestSummary({ ...input, state }),
+                ...(state === "closed" ? { closedAt: "2026-08-27T00:00:00.000Z" } : {}),
+              }),
+          });
+        const sweepReads = (state: "open" | "closed") =>
+          Effect.gen(function* () {
+            const fixture = yield* fixtureFor(state);
+            return yield* Effect.gen(function* () {
+              const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+              yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+              const reads = [(yield* Ref.get(fixture.summaryCalls)).length];
+              for (let sweep = 1; sweep <= 6; sweep++) {
+                yield* TestClock.adjust(ThreadSettlementService.SETTLEMENT_SWEEP_INTERVAL);
+                yield* Queue.take(fixture.snapshotReads);
+                yield* reactor.drain;
+                reads.push((yield* Ref.get(fixture.summaryCalls)).length);
+              }
+              return reads;
+            }).pipe(Effect.provide(fixture.layer));
+          });
+
+        // The sixth sweep is an hour after the first read.
+        assert.deepStrictEqual(yield* sweepReads("closed"), [1, 1, 1, 1, 1, 1, 2]);
+        // Must say no: an open pull request is still read every sweep.
+        assert.deepStrictEqual(yield* sweepReads("open"), [1, 2, 3, 4, 5, 6, 7]);
+      }),
+    ),
+  );
+
   it.effect("reevaluates immediately after a pull request merge", () =>
     Effect.scoped(
       Effect.gen(function* () {

@@ -1519,6 +1519,45 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  it.effect("branchHasPushedHead says yes only for a branch that reached a remote", () =>
+    // Fork patch (board #15036): the periodic thread pass skips a branch this says no for.
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      // A lane branch started from origin/main tracks main but was never pushed.
+      yield* runGit(repoDir, ["branch", "--track", "feature/from-main", "origin/main"]);
+      yield* runGit(repoDir, ["branch", "feature/local-only"]);
+      // push-queue pushes without -u: a tracking ref, no saved upstream.
+      yield* runGit(repoDir, ["branch", "feature/pushed"]);
+      yield* runGit(repoDir, ["push", "origin", "feature/pushed"]);
+      yield* runGit(repoDir, ["branch", "feature/renamed"]);
+      yield* runGit(repoDir, ["push", "origin", "feature/renamed:review/renamed"]);
+      yield* runGit(repoDir, [
+        "branch",
+        "--set-upstream-to=origin/review/renamed",
+        "feature/renamed",
+      ]);
+
+      const { manager, ghCalls } = yield* makeManager();
+      const pushed = (branch: string) => manager.branchHasPushedHead({ cwd: repoDir, branch });
+
+      expect(yield* pushed("feature/pushed")).toBe(true);
+      expect(yield* pushed("feature/renamed")).toBe(true);
+      // Must say no: an upstream on the default branch, no upstream, or no branch at all.
+      expect(yield* pushed("feature/from-main")).toBe(false);
+      expect(yield* pushed("feature/local-only")).toBe(false);
+      expect(yield* pushed("feature/missing")).toBe(false);
+      expect(ghCalls).toHaveLength(0);
+
+      const bareDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(bareDir);
+      expect(yield* manager.branchHasPushedHead({ cwd: bareDir, branch: "main" })).toBe(false);
+    }),
+  );
+
   it.effect("branch PR lookup returns null when the repository has no remotes", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");

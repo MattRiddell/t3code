@@ -138,6 +138,15 @@ export class GitManager extends Context.Service<
       input: { readonly cwd: string; readonly branch: string },
       options?: { readonly refresh?: boolean; readonly freshGitState?: boolean },
     ) => Effect.Effect<GitBranchPullRequest | null, GitManagerServiceError>;
+    /**
+     * Whether the branch's head can be on a remote: some remote has a tracking ref under the
+     * branch's own name, or the branch's saved upstream names another branch than the default.
+     * Reads the same remembered git state as `branchPullRequest` and never asks the host.
+     */
+    readonly branchHasPushedHead: (input: {
+      readonly cwd: string;
+      readonly branch: string;
+    }) => Effect.Effect<boolean, GitManagerServiceError>;
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateStatus: (cwd: string) => Effect.Effect<void, never>;
@@ -2355,15 +2364,13 @@ export const make = Effect.gen(function* () {
       };
     },
   );
-  const lookupBranchPullRequest = Effect.fn("lookupBranchPullRequest")(function* (
-    cacheCwd: string,
-    branch: string,
-    options: { readonly refresh: boolean; readonly freshGitState: boolean },
-  ) {
-    const remember = <E>(key: string, read: Effect.Effect<string | null, E>) =>
-      rememberPrLookupGitState(cacheCwd, key, options.freshGitState, read);
-    const remotes = yield* remember(
+  // The git reads a branch's pull request lookup starts from. They are remembered per
+  // checkout (PR_LOOKUP_GIT_STATE_TTL), so branchHasPushedHead and the lookup share them.
+  const readPrLookupRemoteNames = (cacheCwd: string, fresh: boolean) =>
+    rememberPrLookupGitState(
+      cacheCwd,
       "remotes",
+      fresh,
       gitCore
         .execute({
           operation: "GitManager.branchPullRequest.remotes",
@@ -2371,15 +2378,19 @@ export const make = Effect.gen(function* () {
           args: ["remote"],
         })
         .pipe(Effect.map((result) => result.stdout)),
+    ).pipe(
+      Effect.map((remotes) =>
+        (remotes ?? "")
+          .split("\n")
+          .map((remoteName) => remoteName.trim())
+          .filter((remoteName) => remoteName.length > 0),
+      ),
     );
-    const remoteNames = (remotes ?? "")
-      .split("\n")
-      .map((remoteName) => remoteName.trim())
-      .filter((remoteName) => remoteName.length > 0);
-    const [firstRemoteName] = remoteNames;
-    if (firstRemoteName === undefined) return null;
-    const branchRef = yield* remember(
+  const readPrLookupBranchRef = (cacheCwd: string, branch: string, fresh: boolean) =>
+    rememberPrLookupGitState(
+      cacheCwd,
       `branchRef\u0000${branch}`,
+      fresh,
       gitCore
         .execute({
           operation: "GitManager.branchPullRequest.branchRef",
@@ -2391,13 +2402,76 @@ export const make = Effect.gen(function* () {
           ],
         })
         .pipe(Effect.map((result) => result.stdout)),
+    ).pipe(
+      Effect.map((branchRef) => {
+        const expectedRefName = `refs/heads/${branch}`;
+        const exactBranch = (branchRef ?? "")
+          .split("\n")
+          .find((line) => line.split("\u0000", 1)[0] === expectedRefName);
+        const [refName = "", savedUpstream = "", savedRemoteName = "", savedRemoteRef = ""] =
+          exactBranch?.split("\u0000") ?? [];
+        return { refName, savedUpstream, savedRemoteName, savedRemoteRef };
+      }),
     );
-    const expectedRefName = `refs/heads/${branch}`;
-    const exactBranch = (branchRef ?? "")
-      .split("\n")
-      .find((line) => line.split("\u0000", 1)[0] === expectedRefName);
-    const [refName = "", savedUpstream = "", savedRemoteName = "", savedRemoteRef = ""] =
-      exactBranch?.split("\u0000") ?? [];
+  // Remotes that have a tracking ref under the branch's own name.
+  const readPrLookupTrackingRemotes = (
+    cacheCwd: string,
+    branch: string,
+    remoteNames: ReadonlyArray<string>,
+    fresh: boolean,
+  ) =>
+    rememberPrLookupGitState(
+      cacheCwd,
+      `trackingRemotes\u0000${branch}`,
+      fresh,
+      gitCore
+        .execute({
+          operation: "GitManager.branchPullRequest.remoteTrackingRefs",
+          cwd: cacheCwd,
+          args: ["for-each-ref", "--format=%(refname)", "refs/remotes"],
+        })
+        .pipe(
+          Effect.map((trackingRefs) => {
+            const refNames = new Set(
+              trackingRefs.stdout
+                .split("\n")
+                .map((remoteRef) => remoteRef.trim())
+                .filter((remoteRef) => remoteRef.length > 0),
+            );
+            return remoteNames
+              .filter((candidate) => refNames.has(`refs/remotes/${candidate}/${branch}`))
+              .join("\n");
+          }),
+        ),
+    ).pipe(
+      Effect.map((trackingRemotes) =>
+        (trackingRemotes ?? "").split("\n").filter((candidate) => candidate.length > 0),
+      ),
+    );
+  const readPrLookupDefaultBranch = (
+    cacheCwd: string,
+    remoteNames: ReadonlyArray<string>,
+    firstRemoteName: string,
+    fresh: boolean,
+  ) => {
+    const defaultRemoteName = remoteNames.includes("origin") ? "origin" : firstRemoteName;
+    return rememberPrLookupGitState(
+      cacheCwd,
+      `defaultBranch\u0000${defaultRemoteName}`,
+      fresh,
+      gitCore.resolveDefaultBranchName(cacheCwd, defaultRemoteName),
+    ).pipe(Effect.orElseSucceed(() => null));
+  };
+  const lookupBranchPullRequest = Effect.fn("lookupBranchPullRequest")(function* (
+    cacheCwd: string,
+    branch: string,
+    options: { readonly refresh: boolean; readonly freshGitState: boolean },
+  ) {
+    const remoteNames = yield* readPrLookupRemoteNames(cacheCwd, options.freshGitState);
+    const [firstRemoteName] = remoteNames;
+    if (firstRemoteName === undefined) return null;
+    const { refName, savedUpstream, savedRemoteName, savedRemoteRef } =
+      yield* readPrLookupBranchRef(cacheCwd, branch, options.freshGitState);
     const localBranchExists = refName.length > 0;
     let upstreamRef: string | null = null;
     let remoteName: string | null = null;
@@ -2413,31 +2487,12 @@ export const make = Effect.gen(function* () {
       const upstreamBranch = savedRemoteRef.replace(/^refs\/heads\//, "");
       upstreamRef = `${remoteName}/${upstreamBranch}`;
     } else if (!localBranchExists) {
-      const trackingRemotes = yield* remember(
-        `trackingRemotes\u0000${branch}`,
-        gitCore
-          .execute({
-            operation: "GitManager.branchPullRequest.remoteTrackingRefs",
-            cwd: cacheCwd,
-            args: ["for-each-ref", "--format=%(refname)", "refs/remotes"],
-          })
-          .pipe(
-            Effect.map((trackingRefs) => {
-              const refNames = new Set(
-                trackingRefs.stdout
-                  .split("\n")
-                  .map((remoteRef) => remoteRef.trim())
-                  .filter((remoteRef) => remoteRef.length > 0),
-              );
-              return remoteNames
-                .filter((candidate) => refNames.has(`refs/remotes/${candidate}/${branch}`))
-                .join("\n");
-            }),
-          ),
+      const matchingRemoteNames = yield* readPrLookupTrackingRemotes(
+        cacheCwd,
+        branch,
+        remoteNames,
+        options.freshGitState,
       );
-      const matchingRemoteNames = (trackingRemotes ?? "")
-        .split("\n")
-        .filter((candidate) => candidate.length > 0);
       if (matchingRemoteNames.length > 1) {
         return yield* new GitManagerError({
           operation: "branchPullRequest",
@@ -2450,11 +2505,12 @@ export const make = Effect.gen(function* () {
         upstreamRef = `${remoteName}/${branch}`;
       }
     }
-    const defaultRemoteName = remoteNames.includes("origin") ? "origin" : firstRemoteName;
-    const defaultBranch = yield* remember(
-      `defaultBranch\u0000${defaultRemoteName}`,
-      gitCore.resolveDefaultBranchName(cacheCwd, defaultRemoteName),
-    ).pipe(Effect.orElseSucceed(() => null));
+    const defaultBranch = yield* readPrLookupDefaultBranch(
+      cacheCwd,
+      remoteNames,
+      firstRemoteName,
+      options.freshGitState,
+    );
     const cacheKey = prLookupCacheKey(cacheCwd, {
       branch,
       upstreamRef,
@@ -2533,6 +2589,41 @@ export const make = Effect.gen(function* () {
       // The returned PR URL names the repository that actually owns it.
       repositoryKey: pullRequestRepositoryKey(latest.url),
     };
+  });
+  // Fork patch (board #15036): the periodic thread pass asks this before a branch lookup, so a
+  // branch never pushed (no remote tracking ref under its name) costs no GitHub read.
+  const branchHasPushedHead: GitManager["Service"]["branchHasPushedHead"] = Effect.fn(
+    "branchHasPushedHead",
+  )(function* ({ cwd, branch }) {
+    const cacheCwd = yield* normalizeStatusCacheKey(cwd);
+    const remoteNames = yield* readPrLookupRemoteNames(cacheCwd, false);
+    const [firstRemoteName] = remoteNames;
+    if (firstRemoteName === undefined) return false;
+    const { savedUpstream, savedRemoteRef } = yield* readPrLookupBranchRef(cacheCwd, branch, false);
+    if (savedUpstream.length > 0) {
+      const upstreamBranch = savedRemoteRef.replace(/^refs\/heads\//, "");
+      if (upstreamBranch !== branch) {
+        const defaultBranch = yield* readPrLookupDefaultBranch(
+          cacheCwd,
+          remoteNames,
+          firstRemoteName,
+          false,
+        );
+        // A worktree branch started from origin/main tracks main. That says nothing about
+        // whether the branch itself was pushed; any other upstream name was a push.
+        const tracksDefault =
+          upstreamBranch === defaultBranch ||
+          (defaultBranch === null && (upstreamBranch === "main" || upstreamBranch === "master"));
+        if (!tracksDefault) return true;
+      }
+    }
+    const trackingRemotes = yield* readPrLookupTrackingRemotes(
+      cacheCwd,
+      branch,
+      remoteNames,
+      false,
+    );
+    return trackingRemotes.length > 0;
   });
   const branchPullRequest: GitManager["Service"]["branchPullRequest"] = Effect.fn(
     "branchPullRequest",
@@ -3099,6 +3190,7 @@ export const make = Effect.gen(function* () {
     remoteStatus,
     status,
     branchPullRequest,
+    branchHasPushedHead,
     invalidateLocalStatus,
     invalidateRemoteStatus,
     invalidateStatus,
