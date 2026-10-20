@@ -382,7 +382,7 @@ describe("GitHubSourceControlProvider change request lookups by head", () => {
       const firstLookup = yield* lookup("feature/a");
       yield* TestClock.adjust("200 millis");
       const secondLookup = yield* lookup("feature/b");
-      yield* TestClock.adjust("300 millis");
+      yield* TestClock.adjust(GitHubSourceControlProvider.BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW);
       const first = yield* Fiber.join(firstLookup);
       const second = yield* Fiber.join(secondLookup);
       assert.deepStrictEqual(
@@ -437,7 +437,7 @@ describe("GitHubSourceControlProvider change request lookups by head", () => {
       const both = yield* Effect.all([lookup("feature/a"), lookup("feature/b")], {
         concurrency: "unbounded",
       }).pipe(Effect.forkChild);
-      yield* TestClock.adjust("500 millis");
+      yield* TestClock.adjust(GitHubSourceControlProvider.BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW);
       const [first, second] = yield* Fiber.join(both);
       assert.strictEqual(graphqlCalls.length, 1);
       assert.deepStrictEqual(
@@ -447,6 +447,37 @@ describe("GitHubSourceControlProvider change request lookups by head", () => {
       assert.deepStrictEqual(
         second.map((pr) => pr.number),
         [9],
+      );
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("lets background lookups seconds apart share one document", () => {
+    const { layer, graphqlCalls } = harness({
+      remotes,
+      graphql: () => ({ pullRequests: { nodes: [] } }),
+    });
+    return Effect.gen(function* () {
+      const gh = yield* GitHubSourceControlProvider.make;
+      const lookup = (headSelector: string) =>
+        gh
+          .listChangeRequests({
+            cwd: "/repo",
+            headSelector,
+            state: "all",
+            limit: 100,
+            context: githubContext("github.com"),
+          })
+          .pipe(Effect.forkChild);
+      const first = yield* lookup("feature/early");
+      yield* TestClock.adjust("4 seconds");
+      const second = yield* lookup("feature/late");
+      assert.strictEqual(graphqlCalls.length, 0);
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      assert.deepStrictEqual(
+        graphqlCalls.map((call) => call.lookups.length),
+        [2],
       );
     }).pipe(Effect.provide(layer));
   });
@@ -470,7 +501,7 @@ describe("GitHubSourceControlProvider change request lookups by head", () => {
         ),
         { concurrency: "unbounded" },
       ).pipe(Effect.forkChild);
-      yield* TestClock.adjust("500 millis");
+      yield* TestClock.adjust(GitHubSourceControlProvider.BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW);
       yield* Fiber.join(lookups);
       assert.deepStrictEqual(
         graphqlCalls.map((call) => call.lookups.length).toSorted((a, b) => a - b),
@@ -530,11 +561,11 @@ describe("GitHubSourceControlProvider change request lookups by head", () => {
           .listChangeRequests({ cwd: "/repo", headSelector, state: "open", limit: 1 })
           .pipe(Effect.flip, Effect.forkChild);
       const missing = yield* read("missing");
-      yield* TestClock.adjust("500 millis");
+      yield* TestClock.adjust(GitHubSourceControlProvider.BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW);
       assert.include((yield* Fiber.join(missing)).detail, "No GitHub credential on the server");
       signedIn = true;
       const limited = yield* read("limited");
-      yield* TestClock.adjust("500 millis");
+      yield* TestClock.adjust(GitHubSourceControlProvider.BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW);
       const error = yield* Fiber.join(limited);
       assert.include(error.detail, "rate limit exceeded");
       assert.propertyVal(error.cause, "retryAt", 123_000);

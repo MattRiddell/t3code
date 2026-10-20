@@ -233,6 +233,19 @@ export const make = Effect.gen(function* () {
             worktreeExists && first.worktreePath !== null
               ? first.worktreePath
               : project.workspaceRoot;
+          // Fork patch (board #15036): the periodic pass skips a branch with no pushed head. A
+          // pass held 47 branch groups and 44 were never pushed (finished subagents, reaped
+          // lanes); each cost a GitHub branch lookup every ten minutes. A single-thread sync
+          // (run end, checkpoint, unsettle) still looks the branch up.
+          if (
+            request.threadId === null &&
+            first.branch !== null &&
+            !(yield* git
+              .branchHasPushedHead({ cwd, branch: first.branch })
+              .pipe(Effect.orElseSucceed(() => true)))
+          ) {
+            return;
+          }
           const detected =
             first.branch === null
               ? null

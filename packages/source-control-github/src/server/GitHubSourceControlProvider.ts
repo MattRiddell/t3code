@@ -392,7 +392,12 @@ const HEAD_LOOKUPS_PER_DOCUMENT = 50;
  * without reserve wait longer.
  */
 const HEAD_LOOKUP_BATCH_WINDOW = "50 millis";
-const BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW = "500 millis";
+/**
+ * Fork patch (board #15036): background lookups wait five seconds, not half a second. On a
+ * loaded box (2026-10-19, ~95% CPU) a ten-minute pass's lookups reached GitHub over several
+ * seconds and split into four to six documents. No person waits on a background lookup.
+ */
+export const BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW = "5 seconds";
 /**
  * Background documents fill up under the longer window, and a failed document fails every head
  * in it. Fifty `main`-like heads of a hundred pull requests each took up to ~10s, GitHub's own
