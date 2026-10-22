@@ -78,6 +78,7 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { entryExpiresAt } from "../pullRequest/PullRequestReadCache.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import { detachStackFrame } from "./detachStackFrame.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -174,19 +175,20 @@ const SHORT_SHA_LENGTH = 7;
 const TOAST_DESCRIPTION_MAX = 72;
 const STATUS_RESULT_CACHE_TTL = Duration.seconds(1);
 const STATUS_RESULT_CACHE_CAPACITY = 2_048;
-// Fork patch (MattRiddell/t3code, board #15036): an open PR's lookup is kept
-// for ten minutes, not one. Upstream matched the one-minute settlement sweep
-// so an external merge settled within about a minute, but that re-asked
-// GitHub for every open-PR branch every minute (500 to 1,100 GraphQL calls an
-// hour on the fleet box). A PR badge or an external merge can now lag up to
-// ten minutes. Git actions, turn ends and user refreshes still bypass this
-// cache, and failed lookups still back off via prLookupFailureTtl.
-const PR_LOOKUP_CACHE_TTL = Duration.minutes(10);
-// Answers without an open PR ("no PR yet", merged, closed) only change when
-// someone opens a PR, and the paths that do that in-app (turn end, push,
-// create PR, user refresh) bypass this cache. They wait at least as long as
-// an open PR's answer (fork patch, board #15036; upstream: five minutes).
-const PR_LOOKUP_NO_OPEN_PR_CACHE_TTL = Duration.minutes(10);
+// Fork patch (MattRiddell/t3code, board #15036): a PR lookup is kept up to ten
+// minutes, not one. Upstream matched the one-minute settlement sweep so an
+// external merge settled within about a minute, but that re-asked GitHub for
+// every open-PR branch every minute (500 to 1,100 GraphQL calls an hour on the
+// fleet box). Answers without an open PR ("no PR yet", merged, closed) wait as
+// long (upstream: five minutes). A PR badge or an external merge can now lag up
+// to ten minutes. Git actions and user refreshes still bypass this cache, and
+// failed lookups still back off via prLookupFailureTtl.
+//
+// Every answer expires at the PR cache's next ten-minute tick (`entryExpiresAt`),
+// not ten minutes after its own read. The periodic branch pass runs just after
+// the tick, so it finds every answer stale together and its lookups share
+// batched documents; an answer read between ticks no longer outlives the pass
+// and lags past ten minutes.
 const PR_LOOKUP_FAILURE_BASE_TTL = Duration.seconds(20);
 const PR_LOOKUP_FAILURE_MAX_TTL = Duration.minutes(15);
 const PR_LOOKUP_CACHE_CAPACITY = 2_048;
@@ -196,7 +198,7 @@ const isSourceControlProviderError = Schema.is(SourceControlProviderError);
 /**
  * A hosting provider rejects a throttled request immediately, so caching every
  * failure for a flat 20s made a rate-limited poller re-ask *faster* than a
- * healthy one does (which waits PR_LOOKUP_CACHE_TTL), turning a transient 429
+ * healthy one does (which waits for the next ten-minute tick), turning a transient 429
  * into sustained pressure. Backing off per branch keeps the retry rate below
  * the healthy rate once a branch has failed more than a couple of times.
  */
@@ -715,6 +717,7 @@ function toPullRequestHeadRemoteInfo(pr: {
 }
 
 export const make = Effect.gen(function* () {
+  const clock = yield* Clock.Clock;
   const gitCore = yield* GitVcsDriver.GitVcsDriver;
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const textGeneration = yield* TextGeneration.TextGeneration;
@@ -1212,9 +1215,8 @@ export const make = Effect.gen(function* () {
       timeToLive: (exit, key) => {
         if (Exit.isSuccess(exit)) {
           prLookupFailureStreakByKey.delete(key);
-          return exit.value.latest?.state === "open"
-            ? PR_LOOKUP_CACHE_TTL
-            : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
+          const nowMs = clock.currentTimeMillisUnsafe();
+          return Duration.millis(entryExpiresAt(nowMs) - nowMs);
         }
         return nextPrLookupFailureTtl(key);
       },
@@ -1286,7 +1288,7 @@ export const make = Effect.gen(function* () {
     const cacheKey = prLookupCacheKey(cwd, details);
     // Fork patch (board #15036): a finished run no longer drops a cached "no pull request"
     // answer. Every run end cost one GitHub read; a pull request opened during the run now
-    // shows when the answer's PR_LOOKUP_NO_OPEN_PR_CACHE_TTL ends (Matt, q3440: PR badges
+    // shows when the answer expires at the next ten-minute tick (Matt, q3440: PR badges
     // can lag up to 10 min). A user-driven refresh still bumps the epoch (invalidateStatus).
     void refreshMissingPullRequest;
     return yield* getPrLookup(cacheKey).pipe(

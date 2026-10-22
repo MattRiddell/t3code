@@ -215,6 +215,30 @@ it.layer(NodeServices.layer)("PR filesystem cache", (it) => {
     }),
   );
 
+  it.effect("keeps an entry across an ignored scope's invalidation (fork patch #15036)", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pr-cache-" });
+      let reads = 0;
+      const lookup = Effect.sync(() => String(++reads));
+      const cache = yield* cacheLayer(directory);
+      const scopes = ["project", "pr-1"];
+      const ignoring = { ignoredScopes: ["project"] };
+      assert.strictEqual(yield* cache.get("first", lookup, scopes), "1");
+      yield* cache.invalidate("project");
+      assert.strictEqual(yield* cache.get("first", lookup, scopes, ignoring), "1");
+      // Must say no: a reader that ignores nothing rereads after the project invalidation.
+      assert.strictEqual(yield* cache.get("first", lookup, scopes), "2");
+      yield* cache.invalidate("project");
+      yield* cache.invalidate("pr-1");
+      // Must say no: the pull request's own invalidation still forces a read.
+      assert.strictEqual(yield* cache.get("first", lookup, scopes, ignoring), "3");
+      // That read stored the current project revision, so a strict reader keeps it.
+      assert.strictEqual(yield* cache.get("first", lookup, scopes), "3");
+      assert.strictEqual(reads, 3);
+    }),
+  );
+
   it.effect("shares a pending refresh without blocking an unrelated cached PR", () =>
     Effect.gen(function* () {
       const cache = yield* PullRequestReadCache.make;

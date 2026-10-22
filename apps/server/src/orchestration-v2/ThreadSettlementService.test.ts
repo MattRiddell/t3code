@@ -19,8 +19,10 @@ import {
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -899,8 +901,10 @@ describe("ThreadSettlementServiceV2 worker", () => {
               const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
               yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
               const reads = [(yield* Ref.get(fixture.summaryCalls)).length];
-              for (let sweep = 1; sweep <= 6; sweep++) {
-                yield* TestClock.adjust(ThreadSettlementService.SETTLEMENT_SWEEP_INTERVAL);
+              for (let sweep = 1; sweep <= 7; sweep++) {
+                yield* TestClock.adjust(
+                  ThreadSettlementService.nextSweepDelay(yield* Clock.currentTimeMillis),
+                );
                 yield* Queue.take(fixture.snapshotReads);
                 yield* reactor.drain;
                 reads.push((yield* Ref.get(fixture.summaryCalls)).length);
@@ -909,10 +913,65 @@ describe("ThreadSettlementServiceV2 worker", () => {
             }).pipe(Effect.provide(fixture.layer));
           });
 
-        // The sixth sweep is an hour after the first read.
-        assert.deepStrictEqual(yield* sweepReads("closed"), [1, 1, 1, 1, 1, 1, 2]);
+        // Sweeps run a minute after each tick, so the seventh is 61 minutes after the first read.
+        assert.deepStrictEqual(yield* sweepReads("closed"), [1, 1, 1, 1, 1, 1, 1, 2]);
         // Must say no: an open pull request is still read every sweep.
-        assert.deepStrictEqual(yield* sweepReads("open"), [1, 2, 3, 4, 5, 6, 7]);
+        assert.deepStrictEqual(yield* sweepReads("open"), [1, 2, 3, 4, 5, 6, 7, 8]);
+      }),
+    ),
+  );
+
+  it("sweeps a minute after each ten-minute tick", () => {
+    // Fork patch (board #15036): the sync pass reads open pull requests one second after it.
+    const tick = Date.parse(NOW);
+    const delay = (nowMs: number) =>
+      Duration.toMillis(ThreadSettlementService.nextSweepDelay(nowMs));
+    assert.strictEqual(delay(tick), 60_000);
+    assert.strictEqual(delay(tick + 30_000), 30_000);
+    // Must say no: at or after this tick's slot, the next slot is a tick later.
+    assert.strictEqual(delay(tick + 60_000), 10 * 60_000);
+    assert.strictEqual(delay(tick + 5 * 60_000), 6 * 60_000);
+  });
+
+  it.effect("reads summaries with this tick's answer despite a run's project refresh", () =>
+    // Fork patch (board #15036): each run end invalidated the project's reads and queued this
+    // thread's sweep, which then reread the pull request from GitHub.
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const ignored: Array<boolean | undefined> = [];
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot(
+            [
+              makeThread("linked", {
+                branch: "main",
+                linkedPullRequest: {
+                  projectId: PROJECT_ID,
+                  repository: "owner/repository",
+                  number: 1,
+                  url: "https://example.test/owner/repository/pull/1",
+                },
+                latestUserMessageAt: DateTime.makeUnsafe("2026-08-28T00:00:00.000Z"),
+              }),
+            ],
+            [makeProject()],
+          ),
+          settings: {
+            ...DEFAULT_SERVER_SETTINGS,
+            sidebarAutoSettleAfterDays: null,
+            sidebarAutoSettleOnMerge: true,
+          },
+          branchPullRequest: () => Effect.succeed(null),
+          pullRequestSummary: (input, readOptions) => {
+            ignored.push(readOptions?.ignoreProjectRefresh);
+            return Effect.succeed(makePullRequestSummary({ ...input, state: "open" }));
+          },
+        });
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
+          assert.deepStrictEqual(ignored, [true]);
+        }).pipe(Effect.provide(fixture.layer));
       }),
     ),
   );

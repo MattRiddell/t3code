@@ -6,6 +6,7 @@ import * as NodeChildProcess from "node:child_process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -50,6 +51,7 @@ import * as GitHubChangeRequestTemplate from "@t3tools/source-control-github/ser
 import * as GitLabCli from "@t3tools/source-control-gitlab/server/GitLabCli";
 import type * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
+import { entryExpiresAt } from "../pullRequest/PullRequestReadCache.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -853,6 +855,12 @@ function makeManager(input?: {
 }
 
 const asThreadId = (threadId: string) => threadId as ThreadId;
+
+// Tests in one layer share a TestClock; branch lookups expire on the ten-minute tick.
+const startAtTick = Effect.gen(function* () {
+  const nowMs = yield* Clock.currentTimeMillis;
+  yield* TestClock.adjust(Duration.millis(entryExpiresAt(nowMs) - nowMs));
+});
 
 const layerGitManagerTest = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-git-manager-test-" })),
@@ -2268,6 +2276,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         );
         const prListCalls = () => ghCalls.filter((call) => call.startsWith("pr list "));
 
+        yield* startAtTick;
         yield* lookupAll;
         expect(prListCalls()).toHaveLength(3);
 
@@ -2281,6 +2290,52 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         yield* lookupAll;
         expect(prListCalls()).toHaveLength(6);
         expect(prListCalls().slice(-3).join("\n")).toContain("--head feature/open-pr");
+      }),
+  );
+
+  it.effect(
+    "branch PR lookup answers read between ticks expire at the next tick (fork patch #15036)",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-");
+        yield* initRepo(repoDir);
+        const remoteDir = yield* createBareRemote();
+        yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+        yield* runGit(repoDir, ["checkout", "-b", "feature/mid-tick", "main"]);
+        yield* runGit(repoDir, ["push", "-u", "origin", "feature/mid-tick"]);
+        const { manager, ghCalls } = yield* makeManager({
+          ghScenario: {
+            prListByHeadSelector: {
+              "feature/mid-tick": encodeCliJson([
+                {
+                  number: 303,
+                  title: "feature/mid-tick",
+                  url: "https://github.com/pingdotgg/codething-mvp/pull/303",
+                  baseRefName: "main",
+                  headRefName: "feature/mid-tick",
+                  state: "OPEN",
+                  updatedAt: "2026-04-07T15:00:00Z",
+                },
+              ]),
+            },
+          },
+        });
+        const lookup = manager.branchPullRequest({ cwd: repoDir, branch: "feature/mid-tick" });
+        const prListCalls = () => ghCalls.filter((call) => call.startsWith("pr list "));
+
+        // Read five minutes into a tick.
+        yield* startAtTick;
+        yield* TestClock.adjust("5 minutes");
+        yield* lookup;
+        expect(prListCalls()).toHaveLength(1);
+        // Must say no: the answer holds until the tick.
+        yield* TestClock.adjust("299 seconds");
+        yield* lookup;
+        expect(prListCalls()).toHaveLength(1);
+        // Just past the tick it expires, five minutes before a read-relative TTL would.
+        yield* TestClock.adjust("2 seconds");
+        yield* lookup;
+        expect(prListCalls()).toHaveLength(2);
       }),
   );
 

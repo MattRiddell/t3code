@@ -11,18 +11,19 @@ import {
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as Duration from "effect/Duration";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
-import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import { entryExpiresAt } from "../pullRequest/PullRequestReadCache.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -44,8 +45,15 @@ export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
  * GitHub for every branch candidate whose cached answer had expired. PR answers
  * now live ten minutes (Matt, q3440: PR badges can lag up to 10 min), so a
  * faster sweep only finds the same answers.
+ *
+ * It runs a minute after each tick of the PR cache's ten-minute clock
+ * (`entryExpiresAt`), after the sync pass (one second after the tick) has read
+ * every open pull request. A sweep ten minutes after the last one ended drifted
+ * across the tick and reread from GitHub what the pass had just read.
  */
-export const SETTLEMENT_SWEEP_INTERVAL = "10 minutes";
+const SWEEP_AFTER_TICK_MS = 60_000;
+export const nextSweepDelay = (nowMs: number): Duration.Duration =>
+  Duration.millis(entryExpiresAt(nowMs - SWEEP_AFTER_TICK_MS) + SWEEP_AFTER_TICK_MS - nowMs);
 /**
  * Branch lookups per sweep run together so GitHub's batched head lookups fill a
  * document (25 per background document) instead of eight at a time.
@@ -333,13 +341,16 @@ export const make = Effect.gen(function* () {
     if (held !== undefined && nowMs - held.readAtMs < CLOSED_PULL_REQUEST_RECHECK_MS) {
       return held.pullRequest;
     }
+    // Fork patch (board #15036): every finished run invalidates its project's PR reads, and the
+    // same run end queues this thread's sweep, so each run end cost a GitHub read here. The sweep
+    // takes this tick's answer instead; a merge or close shows within one tick.
     const summary = yield* pullRequests.summary(
       {
         projectId: reference.projectId,
         repository: reference.repository,
         number: reference.number,
       },
-      { recoverTransientFailure: false },
+      { recoverTransientFailure: false, ignoreProjectRefresh: true },
     );
     const pullRequest = {
       state: summary.state,
@@ -695,7 +706,8 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* worker.enqueue(undefined);
         yield* worker.drain;
-      }).pipe(Effect.repeat(Schedule.spaced(SETTLEMENT_SWEEP_INTERVAL)), Effect.asVoid),
+        yield* Effect.sleep(nextSweepDelay(yield* Clock.currentTimeMillis));
+      }).pipe(Effect.forever, Effect.asVoid),
     );
     yield* forkParked(
       Stream.runForEach(settingsChanges, (settings) => {
