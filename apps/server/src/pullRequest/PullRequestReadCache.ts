@@ -53,6 +53,14 @@ const ENTRY_TTL_MILLIS = Duration.toMillis(ENTRY_TTL);
 export const entryExpiresAt = (nowMillis: number): number =>
   (Math.floor(nowMillis / ENTRY_TTL_MILLIS) + 1) * ENTRY_TTL_MILLIS;
 type ReadError = PullRequestOperationError | PullRequestUnavailableError;
+/**
+ * True when every scope revision a reader wants equals the one stored with the entry. A scope
+ * with no live invalidation wants "" and matches any stored revision.
+ */
+const revisionMatches = (wanted: string, stored: string | undefined): boolean => {
+  const storedParts = stored?.split(":") ?? [];
+  return wanted.split(":").every((value, index) => value === "" || value === storedParts[index]);
+};
 const revisionCodec = Schema.fromJsonString(
   Schema.Record(
     Schema.String,
@@ -71,10 +79,7 @@ class Read extends Persistable.Class<{
   error: Schema.Union([PullRequestOperationError, PullRequestUnavailableError]),
 }) {
   matchesRevision(revision: string | undefined): boolean {
-    const stored = revision?.split(":") ?? [];
-    return this.revision
-      .split(":")
-      .every((value, index) => value === "" || value === stored[index]);
+    return revisionMatches(this.revision, revision);
   }
 
   [Equal.symbol](that: unknown): boolean {
@@ -85,6 +90,15 @@ class Read extends Persistable.Class<{
   }
 }
 
+export interface GetOptions {
+  /**
+   * Fork patch (board #15036): scopes whose invalidation this read ignores. The read takes an
+   * unexpired entry stored before such an invalidation. A fresh read still stores the current
+   * revision of every scope, so strict readers can use it.
+   */
+  readonly ignoredScopes?: ReadonlyArray<string>;
+}
+
 export class PullRequestReadCache extends Context.Service<
   PullRequestReadCache,
   {
@@ -92,6 +106,7 @@ export class PullRequestReadCache extends Context.Service<
       key: string,
       lookup: Effect.Effect<string, ReadError>,
       scopes?: ReadonlyArray<string>,
+      options?: GetOptions,
     ) => Effect.Effect<string, ReadError>;
     readonly invalidate: (scope: string) => Effect.Effect<void>;
   }
@@ -145,22 +160,25 @@ export const make = Effect.gen(function* () {
     { capacity: CONCURRENT_READS, timeToLive: () => Duration.zero },
   );
   return PullRequestReadCache.of({
-    get: Effect.fn("PullRequestReadCache.get")(function* (key, lookup, scopes = []) {
+    get: Effect.fn("PullRequestReadCache.get")(function* (key, lookup, scopes = [], options) {
       if (!enabled) return yield* lookup;
       const read = yield* Effect.cached(lookup);
       return yield* Effect.gen(function* () {
         const current = yield* Cache.get(revisions, undefined);
         const now = clock.currentTimeMillisUnsafe();
-        const revision = scopes
-          .map((scope) => {
-            const value = current[scope];
-            return value !== undefined && value.expiresAt > now ? value.revision : "";
-          })
+        const revisionOf = (scope: string) => {
+          const value = current[scope];
+          return value !== undefined && value.expiresAt > now ? value.revision : "";
+        };
+        const revision = scopes.map(revisionOf).join(":");
+        const ignored = new Set(options?.ignoredScopes ?? []);
+        const wanted = scopes
+          .map((scope) => (ignored.has(scope) ? "" : revisionOf(scope)))
           .join(":");
         const request = new Read({ key: yield* digest(key), revision, lookup: read });
         const stored = yield* cache.get(request);
         return (
-          request.matchesRevision(stored.revision) ? stored : yield* Cache.get(refreshes, request)
+          revisionMatches(wanted, stored.revision) ? stored : yield* Cache.get(refreshes, request)
         ).payload;
       }).pipe(
         Effect.catchTags({

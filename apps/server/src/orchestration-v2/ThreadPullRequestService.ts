@@ -14,18 +14,20 @@ import {
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectStore from "./ProjectStore.ts";
+import { entryExpiresAt } from "../pullRequest/PullRequestReadCache.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -111,12 +113,28 @@ export const hasOpenBranchPullRequest = (thread: OrchestrationV2ThreadShell): bo
 
 const BACKFILL_ATTEMPTS = 5;
 /**
- * Fork patch (board #15036): the periodic pass over every unsettled thread runs every ten
- * minutes, not every minute. Branch lookups are cached for ten minutes, so a one-minute pass
- * found a few expired branches each minute and sent each handful to GitHub as its own GraphQL
- * document. A ten-minute pass finds them expired together, and they share documents.
+ * Fork patch (board #15036): the periodic pass over every unsettled thread runs once each ten
+ * minutes, not every minute. Branch lookups are cached until the PR cache's next ten-minute
+ * tick (`entryExpiresAt`), so a one-minute pass found a few expired branches each minute and
+ * sent each handful to GitHub as its own GraphQL document.
+ *
+ * The pass runs one second after each tick, so every cached lookup it reads has expired
+ * together and its lookups share documents. A pass ten minutes after the last one ended
+ * drifted, and a lookup cached between passes outlived the next one.
  */
-export const PERIODIC_PASS_INTERVAL = "10 minutes";
+const PERIODIC_PASS_AFTER_TICK_MS = 1_000;
+export const nextPeriodicPassDelay = (nowMs: number): Duration.Duration =>
+  Duration.millis(
+    entryExpiresAt(nowMs - PERIODIC_PASS_AFTER_TICK_MS) + PERIODIC_PASS_AFTER_TICK_MS - nowMs,
+  );
+/**
+ * Fork patch (board #15036): a finished run or a checkpoint no longer syncs its thread at once.
+ * Each one looked the branch up whenever its cached answer had expired, at about one GitHub
+ * document a minute between passes on 2026-10-22. The next periodic pass looks the branch up
+ * with every other one, at most one tick later (Matt, q3440: PR badges can lag up to 10 min).
+ * A new, unarchived, renamed or unsettled thread still syncs at once.
+ */
+export const DEFER_RUN_END_SYNC_TO_PASS = true;
 
 /**
  * Fork patch (board #15036): a provider's own subagent works on its root thread's branch. Once
@@ -424,16 +442,19 @@ export const make = Effect.gen(function* () {
       case "thread.unsettled":
         return worker.enqueue({ threadId: event.threadId, refresh: true });
       // Fork patch (board #15036): a checkpoint or a finished run reads the cached branch
-      // lookup. Forcing a fresh read cost one GitHub document per run end; a pull request
-      // opened during the run shows within the cache's ten minutes (Matt, q3440).
+      // lookup. Forcing a fresh read cost one GitHub document per run end. With
+      // DEFER_RUN_END_SYNC_TO_PASS the next periodic pass reads it instead.
       case "checkpoint.captured":
-        return worker.enqueue({ threadId: event.threadId, refresh: false });
+        return DEFER_RUN_END_SYNC_TO_PASS
+          ? Effect.void
+          : worker.enqueue({ threadId: event.threadId, refresh: false });
       case "run.updated":
         if (
-          event.payload.status === "completed" ||
-          event.payload.status === "failed" ||
-          event.payload.status === "cancelled" ||
-          event.payload.status === "interrupted"
+          !DEFER_RUN_END_SYNC_TO_PASS &&
+          (event.payload.status === "completed" ||
+            event.payload.status === "failed" ||
+            event.payload.status === "cancelled" ||
+            event.payload.status === "interrupted")
         ) {
           return worker.enqueue({ threadId: event.threadId, refresh: false });
         }
@@ -450,13 +471,11 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* worker.enqueue({ threadId: null, refresh: false, backfill: true });
         yield* worker.drain;
-        yield* Effect.gen(function* () {
+        return yield* Effect.gen(function* () {
+          yield* Effect.sleep(nextPeriodicPassDelay(yield* Clock.currentTimeMillis));
           yield* worker.enqueue({ threadId: null, refresh: false });
           yield* worker.drain;
-        }).pipe(
-          Effect.repeat(Schedule.spaced(PERIODIC_PASS_INTERVAL)),
-          Effect.delay(PERIODIC_PASS_INTERVAL),
-        );
+        }).pipe(Effect.forever);
       }).pipe(Effect.asVoid),
     );
   });

@@ -1,8 +1,10 @@
 import {
   EventId,
   GitManagerError,
+  MessageId,
   ProjectId,
   ProviderInstanceId,
+  RunId,
   ThreadId,
   type OrchestrationProjectShell,
   type OrchestrationV2DomainEvent,
@@ -12,6 +14,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -221,6 +224,36 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           yield* Deferred.succeed(activation, undefined);
           expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: false });
           yield* service.drain;
+          // Fork patch (board #15036): a finished run leaves its branch to the next pass.
+          const runId = RunId.make("run:updated-thread:1");
+          yield* PubSub.publish(events, {
+            type: "run.updated",
+            id: EventId.make("event:run-completed"),
+            threadId: thread.id,
+            runId,
+            occurredAt: NOW,
+            payload: {
+              id: runId,
+              threadId: thread.id,
+              ordinal: 1,
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+              providerThreadId: null,
+              userMessageId: MessageId.make("message:updated-thread:1"),
+              rootNodeId: null,
+              activeAttemptId: null,
+              status: "completed",
+              requestedAt: NOW,
+              startedAt: NOW,
+              completedAt: NOW,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          });
+          yield* Effect.yieldNow;
+          yield* service.drain;
+          expect(yield* Queue.size(reads)).toBe(0);
+          // Must say no: a metadata update still syncs its thread at once.
           yield* PubSub.publish(events, {
             type: "thread.metadata-updated",
             id: EventId.make("event:metadata"),
@@ -456,6 +489,17 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     ),
   );
 
+  it("periodic passes run one second after each ten-minute tick", () => {
+    // Fork patch (board #15036): branch lookups expire on the tick, so the pass reads them together.
+    const tick = Date.parse("2026-09-20T00:00:00.000Z");
+    const delay = (nowMs: number) =>
+      Duration.toMillis(ThreadPullRequestService.nextPeriodicPassDelay(nowMs));
+    expect(delay(tick)).toBe(1_000);
+    // Must say no: at or after this tick's slot, the next slot is a tick later.
+    expect(delay(tick + 1_000)).toBe(10 * 60_000);
+    expect(delay(tick + 4 * 60_000)).toBe(6 * 60_000 + 1_000);
+  });
+
   it.effect("periodic sweeps read only unsettled threads once backfill is done", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -507,7 +551,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: false });
           yield* service.drain;
           // Its project is gone, so backfill finishes it on the first pass.
-          yield* TestClock.adjust(ThreadPullRequestService.PERIODIC_PASS_INTERVAL);
+          yield* TestClock.adjust("10 minutes");
           expect(yield* Queue.take(reads)).toEqual({ location: "active", unsettledOnly: true });
           yield* service.drain;
         }).pipe(Effect.provide(layerDependencies));

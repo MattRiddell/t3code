@@ -62,6 +62,15 @@ export const nextPassDelay = (nowMs: number): Duration.Duration =>
  * once through `requestSync`.
  */
 export const DEFER_BACKGROUND_SYNC_TO_PASS = true;
+/**
+ * Fork patch (board #15036): the pass starts every due group at once, not 25 at a time. Each
+ * group writes its snapshot under one shared lock, so slots freed one by one about a second
+ * apart, and every group after the first 25 reached GitHub alone: the pass of
+ * 2026-10-22 06:30Z sent 14 summary documents for one tick. Reads started together share
+ * the resolver's 250 ms window and go out 25 to a document. Linked pull requests bound the
+ * width, and `GitHubRequestPolicy` still bounds the requests in flight.
+ */
+export const SYNC_PASS_CONCURRENCY = "unbounded";
 const PULL_REQUEST_CLOSE_COMMAND = /\b(?:gh\s+pr|glab\s+mr)\s+(?:merge|close)\b/u;
 
 const isPullRequestProviderError = Schema.is(PullRequestProviderError);
@@ -392,9 +401,9 @@ export const make = Effect.gen(function* () {
           ),
         );
       },
-      // As wide as one batched summary read, so the sweep's reads on a host arrive together and
-      // GitHub answers them in one request rather than one `gh pr view` apiece.
-      { concurrency: 25, discard: true },
+      // Fork patch (board #15036): every due group starts at once (SYNC_PASS_CONCURRENCY), so
+      // the pass's summary reads on a host reach the batched resolver inside one window.
+      { concurrency: SYNC_PASS_CONCURRENCY, discard: true },
     );
     for (const [reason, { count, key }] of skips) {
       yield* Effect.logWarning("pull request sync skipped", { count, key, reason });

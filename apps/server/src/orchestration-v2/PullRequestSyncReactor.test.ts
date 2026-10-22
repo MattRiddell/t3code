@@ -740,6 +740,40 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
+  it.effect("starts every due read of a pass at once, so they share batched documents", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const numbers = Array.from({ length: 40 }, (_, index) => index + 1);
+        let inFlight = 0;
+        let mostInFlight = 0;
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot(
+            numbers.map((number) =>
+              makeThread(`thread-${number}`, {
+                pullRequests: [makeLink(number, { state: "open" })],
+              }),
+            ),
+          ),
+          summary: (input) =>
+            Effect.gen(function* () {
+              inFlight += 1;
+              mostInFlight = Math.max(mostInFlight, inFlight);
+              for (let turn = 0; turn < 10; turn += 1) yield* Effect.yieldNow;
+              inFlight -= 1;
+              return makeSummary(input, { state: "open" });
+            }),
+        });
+        yield* Effect.gen(function* () {
+          yield* startAndSweep(fixture);
+          assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 40);
+          // 25 at a time let the reads after the first 25 reach the host one by one.
+          assert.strictEqual(mostInFlight, 40);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
   it.effect("discovers externally reopened pull requests after fifteen minutes", () =>
     Effect.scoped(
       Effect.gen(function* () {

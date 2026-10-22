@@ -180,7 +180,17 @@ export class PullRequestService extends Context.Service<
     ) => Effect.Effect<A, E | PullRequestError, R>;
     readonly summary: (
       input: PullRequestRef,
-      options?: { readonly recoverTransientFailure?: boolean },
+      options?: {
+        readonly recoverTransientFailure?: boolean;
+        /**
+         * Fork patch (board #15036): take this tick's cached answer even after a finished run
+         * invalidated the project's reads (`refreshAfterTurn`). An invalidation of this pull
+         * request itself still forces a fresh read. For background readers only: the sync
+         * pass rereads every open pull request each tick (Matt, q3440: PR badges can lag up to
+         * 10 min).
+         */
+        readonly ignoreProjectRefresh?: boolean;
+      },
     ) => Effect.Effect<PullRequestSummary, PullRequestError>;
     readonly stack: (
       input: PullRequestRef,
@@ -2628,6 +2638,7 @@ export const make = Effect.gen(function* () {
     operation: string,
     codec: Schema.Codec<A, string>,
     read: Effect.Effect<A, PullRequestError>,
+    options?: { readonly ignoreProjectRefresh?: boolean },
   ) {
     const project = yield* requireProject(input);
     const key = [
@@ -2658,10 +2669,13 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    const payload = yield* readCache.get(key, encodedRead, [
-      `project:${input.projectId}`,
-      refScope(input),
-    ]);
+    const projectScope = `project:${input.projectId}`;
+    const payload = yield* readCache.get(
+      key,
+      encodedRead,
+      [projectScope, refScope(input)],
+      options?.ignoreProjectRefresh === true ? { ignoredScopes: [projectScope] } : undefined,
+    );
     const decoded = yield* Schema.decodeEffect(codec)(payload).pipe(Effect.option);
     return Option.isSome(decoded) ? decoded.value : yield* lookup;
   });
@@ -2670,7 +2684,9 @@ export const make = Effect.gen(function* () {
 
   const summary: PullRequestService["Service"]["summary"] = (input, options) => {
     const key = refCacheKey(input);
-    const cached = persistedRead(input, "summary", summaryCodec, summaryUncached(input));
+    const cached = persistedRead(input, "summary", summaryCodec, summaryUncached(input), {
+      ignoreProjectRefresh: options?.ignoreProjectRefresh === true,
+    });
     const held = lastGoodSummary.peek(key);
     return held !== undefined &&
       input.allowStale !== false &&
