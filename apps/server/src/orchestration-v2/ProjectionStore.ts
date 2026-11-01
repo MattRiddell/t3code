@@ -1,6 +1,7 @@
 import { pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
+import { preserveFreshContext } from "./freshProviderContext.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -855,7 +856,13 @@ export function applyToProjection(
                 activeProviderThreadId: event.payload.id,
               }
             : base.thread,
-        providerThreads: upsertById(base.providerThreads, event.payload),
+        providerThreads: upsertById(
+          base.providerThreads,
+          preserveFreshContext(
+            base.providerThreads.find((thread) => thread.id === event.payload.id),
+            event.payload,
+          ),
+        ),
       };
     case "provider-turn.updated":
       return {
@@ -2190,12 +2197,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               WHERE provider_session_id = ${event.payload.providerSessionId}
                 AND thread_id = ${event.threadId}
             `;
-              break;
-            }
-            case "provider-thread.updated": {
-              const payloadJson = yield* encodeProviderThreadPayload(event.payload);
-              const payload = parseEncodedPayload(payloadJson);
-              yield* sql`
+            break;
+          }
+          case "provider-thread.updated": {
+            const existing = yield* sql<PayloadRow>`
+              SELECT payload_json FROM orchestration_v2_projection_provider_threads
+              WHERE provider_thread_id = ${event.payload.id}
+            `;
+            const previous =
+              existing[0] === undefined
+                ? undefined
+                : yield* decodeProviderThreadPayload(existing[0].payload_json);
+            const payloadJson = yield* encodeProviderThreadPayload(
+              preserveFreshContext(previous, event.payload),
+            );
+            const payload = parseEncodedPayload(payloadJson);
+            yield* sql`
               INSERT INTO orchestration_v2_projection_provider_threads (
                 provider_thread_id,
                 thread_id,

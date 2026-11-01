@@ -795,8 +795,8 @@ export const layer: Layer.Layer<
       );
       const freshBootstrapForThread = (loaded: OrchestrationV2ProviderThread) =>
         providerThread.freshContext !== undefined &&
-        (run.ordinal === providerThread.firstRunOrdinal ||
-          loaded.nativeThreadRef?.nativeId !== providerThread.nativeThreadRef?.nativeId)
+        (providerThread.freshContext.acceptedNativeThreadId === undefined ||
+          providerThread.freshContext.acceptedNativeThreadId !== loaded.nativeThreadRef?.nativeId)
           ? providerThread.freshContext.bootstrap : "";
       const handoffContextForThread = (loadedProviderThread: OrchestrationV2ProviderThread) => {
         const measuredContext = latestNativeContextUsage(projection, providerThread);
@@ -1391,6 +1391,7 @@ export const layer: Layer.Layer<
       );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
+          const freshBootstrap = compact ? "" : freshBootstrapForThread(runningProviderThread);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
             deferInline: compact || goalCommand,
@@ -1427,7 +1428,7 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [freshBootstrapForThread(runningProviderThread), delivery.context, restartNote]
+          const context = [freshBootstrap, delivery.context, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
@@ -1454,6 +1455,56 @@ export const layer: Layer.Layer<
                 : Effect.void,
             ),
           );
+          if (freshBootstrap !== "") {
+            yield* Effect.gen(function* () {
+              const nativeId = runningProviderThread.nativeThreadRef?.nativeId;
+              if (nativeId === undefined || nativeId === null) return;
+              for (let retry = 0; retry < 3; retry += 1) {
+                const records = yield* projectionStore.getThreadRecords(input.threadId, [
+                  "providerThreads",
+                ]);
+                const current = records.providerThreads.find((row) => row.id === providerThread.id);
+                if (
+                  current?.nativeThreadRef?.nativeId !== nativeId ||
+                  current.freshContext?.bootstrap !== freshBootstrap ||
+                  current.freshContext.throughRunOrdinal !==
+                    providerThread.freshContext?.throughRunOrdinal ||
+                  current.freshContext.acceptedNativeThreadId === nativeId
+                )
+                  return;
+                const acceptedAt = yield* DateTime.now;
+                const result = yield* eventSink.writeIfProviderThreadUnchanged({
+                  expected: current,
+                  events: [
+                    {
+                      id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+                      type: "provider-thread.updated",
+                      threadId: input.threadId,
+                      runId: run.id,
+                      providerInstanceId: run.providerInstanceId,
+                      occurredAt: acceptedAt,
+                      payload: {
+                        ...current,
+                        freshContext: { ...current.freshContext, acceptedNativeThreadId: nativeId },
+                        updatedAt: acceptedAt,
+                      },
+                    },
+                  ],
+                });
+                if (result.committed) return;
+              }
+              yield* Effect.logWarning("Bootstrap receipt lost concurrent update races", {
+                runId: run.id,
+              });
+            }).pipe(
+              Effect.catchCause(() =>
+                Effect.logWarning("Failed to record accepted bootstrap", {
+                  runId: run.id,
+                  deliveryStatus: "pending",
+                }),
+              ),
+            );
+          }
           // After provider acceptance, failed delivery bookkeeping must not stop live ingestion.
           yield* delivery.delivered.pipe(
             Effect.catchCause(() =>

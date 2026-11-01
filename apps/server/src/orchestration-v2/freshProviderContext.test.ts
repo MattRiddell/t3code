@@ -196,5 +196,60 @@ it.effect(
       assert.equal(fresh.nativeThreadRef, null);
       assert.equal(fresh.freshContext?.bootstrap, command.freshContext.bootstrap);
       refuse(after); // NO: repeated/stale renewal must not reset again.
+
+      // Both reducers must keep a durable receipt when adapters/finalization
+      // write snapshots captured before successful bootstrap delivery.
+      let memory = after;
+      const update = (payload: typeof fresh) =>
+        Effect.gen(function* () {
+          const event = {
+            id: EventId.make(`receipt:${payload.nativeThreadRef?.nativeId}:${payload.updatedAt}`),
+            type: "provider-thread.updated" as const,
+            threadId,
+            occurredAt: later,
+            payload,
+          };
+          memory = ProjectionStore.applyToProjection(memory, event);
+          yield* store.apply(event);
+          const persisted = yield* store.getThreadProjection(threadId);
+          assert.deepEqual(
+            persisted.providerThreads.find((row) => row.id === fresh.id)?.freshContext,
+            memory.providerThreads.find((row) => row.id === fresh.id)?.freshContext,
+          );
+          return persisted.providerThreads.find((row) => row.id === fresh.id)!;
+        });
+      const pending = {
+        ...fresh,
+        nativeThreadRef: {
+          driver: adapter.driver,
+          nativeId: "seed-native",
+          strength: "strong" as const,
+        },
+      };
+      yield* update({
+        ...pending,
+        freshContext: { ...fresh.freshContext!, acceptedNativeThreadId: "seed-native" },
+      });
+      for (const stale of [pending, { ...pending, freshContext: undefined }]) {
+        const kept = yield* update(stale);
+        assert.equal(kept.freshContext?.acceptedNativeThreadId, "seed-native");
+      }
+      const replacement = {
+        ...pending,
+        nativeThreadRef: { ...pending.nativeThreadRef, nativeId: "replacement" },
+      };
+      const unaccepted = yield* update(replacement);
+      assert.notEqual(unaccepted.freshContext?.acceptedNativeThreadId, "replacement");
+      yield* update({
+        ...replacement,
+        freshContext: { ...fresh.freshContext!, acceptedNativeThreadId: "replacement" },
+      });
+      const retained = yield* update(replacement);
+      assert.equal(retained.freshContext?.acceptedNativeThreadId, "replacement");
+      const renewed = yield* update({
+        ...replacement,
+        freshContext: { bootstrap: "New generation", throughRunOrdinal: 2 },
+      });
+      assert.equal(renewed.freshContext?.acceptedNativeThreadId, undefined);
     }).pipe(Effect.provide(layer)),
 );
