@@ -174,6 +174,7 @@ function makeLocalCommandHarness(input: {
   readonly openFailure?: unknown;
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly emptyRetryHistory?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -470,29 +471,30 @@ function makeLocalCommandHarness(input: {
           }),
         ),
   );
-  const writeIfRunCurrent = vi.fn(({ events: incoming, activeAttemptId, expectedStatus }) =>
-    "writeFailure" in input
-      ? Effect.fail(
-          new EventSink.EventSinkWriteError({
-            eventCount: incoming.length,
-            cause: input.writeFailure,
-          }),
-        )
-      : Effect.sync(() => {
-          const current = projection.runs.find((candidate) => candidate.id === runId);
-          const committed =
-            current !== undefined &&
-            current.activeAttemptId === activeAttemptId &&
-            current.status === expectedStatus;
-          if (committed) {
-            for (const event of incoming) {
-              expect(isDomainEvent(event)).toBe(true);
-              events.push(event);
-              projection = ProjectionStore.applyToProjection(projection, event);
+  const writeIfRunCurrent = vi.fn(
+    ({ events: incoming, activeAttemptId, expectedStatus, runId: currentRunId }) =>
+      "writeFailure" in input
+        ? Effect.fail(
+            new EventSink.EventSinkWriteError({
+              eventCount: incoming.length,
+              cause: input.writeFailure,
+            }),
+          )
+        : Effect.sync(() => {
+            const current = projection.runs.find((candidate) => candidate.id === currentRunId);
+            const committed =
+              current !== undefined &&
+              current.activeAttemptId === activeAttemptId &&
+              current.status === expectedStatus;
+            if (committed) {
+              for (const event of incoming) {
+                expect(isDomainEvent(event)).toBe(true);
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
             }
-          }
-          return { committed, storedEvents: [] };
-        }),
+            return { committed, storedEvents: [] };
+          }),
   );
   const resolveRuntimePolicy = vi.fn(
     ({ thread }: Parameters<RuntimePolicy.RuntimePolicyV2Shape["resolve"]>[0]) =>
@@ -518,7 +520,20 @@ function makeLocalCommandHarness(input: {
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent,
+          writeIfProviderThreadUnchanged: ({ expected, events: incoming }) =>
+            Effect.sync(() => {
+              const current = projection.providerThreads.find((row) => row.id === expected.id);
+              if (current !== expected) return { committed: false, storedEvents: [] };
+              for (const event of incoming) {
+                expect(isDomainEvent(event)).toBe(true);
+                events.push(event);
+                projection = ProjectionStore.applyToProjection(projection, event);
+              }
+              return { committed: true, storedEvents: [] };
+            }),
+        }),
         IdAllocator.layer,
         Path.layer,
         input.fileSystem === undefined
@@ -544,13 +559,15 @@ function makeLocalCommandHarness(input: {
                   (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
               ),
             }),
-          getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+          getTurnStartHistory: (_threadId, runIds) =>
+            input.emptyRetryHistory && runIds !== undefined
+              ? Effect.succeed([])
+              : Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: input.historyReadFailureAfterFallback,
+                  }),
+                ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
@@ -579,7 +596,10 @@ function makeLocalCommandHarness(input: {
     attemptId,
     projection: () => projection,
     start: Effect.gen(function* () {
-      yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({ threadId, runId });
+      yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({
+        threadId,
+        runId: projection.runs.at(-1)!.id,
+      });
     }).pipe(Effect.provide(layer)),
     startWithRetry: Effect.gen(function* () {
       yield* (yield* ProviderTurnStart.ProviderTurnStartServiceV2).start({
@@ -1047,25 +1067,41 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
   );
 }
 
-effectIt.effect(
-  "starts a renewed native thread from its seed without reading the old transcript",
-  () =>
+for (const first of ["success", "rejected", "compact"] as const) {
+  effectIt.effect(`keeps bootstrap delivery durable after a first ${first} turn`, () =>
     Effect.gen(function* () {
-      const seed = "Role: matt-console. Handoff: pending ask. Lessons: read the bounded role file.";
-      const harness = makeLocalCommandHarness({ text: "New ask", freshBootstrap: seed });
-      const startTurn = vi.fn((_input: unknown) => Effect.void);
+      const seed = "Role: matt-console. Handoff: pending ask. Lessons: bounded role file.";
+      const harness = makeLocalCommandHarness({
+        text: first === "compact" ? "/compact" : "New ask",
+        freshBootstrap: seed,
+        emptyRetryHistory: true,
+        previousMessages: ["Pre-renewal transcript must stay out of native context"],
+      });
+      harness.tryHandlePromptCommand.mockImplementation(() => Effect.succeed(false));
       const old = harness.projection().providerThreads[0]!;
-      const ensureThread = vi.fn(() =>
-        Effect.succeed({
-          ...old,
-          nativeThreadRef: {
-            driver: old.driver,
-            nativeId: "fresh-native",
-            strength: "strong" as const,
-          },
-        }),
+      let nativeId = "fresh-native";
+      const withNative = (thread: typeof old) => ({
+        ...thread,
+        nativeThreadRef: { driver: old.driver, nativeId, strength: "strong" as const },
+      });
+      const startTurn = vi.fn((_input: unknown) =>
+        first === "rejected" && startTurn.mock.calls.length === 1
+          ? Effect.fail(
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: old.driver,
+                threadId: old.appThreadId!,
+                providerThreadId: old.id,
+                runId: harness.projection().runs.at(-1)!.id,
+                cause: "Provider refused before accepting the prompt",
+              }),
+            )
+          : Effect.void,
       );
-      const resumeThread = vi.fn(() => Effect.die("Must not resume the previous native thread"));
+      const compactThread = vi.fn((_input: unknown) => Effect.void);
+      const ensureThread = vi.fn(() => Effect.succeed(withNative(old)));
+      const resumeThread = vi.fn(({ providerThread }: { providerThread: typeof old }) =>
+        Effect.succeed(withNative(providerThread)),
+      );
       harness.open.mockImplementation(() =>
         Effect.succeed({
           driver: old.driver,
@@ -1084,27 +1120,96 @@ effectIt.effect(
           ensureThread,
           resumeThread,
           startTurn,
+          compactThread,
         } as never),
       );
-      harness.startRootRun.mockImplementation((input) =>
-        input.session
-          .startTurn({
-            threadId: input.appThread.id,
-            runId: input.run.id,
-            message: input.message,
-            modelSelection: input.modelSelection,
-            runtimePolicy: input.runtimePolicy,
-            providerThread: input.providerThread,
-          } as never)
-          .pipe(Effect.orDie),
-      );
+      harness.startRootRun.mockImplementation((input) => {
+        const start =
+          input.message.text === "/compact"
+            ? input.session.compactThread!
+            : input.session.startTurn;
+        return start({
+          threadId: input.appThread.id,
+          runId: input.run.id,
+          message: input.message,
+          modelSelection: input.modelSelection,
+          runtimePolicy: input.runtimePolicy,
+          providerThread: input.providerThread,
+        } as never).pipe(Effect.catch(() => Effect.void));
+      });
+      const next = (text: string) => {
+        const projection = harness.projection();
+        const prior = projection.runs.at(-1)!;
+        const runId = RunId.make(`next:${prior.ordinal}`);
+        harness.setProjection({
+          ...projection,
+          runs: [
+            ...projection.runs.map((run) => ({
+              ...run,
+              status:
+                first === "rejected" && run.ordinal === old.firstRunOrdinal
+                  ? ("failed" as const)
+                  : ("completed" as const),
+            })),
+            { ...prior, id: runId, ordinal: prior.ordinal + 1, status: "starting" },
+          ],
+          attempts: projection.attempts.map((attempt) => ({
+            ...attempt,
+            runId,
+            status: "pending",
+          })),
+          messages: projection.messages.map((message) =>
+            message.id === prior.userMessageId ? { ...message, runId, text } : message,
+          ),
+        });
+      };
       yield* harness.start;
       expect(ensureThread).toHaveBeenCalledOnce();
       expect(resumeThread).not.toHaveBeenCalled();
-      expect(startTurn).toHaveBeenCalledOnce();
-      expect(startTurn.mock.calls[0]?.[0]).toMatchObject({
-        message: { text: `${seed}\n\nUser message:\nNew ask` },
+      expect(harness.projection().providerThreads[0]?.freshContext?.acceptedNativeThreadId).toBe(
+        first === "success" ? nativeId : undefined,
+      );
+      if (first === "compact") {
+        expect(compactThread).toHaveBeenCalledOnce();
+        expect(compactThread.mock.calls[0]?.[0]).toMatchObject({ message: { text: "/compact" } });
+      } else {
+        expect(startTurn.mock.calls[0]?.[0]).toMatchObject({
+          message: { text: `${seed}\n\nUser message:\nNew ask` },
+        });
+      }
+      next("Next ordinary ask");
+      yield* harness.start;
+      expect(resumeThread).toHaveBeenCalledOnce();
+      expect(startTurn.mock.calls.at(-1)?.[0]).toMatchObject({
+        message: {
+          text:
+            first === "success"
+              ? "Next ordinary ask"
+              : `${seed}\n\nUser message:\nNext ordinary ask`,
+        },
       });
-      expect(harness.projection().providerThreads[0]?.freshContext?.bootstrap).toBe(seed);
+      expect(harness.projection().providerThreads[0]?.freshContext?.acceptedNativeThreadId).toBe(
+        nativeId,
+      );
+      next("After acceptance");
+      yield* harness.start;
+      expect(startTurn.mock.calls.at(-1)?.[0]).toMatchObject({
+        message: { text: "After acceptance" },
+      });
+      nativeId = "replacement-native";
+      next("After native replacement");
+      yield* harness.start;
+      expect(startTurn.mock.calls.at(-1)?.[0]).toMatchObject({
+        message: { text: `${seed}\n\nUser message:\nAfter native replacement` },
+      });
+      expect(harness.projection().providerThreads[0]?.freshContext?.acceptedNativeThreadId).toBe(
+        nativeId,
+      );
+      for (const [call] of startTurn.mock.calls) {
+        expect((call as { message: { text: string } }).message.text).not.toContain(
+          "Pre-renewal transcript",
+        );
+      }
     }),
-);
+  );
+}

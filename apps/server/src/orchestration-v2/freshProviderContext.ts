@@ -7,6 +7,26 @@ import {
 import * as DateTime from "effect/DateTime";
 import type { ProjectionRecords } from "./ProjectionStore.ts";
 
+// Adapter snapshots and finalization can predate acceptance of the bootstrap.
+// Only a new renewal generation or native context invalidates that receipt.
+export function preserveFreshContext(
+  previous: OrchestrationV2ProviderThread | undefined,
+  incoming: OrchestrationV2ProviderThread,
+): OrchestrationV2ProviderThread {
+  const saved = previous?.freshContext;
+  if (saved === undefined) return incoming;
+  const freshContext = incoming.freshContext ?? saved;
+  if (
+    freshContext.bootstrap === saved.bootstrap &&
+    freshContext.throughRunOrdinal === saved.throughRunOrdinal &&
+    saved.acceptedNativeThreadId !== undefined &&
+    saved.acceptedNativeThreadId === incoming.nativeThreadRef?.nativeId
+  ) {
+    return { ...incoming, freshContext: saved };
+  }
+  return { ...incoming, freshContext };
+}
+
 // Refuse before emitting anything. The command's timestamp is a compare-and-swap
 // against the saved handoff's snapshot, including input queued since that snapshot.
 export function prepareFreshProviderThread(

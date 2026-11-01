@@ -1,5 +1,6 @@
 import { applyThreadPullRequestLinkUpdate } from "@t3tools/shared/threadPullRequests";
 import { projectTurnItemForWire } from "./WireProjection.ts";
+import { preserveFreshContext } from "./freshProviderContext.ts";
 import * as Stream from "effect/Stream";
 import { makeThreadFind, findProjectedThreadItems } from "./ThreadFind.ts";
 import type {
@@ -836,7 +837,13 @@ export function applyToProjection(
                 activeProviderThreadId: event.payload.id,
               }
             : base.thread,
-        providerThreads: upsertById(base.providerThreads, event.payload),
+        providerThreads: upsertById(
+          base.providerThreads,
+          preserveFreshContext(
+            base.providerThreads.find((thread) => thread.id === event.payload.id),
+            event.payload,
+          ),
+        ),
       };
     case "provider-turn.updated":
       return {
@@ -2215,7 +2222,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             break;
           }
           case "provider-thread.updated": {
-            const payloadJson = yield* encodeProviderThreadPayload(event.payload);
+            const existing = yield* sql<PayloadRow>`
+              SELECT payload_json FROM orchestration_v2_projection_provider_threads
+              WHERE provider_thread_id = ${event.payload.id}
+            `;
+            const previous =
+              existing[0] === undefined
+                ? undefined
+                : yield* decodeProviderThreadPayload(existing[0].payload_json);
+            const payloadJson = yield* encodeProviderThreadPayload(
+              preserveFreshContext(previous, event.payload),
+            );
             const payload = parseEncodedPayload(payloadJson);
             yield* sql`
               INSERT INTO orchestration_v2_projection_provider_threads (

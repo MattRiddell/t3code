@@ -881,6 +881,7 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
     Schema.Struct({
       bootstrap: Schema.String,
       throughRunOrdinal: PositiveInt,
+      acceptedNativeThreadId: Schema.optional(Schema.String),
     }),
   ),
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
