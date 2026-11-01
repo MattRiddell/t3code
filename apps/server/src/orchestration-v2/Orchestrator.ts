@@ -66,6 +66,7 @@ import {
   derivePendingBackgroundWork,
   pendingBackgroundTurnItems,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { prepareFreshProviderThread } from "./freshProviderContext.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -450,6 +451,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.runtime-mode.set":
     case "thread.interaction-mode.set":
     case "thread.model-selection.set":
+    case "provider-session.renew":
     case "provider-session.detach":
     case "message.dispatch":
     case "notification.delivery.accept":
@@ -3454,58 +3456,102 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
   });
 
-  const dispatchProviderSessionDetach = Effect.fn("orchestrationV2.dispatch.providerSessionDetach")(
-    function* (
-      command: Extract<OrchestrationV2Command, { readonly type: "provider-session.detach" }>,
-      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
-      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
-    ) {
-      const projection = yield* projectionStore
-        .getThreadRecords(command.threadId, ["providerSessions"])
+  const dispatchProviderSessionLifecycle = Effect.fn(
+    "orchestrationV2.dispatch.providerSessionLifecycle",
+  )(function* (
+    command: Extract<
+      OrchestrationV2Command,
+      { readonly type: "provider-session.detach" | "provider-session.renew" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) {
+    const projection = yield* projectionStore
+      .getThreadRecords(command.threadId, ["providerSessions"])
+      .pipe(
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+        ),
+      );
+    const session = projection.providerSessions.find(
+      (candidate) => candidate.id === command.providerSessionId,
+    );
+    if (session === undefined) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: `Provider session ${command.providerSessionId} does not belong to thread ${command.threadId}.`,
+      });
+    }
+    const now = yield* DateTime.now;
+    if (command.type === "provider-session.renew") {
+      const records = yield* projectionStore
+        .getThreadRecords(command.threadId, [
+          "providerThreads",
+          "runs",
+          "providerTurns",
+          "runtimeRequests",
+          "subagents",
+          "turnItems",
+        ])
         .pipe(
           Effect.mapError(
             (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
           ),
         );
-      const session = projection.providerSessions.find(
-        (candidate) => candidate.id === command.providerSessionId,
-      );
-      if (session === undefined) {
+      const prepared = prepareFreshProviderThread(records, command, now);
+      if (typeof prepared === "string") {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
           commandType: command.type,
-          cause: `Provider session ${command.providerSessionId} does not belong to thread ${command.threadId}.`,
+          cause: prepared,
         });
       }
-      const now = yield* DateTime.now;
-      yield* emit(
-        events,
-        command,
-      )({
-        type: "provider-session.detached",
-        threadId: command.threadId,
-        driver: session.driver,
-        providerInstanceId: session.providerInstanceId,
-        occurredAt: now,
-        payload: {
-          providerSessionId: session.id,
-          detachedAt: now,
-          ...(command.reason === undefined ? {} : { reason: command.reason }),
-        },
-      });
-      const pendingEffect = {
-        id: `effect:${command.commandId}:provider-session.detach:${command.providerSessionId}`,
-        commandId: command.commandId,
-        threadId: command.threadId,
-        request: {
-          type: "provider-session.detach",
-          providerSessionId: command.providerSessionId,
-          ...(command.reason === undefined ? {} : { detail: command.reason }),
-        },
-      } satisfies PendingOrchestrationEffectV2;
-      yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
-    },
-  );
+      for (const providerThread of [prepared.previous, prepared.fresh]) {
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "provider-thread.updated",
+          threadId: command.threadId,
+          driver: session.driver,
+          providerInstanceId: session.providerInstanceId,
+          occurredAt: now,
+          payload: providerThread,
+        });
+      }
+      // Keep the transport attached. A delayed detach effect could otherwise
+      // interrupt input that arrives after this atomic renewal. The next run
+      // starts a new native thread from the new row's null native reference.
+      return;
+    }
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "provider-session.detached",
+      threadId: command.threadId,
+      driver: session.driver,
+      providerInstanceId: session.providerInstanceId,
+      occurredAt: now,
+      payload: {
+        providerSessionId: session.id,
+        detachedAt: now,
+        ...(command.reason === undefined ? {} : { reason: command.reason }),
+      },
+    });
+    const pendingEffect = {
+      id: `effect:${command.commandId}:provider-session.detach:${command.providerSessionId}`,
+      commandId: command.commandId,
+      threadId: command.threadId,
+      request: {
+        type: "provider-session.detach",
+        providerSessionId: command.providerSessionId,
+        ...(command.reason === undefined ? {} : { detail: command.reason }),
+      },
+    } satisfies PendingOrchestrationEffectV2;
+    yield* Ref.update(effects, (existing) => [...existing, pendingEffect]);
+  });
 
   const refuseAboveDispatchModeLimit = Effect.fn("orchestrationV2.dispatch.refuseAboveModeLimit")(
     function* (
@@ -10743,8 +10789,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.pull-request-watch.sync":
         yield* dispatchPullRequestWatchSync(command, events, effects);
         break;
+      case "provider-session.renew":
       case "provider-session.detach":
-        yield* dispatchProviderSessionDetach(command, events, effects);
+        yield* dispatchProviderSessionLifecycle(command, events, effects);
         break;
       case "message.dispatch": {
         // The provider owns a native subagent's conversation, so a sent

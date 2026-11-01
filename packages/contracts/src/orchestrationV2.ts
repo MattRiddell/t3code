@@ -876,6 +876,13 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
       checkpointId: Schema.optional(CheckpointId),
     }),
   ),
+  // A renewal retains history in the app, but starts native context from this bounded seed.
+  freshContext: Schema.optional(
+    Schema.Struct({
+      bootstrap: Schema.String,
+      throughRunOrdinal: PositiveInt,
+    }),
+  ),
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
@@ -2753,6 +2760,19 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     providerSessionId: ProviderSessionId,
     reason: Schema.optional(Schema.String),
+  }),
+  Schema.Struct({
+    // A distinct command makes old servers refuse instead of silently ignoring the seed.
+    type: Schema.Literal("provider-session.renew"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    providerSessionId: ProviderSessionId,
+    reason: Schema.optional(Schema.String),
+    freshContext: Schema.Struct({
+      providerThreadId: ProviderThreadId,
+      expectedUpdatedAt: Schema.DateTimeUtc,
+      bootstrap: Schema.String,
+    }),
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),

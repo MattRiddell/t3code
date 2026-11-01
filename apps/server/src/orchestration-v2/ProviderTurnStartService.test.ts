@@ -165,6 +165,7 @@ it("does not commit running state when inherited background routing cannot be re
 
 function makeLocalCommandHarness(input: {
   readonly text: string;
+  readonly freshBootstrap?: string;
   readonly worktreePath?: string;
   readonly fileSystem?: FileSystem.FileSystem;
   readonly previousNativeSession?: boolean;
@@ -220,6 +221,9 @@ function makeLocalCommandHarness(input: {
     firstRunOrdinal: 2,
     lastRunOrdinal: 2,
     handoffIds: [],
+    ...(input.freshBootstrap === undefined
+      ? {}
+      : { freshContext: { bootstrap: input.freshBootstrap, throughRunOrdinal: 1 } }),
     forkedFrom: null,
     createdAt: now,
     updatedAt: now,
@@ -1042,3 +1046,65 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect(
+  "starts a renewed native thread from its seed without reading the old transcript",
+  () =>
+    Effect.gen(function* () {
+      const seed = "Role: matt-console. Handoff: pending ask. Lessons: read the bounded role file.";
+      const harness = makeLocalCommandHarness({ text: "New ask", freshBootstrap: seed });
+      const startTurn = vi.fn((_input: unknown) => Effect.void);
+      const old = harness.projection().providerThreads[0]!;
+      const ensureThread = vi.fn(() =>
+        Effect.succeed({
+          ...old,
+          nativeThreadRef: {
+            driver: old.driver,
+            nativeId: "fresh-native",
+            strength: "strong" as const,
+          },
+        }),
+      );
+      const resumeThread = vi.fn(() => Effect.die("Must not resume the previous native thread"));
+      harness.open.mockImplementation(() =>
+        Effect.succeed({
+          driver: old.driver,
+          providerSession: {
+            id: old.providerSessionId,
+            driver: old.driver,
+            providerInstanceId: old.providerInstanceId,
+            status: "ready",
+            cwd: "/tmp/native-account-command",
+            model: null,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: old.createdAt,
+            updatedAt: old.updatedAt,
+            lastError: null,
+          },
+          ensureThread,
+          resumeThread,
+          startTurn,
+        } as never),
+      );
+      harness.startRootRun.mockImplementation((input) =>
+        input.session
+          .startTurn({
+            threadId: input.appThread.id,
+            runId: input.run.id,
+            message: input.message,
+            modelSelection: input.modelSelection,
+            runtimePolicy: input.runtimePolicy,
+            providerThread: input.providerThread,
+          } as never)
+          .pipe(Effect.orDie),
+      );
+      yield* harness.start;
+      expect(ensureThread).toHaveBeenCalledOnce();
+      expect(resumeThread).not.toHaveBeenCalled();
+      expect(startTurn).toHaveBeenCalledOnce();
+      expect(startTurn.mock.calls[0]?.[0]).toMatchObject({
+        message: { text: `${seed}\n\nUser message:\nNew ask` },
+      });
+      expect(harness.projection().providerThreads[0]?.freshContext?.bootstrap).toBe(seed);
+    }),
+);
