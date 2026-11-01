@@ -793,6 +793,11 @@ export const layer: Layer.Layer<
       const tokenCap = yield* handoffTokenCapConfig.pipe(
         Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
       );
+      const freshBootstrapForThread = (loaded: OrchestrationV2ProviderThread) =>
+        providerThread.freshContext !== undefined &&
+        (run.ordinal === providerThread.firstRunOrdinal ||
+          loaded.nativeThreadRef?.nativeId !== providerThread.nativeThreadRef?.nativeId)
+          ? providerThread.freshContext.bootstrap : "";
       const handoffContextForThread = (loadedProviderThread: OrchestrationV2ProviderThread) => {
         const measuredContext = latestNativeContextUsage(projection, providerThread);
         const previousSelection =
@@ -935,7 +940,7 @@ export const layer: Layer.Layer<
             return handoffBudget({
               tokenCap,
               modelContextWindow,
-              userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
+              userText: [freshBootstrapForThread(loadedProviderThread), restartNote, userText].filter(Boolean).join("\n\n"),
               attachments: message.attachments,
               providerThread: budgetProviderThread,
               nativeContextEstimate:
@@ -1002,14 +1007,20 @@ export const layer: Layer.Layer<
             toProviderThreadId: providerThread.id,
             fromProviderInstanceId: providerThread.providerInstanceId,
             toProviderInstanceId: run.providerInstanceId,
-            coveredRunOrdinals: { from: 1, to: Math.max(1, run.ordinal - 1) },
+            coveredRunOrdinals: {
+              from: (providerThread.freshContext?.throughRunOrdinal ?? 0) + 1,
+              to: Math.max(1, run.ordinal - 1),
+            },
             strategy: "full_thread_summary",
-            runs: projection.runs,
+            runs: projection.runs.filter(
+              (source) => source.ordinal > (providerThread.freshContext?.throughRunOrdinal ?? 0),
+            ),
             items: (yield* projectionStore.getTurnStartHistory(input.threadId)).filter(
               (item) =>
-                item.runId === null ||
+                (item.runId === null && providerThread.freshContext === undefined) ||
                 projection.runs.some(
-                  (source) => source.id === item.runId && source.ordinal < run.ordinal,
+                  (source) => source.id === item.runId && source.ordinal < run.ordinal &&
+                    source.ordinal > (providerThread.freshContext?.throughRunOrdinal ?? 0),
                 ),
             ),
             createdAt,
@@ -1186,6 +1197,10 @@ export const layer: Layer.Layer<
           }),
         );
         if (replacement === undefined) return undefined;
+        if (
+          providerThread.freshContext !== undefined &&
+          run.ordinal <= providerThread.freshContext.throughRunOrdinal + 1
+        ) return replacement;
         const { handoff, transferId, createdAt } = yield* recoveryHandoff;
         effectiveHandoffs = withRecoveryHandoff(handoff);
         resumeFellBack = true;
@@ -1255,6 +1270,7 @@ export const layer: Layer.Layer<
         providerSessionId,
         appThreadId: projection.thread.id,
         ownerNodeId: providerThread.ownerNodeId,
+        freshContext: providerThread.freshContext,
         firstRunOrdinal: providerThread.firstRunOrdinal ?? run.ordinal,
         lastRunOrdinal: run.ordinal,
         handoffIds: providerThread.handoffIds,
@@ -1411,7 +1427,7 @@ export const layer: Layer.Layer<
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
           const start = compact ? session.compactThread! : session.startTurn;
-          const context = [delivery.context, restartNote]
+          const context = [freshBootstrapForThread(runningProviderThread), delivery.context, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
@@ -1461,6 +1477,7 @@ export const layer: Layer.Layer<
         ),
       );
       const deliverySession =
+        providerThread.freshContext === undefined &&
         effectiveHandoffs.length === 0 &&
         retryHandoff.length === 0 &&
         restartNote === "" &&
