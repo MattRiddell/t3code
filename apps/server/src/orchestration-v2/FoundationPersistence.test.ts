@@ -14,6 +14,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   ProjectId,
@@ -146,6 +147,101 @@ function threadCreatedEvent(input: {
     payload: input.thread,
   };
 }
+
+it.effect("persists fresh acceptance despite three provider-thread receipt collisions", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:fresh-acceptance-collisions");
+    const providerThread: OrchestrationV2ProviderThread = {
+      id: ProviderThreadId.make("provider-thread:fresh-acceptance-collisions"),
+      driver: providerDriver,
+      providerInstanceId,
+      providerSessionId: null,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: { driver: providerDriver, nativeId: "renewed-native", strength: "strong" },
+      nativeConversationHeadRef: null,
+      status: "idle",
+      firstRunOrdinal: 2,
+      lastRunOrdinal: 2,
+      handoffIds: [],
+      forkedFrom: null,
+      freshContext: { bootstrap: "role and lessons", throughRunOrdinal: 1 },
+      createdAt: now,
+      updatedAt: now,
+    };
+    const update = (id: string, payload: OrchestrationV2ProviderThread) => ({
+      id: EventId.make(id),
+      type: "provider-thread.updated" as const,
+      threadId,
+      occurredAt: now,
+      payload,
+    });
+    yield* sink.write({
+      events: [
+        threadCreatedEvent({
+          id: "event:fresh-acceptance:thread",
+          thread: makeThread(threadId, now),
+          now,
+        }),
+        update("event:fresh-acceptance:initial", providerThread),
+      ],
+    });
+    const receipt = update("event:fresh-acceptance:receipt", {
+      ...providerThread,
+      freshContext: { ...providerThread.freshContext!, acceptedNativeThreadId: "renewed-native" },
+    });
+    for (let collision = 0; collision < 3; collision += 1) {
+      const snapshot = (yield* store.getThreadRecords(threadId, ["providerThreads"]))
+        .providerThreads[0]!;
+      yield* sink.write({
+        events: [
+          update(`event:fresh-acceptance:roster-${collision}`, {
+            ...snapshot,
+            pendingBackgroundTasks: [
+              { taskId: `roster-${collision}`, description: "ingestion update", kind: "command" },
+            ],
+          }),
+        ],
+      });
+      const staleReceipt = yield* sink.writeIfProviderThreadUnchanged({
+        expected: snapshot,
+        events: [receipt],
+      });
+      assert.isFalse(staleReceipt.committed);
+    }
+    const accepted = yield* sink.acceptFreshContext(receipt);
+    assert.isTrue(accepted.committed);
+    const durable = (yield* store.getThreadRecords(threadId, ["providerThreads"]))
+      .providerThreads[0]!;
+    assert.equal(durable.freshContext?.acceptedNativeThreadId, "renewed-native");
+    assert.equal(durable.pendingBackgroundTasks?.[0]?.taskId, "roster-2");
+    assert.isFalse((yield* sink.acceptFreshContext(receipt)).committed);
+
+    for (const replacement of [
+      {
+        ...providerThread,
+        nativeThreadRef: { ...providerThread.nativeThreadRef!, nativeId: "replacement-native" },
+      },
+      { ...providerThread, freshContext: { bootstrap: "new generation", throughRunOrdinal: 2 } },
+    ]) {
+      yield* sink.write({
+        events: [
+          update(
+            `event:fresh-acceptance:replacement-${replacement.freshContext?.throughRunOrdinal}`,
+            replacement,
+          ),
+        ],
+      });
+      assert.isFalse((yield* sink.acceptFreshContext(receipt)).committed);
+      const current = (yield* store.getThreadRecords(threadId, ["providerThreads"]))
+        .providerThreads[0]!;
+      assert.isUndefined(current.freshContext?.acceptedNativeThreadId);
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
 
 it.effect("rebuilds event history one bounded page at a time", () =>
   Effect.gen(function* () {
