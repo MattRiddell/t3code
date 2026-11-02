@@ -1455,12 +1455,13 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
   );
 }
 
-for (const first of ["success", "concurrent-updates", "rejected", "compact"] as const) {
+for (const first of ["success", "concurrent-updates", "rejected", "compact", "goal"] as const) {
   effectIt.effect(`keeps bootstrap delivery durable after a first ${first} turn`, () =>
     Effect.gen(function* () {
       const seed = "Role: matt-console. Handoff: pending ask. Lessons: bounded role file.";
       const harness = makeLocalCommandHarness({
-        text: first === "compact" ? "/compact" : "New ask",
+        text:
+          first === "compact" ? "/compact" : first === "goal" ? "/goal Keep working" : "New ask",
         freshBootstrap: seed,
         emptyRetryHistory: true,
         previousMessages: ["Pre-renewal transcript must stay out of native context"],
@@ -1541,7 +1542,7 @@ for (const first of ["success", "concurrent-updates", "rejected", "compact"] as 
           modelSelection: input.modelSelection,
           runtimePolicy: input.runtimePolicy,
           providerThread: input.providerThread,
-        } as never).pipe(Effect.catch(() => Effect.void));
+        } as never).pipe(Effect.ignore);
       });
       const next = (text: string) => {
         const projection = harness.projection();
@@ -1578,6 +1579,10 @@ for (const first of ["success", "concurrent-updates", "rejected", "compact"] as 
       if (first === "compact") {
         expect(compactThread).toHaveBeenCalledOnce();
         expect(compactThread.mock.calls[0]?.[0]).toMatchObject({ message: { text: "/compact" } });
+      } else if (first === "goal") {
+        expect(startTurn.mock.calls[0]?.[0]).toMatchObject({
+          message: { text: "/goal Keep working" },
+        });
       } else {
         expect(startTurn.mock.calls[0]?.[0]).toMatchObject({
           message: { text: `${seed}\n\nUser message:\nNew ask` },

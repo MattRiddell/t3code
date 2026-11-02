@@ -2197,22 +2197,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               WHERE provider_session_id = ${event.payload.providerSessionId}
                 AND thread_id = ${event.threadId}
             `;
-            break;
-          }
-          case "provider-thread.updated": {
-            const existing = yield* sql<PayloadRow>`
+              break;
+            }
+            case "provider-thread.updated": {
+              const existing = yield* sql<PayloadRow>`
               SELECT payload_json FROM orchestration_v2_projection_provider_threads
               WHERE provider_thread_id = ${event.payload.id}
             `;
-            const previous =
-              existing[0] === undefined
-                ? undefined
-                : yield* decodeProviderThreadPayload(existing[0].payload_json);
-            const payloadJson = yield* encodeProviderThreadPayload(
-              preserveFreshContext(previous, event.payload),
-            );
-            const payload = parseEncodedPayload(payloadJson);
-            yield* sql`
+              const previous =
+                existing[0] === undefined
+                  ? undefined
+                  : yield* decodeProviderThreadPayload(existing[0].payload_json);
+              const payloadJson = yield* encodeProviderThreadPayload(
+                preserveFreshContext(previous, event.payload),
+              );
+              const payload = parseEncodedPayload(payloadJson);
+              yield* sql`
               INSERT INTO orchestration_v2_projection_provider_threads (
                 provider_thread_id,
                 thread_id,

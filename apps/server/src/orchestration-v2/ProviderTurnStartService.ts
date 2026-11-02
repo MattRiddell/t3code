@@ -797,7 +797,8 @@ export const layer: Layer.Layer<
         providerThread.freshContext !== undefined &&
         (providerThread.freshContext.acceptedNativeThreadId === undefined ||
           providerThread.freshContext.acceptedNativeThreadId !== loaded.nativeThreadRef?.nativeId)
-          ? providerThread.freshContext.bootstrap : "";
+          ? providerThread.freshContext.bootstrap
+          : "";
       const handoffContextForThread = (loadedProviderThread: OrchestrationV2ProviderThread) => {
         const measuredContext = latestNativeContextUsage(projection, providerThread);
         const previousSelection =
@@ -940,7 +941,9 @@ export const layer: Layer.Layer<
             return handoffBudget({
               tokenCap,
               modelContextWindow,
-              userText: [freshBootstrapForThread(loadedProviderThread), restartNote, userText].filter(Boolean).join("\n\n"),
+              userText: [freshBootstrapForThread(loadedProviderThread), restartNote, userText]
+                .filter(Boolean)
+                .join("\n\n"),
               attachments: message.attachments,
               providerThread: budgetProviderThread,
               nativeContextEstimate:
@@ -1019,7 +1022,9 @@ export const layer: Layer.Layer<
               (item) =>
                 (item.runId === null && providerThread.freshContext === undefined) ||
                 projection.runs.some(
-                  (source) => source.id === item.runId && source.ordinal < run.ordinal &&
+                  (source) =>
+                    source.id === item.runId &&
+                    source.ordinal < run.ordinal &&
                     source.ordinal > (providerThread.freshContext?.throughRunOrdinal ?? 0),
                 ),
             ),
@@ -1200,7 +1205,8 @@ export const layer: Layer.Layer<
         if (
           providerThread.freshContext !== undefined &&
           run.ordinal <= providerThread.freshContext.throughRunOrdinal + 1
-        ) return replacement;
+        )
+          return replacement;
         const { handoff, transferId, createdAt } = yield* recoveryHandoff;
         effectiveHandoffs = withRecoveryHandoff(handoff);
         resumeFellBack = true;
@@ -1391,7 +1397,8 @@ export const layer: Layer.Layer<
       );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
-          const freshBootstrap = compact || goalCommand ? "" : freshBootstrapForThread(runningProviderThread);
+          const freshBootstrap =
+            compact || goalCommand ? "" : freshBootstrapForThread(runningProviderThread);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
             deferInline: compact || goalCommand,
