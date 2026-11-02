@@ -67,6 +67,15 @@ export const EventSinkV2Error = Schema.Union([EventSinkWriteError, EventSinkStre
 export type EventSinkV2Error = typeof EventSinkV2Error.Type;
 
 export interface EventSinkV2Shape {
+  readonly acceptFreshContext: (
+    event: Extract<OrchestrationV2DomainEvent, { type: "provider-thread.updated" }>,
+  ) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
   readonly write: (input: {
     /** Return no events if another thread owns this native session at commit time. */
     readonly unlessNativeThreadOwned?: Pick<
@@ -616,6 +625,51 @@ const layerBase: Layer.Layer<
       );
     });
 
+    const acceptFreshContextEffect = Effect.fn("orchestrationV2.EventSink.acceptFreshContext")(
+      function* (event: Parameters<EventSinkV2Shape["acceptFreshContext"]>[0]) {
+        return yield* commitThenPublish(
+          Effect.gen(function* () {
+            const records = yield* projectionStore.getThreadRecords(event.threadId, [
+              "providerThreads",
+            ]);
+            const current = records.providerThreads.find((row) => row.id === event.payload.id);
+            const accepted = event.payload.freshContext;
+            const nativeId = event.payload.nativeThreadRef?.nativeId;
+            if (
+              nativeId == null ||
+              accepted?.acceptedNativeThreadId !== nativeId ||
+              current?.nativeThreadRef?.nativeId !== nativeId ||
+              current.freshContext?.bootstrap !== accepted.bootstrap ||
+              current.freshContext.throughRunOrdinal !== accepted.throughRunOrdinal ||
+              current.freshContext.acceptedNativeThreadId === nativeId
+            ) {
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
+            }
+            // Read and merge under the transaction so ingestion cannot invalidate
+            // acceptance by changing unrelated provider-thread fields.
+            const storedEvents = yield* eventStore.append({
+              events: [
+                {
+                  ...event,
+                  payload: {
+                    ...current,
+                    freshContext: { ...current.freshContext, acceptedNativeThreadId: nativeId },
+                    updatedAt: event.occurredAt,
+                  },
+                },
+              ],
+            });
+            const outcomes = yield* applyStoredEvents(storedEvents);
+            return { committed: true as const, storedEvents, outcomes };
+          }),
+          (result) => (result.committed ? publishStoredEvents(result.storedEvents, result.outcomes) : Effect.void),
+        );
+      },
+    );
+
     const existingCommandResult =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (commandId: CommandId) {
@@ -921,6 +975,10 @@ const layerBase: Layer.Layer<
                 cause,
               }),
           ),
+        ),
+      acceptFreshContext: (event) =>
+        acceptFreshContextEffect(event).pipe(
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 1, cause })),
         ),
       writeIfProviderThreadUnchanged: (input) =>
         writeIfProviderThreadUnchangedEffect(input).pipe(

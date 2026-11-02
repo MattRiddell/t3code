@@ -704,6 +704,19 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent,
+          acceptFreshContext: (event) =>
+            Effect.sync(() => {
+              const current = projection.providerThreads.find(
+                (row) => row.id === event.payload.id,
+              )!;
+              const merged = {
+                ...event,
+                payload: { ...current, freshContext: event.payload.freshContext },
+              };
+              events.push(merged);
+              projection = ProjectionStore.applyToProjection(projection, merged);
+              return { committed: true, storedEvents: [] };
+            }),
           writeIfProviderThreadUnchanged: ({ expected, events: incoming }) =>
             Effect.sync(() => {
               const current = projection.providerThreads.find((row) => row.id === expected.id);
@@ -1442,7 +1455,7 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
   );
 }
 
-for (const first of ["success", "rejected", "compact"] as const) {
+for (const first of ["success", "concurrent-updates", "rejected", "compact"] as const) {
   effectIt.effect(`keeps bootstrap delivery durable after a first ${first} turn`, () =>
     Effect.gen(function* () {
       const seed = "Role: matt-console. Handoff: pending ask. Lessons: bounded role file.";
@@ -1470,7 +1483,25 @@ for (const first of ["success", "rejected", "compact"] as const) {
                 cause: "Provider refused before accepting the prompt",
               }),
             )
-          : Effect.void,
+          : Effect.sync(() => {
+              if (first !== "concurrent-updates") return;
+              for (let update = 0; update < 3; update += 1) {
+                const current = harness.projection();
+                harness.setProjection({
+                  ...current,
+                  providerThreads: current.providerThreads.map((row) => ({
+                    ...row,
+                    pendingBackgroundTasks: [
+                      {
+                        taskId: `roster-${update}`,
+                        description: "ingestion update",
+                        kind: "command" as const,
+                      },
+                    ],
+                  })),
+                });
+              }
+            }),
       );
       const compactThread = vi.fn((_input: unknown) => Effect.void);
       const ensureThread = vi.fn(() => Effect.succeed(withNative(old)));
@@ -1542,7 +1573,7 @@ for (const first of ["success", "rejected", "compact"] as const) {
       expect(ensureThread).toHaveBeenCalledOnce();
       expect(resumeThread).not.toHaveBeenCalled();
       expect(harness.projection().providerThreads[0]?.freshContext?.acceptedNativeThreadId).toBe(
-        first === "success" ? nativeId : undefined,
+        first === "success" || first === "concurrent-updates" ? nativeId : undefined,
       );
       if (first === "compact") {
         expect(compactThread).toHaveBeenCalledOnce();
@@ -1558,7 +1589,7 @@ for (const first of ["success", "rejected", "compact"] as const) {
       expect(startTurn.mock.calls.at(-1)?.[0]).toMatchObject({
         message: {
           text:
-            first === "success"
+            first === "success" || first === "concurrent-updates"
               ? "Next ordinary ask"
               : `${seed}\n\nUser message:\nNext ordinary ask`,
         },

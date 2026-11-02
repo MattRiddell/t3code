@@ -1391,7 +1391,7 @@ export const layer: Layer.Layer<
       );
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
-          const freshBootstrap = compact ? "" : freshBootstrapForThread(runningProviderThread);
+          const freshBootstrap = compact || goalCommand ? "" : freshBootstrapForThread(runningProviderThread);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff],
             deferInline: compact || goalCommand,
@@ -1458,43 +1458,23 @@ export const layer: Layer.Layer<
           if (freshBootstrap !== "") {
             yield* Effect.gen(function* () {
               const nativeId = runningProviderThread.nativeThreadRef?.nativeId;
-              if (nativeId === undefined || nativeId === null) return;
-              for (let retry = 0; retry < 3; retry += 1) {
-                const records = yield* projectionStore.getThreadRecords(input.threadId, [
-                  "providerThreads",
-                ]);
-                const current = records.providerThreads.find((row) => row.id === providerThread.id);
-                if (
-                  current?.nativeThreadRef?.nativeId !== nativeId ||
-                  current.freshContext?.bootstrap !== freshBootstrap ||
-                  current.freshContext.throughRunOrdinal !==
-                    providerThread.freshContext?.throughRunOrdinal ||
-                  current.freshContext.acceptedNativeThreadId === nativeId
-                )
-                  return;
-                const acceptedAt = yield* DateTime.now;
-                const result = yield* eventSink.writeIfProviderThreadUnchanged({
-                  expected: current,
-                  events: [
-                    {
-                      id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
-                      type: "provider-thread.updated",
-                      threadId: input.threadId,
-                      runId: run.id,
-                      providerInstanceId: run.providerInstanceId,
-                      occurredAt: acceptedAt,
-                      payload: {
-                        ...current,
-                        freshContext: { ...current.freshContext, acceptedNativeThreadId: nativeId },
-                        updatedAt: acceptedAt,
-                      },
-                    },
-                  ],
-                });
-                if (result.committed) return;
-              }
-              yield* Effect.logWarning("Bootstrap receipt lost concurrent update races", {
+              if (nativeId == null || runningProviderThread.freshContext === undefined) return;
+              const acceptedAt = yield* DateTime.now;
+              yield* eventSink.acceptFreshContext({
+                id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+                type: "provider-thread.updated",
+                threadId: input.threadId,
                 runId: run.id,
+                providerInstanceId: run.providerInstanceId,
+                occurredAt: acceptedAt,
+                payload: {
+                  ...runningProviderThread,
+                  freshContext: {
+                    ...runningProviderThread.freshContext,
+                    acceptedNativeThreadId: nativeId,
+                  },
+                  updatedAt: acceptedAt,
+                },
               });
             }).pipe(
               Effect.catchCause(() =>
