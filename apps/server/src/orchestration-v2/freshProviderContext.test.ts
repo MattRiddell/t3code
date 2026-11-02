@@ -3,21 +3,28 @@ import {
   CommandId,
   EventId,
   MessageId,
+  NodeId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
   RunId,
   ThreadId,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
@@ -44,9 +51,9 @@ const layer = Layer.mergeAll(
   ),
 );
 
-it.effect(
-  "renews native context while retaining visible identity, messages, runs and old refs; refuses unsafe twins",
-  () =>
+it.effect.each(["none", "background", "turn", "metadata"] as const)(
+  "renews native context and preserves concurrent ingestion; refuses unsafe twins (%s)",
+  (race) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const store = yield* ProjectionStore.ProjectionStoreV2;
@@ -177,6 +184,96 @@ it.effect(
           pendingBackgroundTasks: [{ taskId: "active-background", kind: "monitor" as const }],
         })),
       });
+      if (race !== "none") {
+        const sink = yield* EventSink.EventSinkV2;
+        const commit = sink.commitCommand;
+        const planned = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        const previous = before.providerThreads.find((row) => row.id === providerThreadId)!;
+        const ingested: OrchestrationV2DomainEvent =
+          race === "turn"
+            ? {
+                id: EventId.make("concurrent-native-turn"),
+                type: "provider-turn.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: ProviderTurnId.make("concurrent-turn"),
+                  providerThreadId,
+                  nodeId: NodeId.make("concurrent-node"),
+                  runAttemptId: null,
+                  nativeTurnRef: {
+                    driver: adapter.driver,
+                    nativeId: "concurrent-native-turn",
+                    strength: "strong",
+                  },
+                  ordinal: 1,
+                  status: "running",
+                  startedAt: later,
+                  completedAt: null,
+                },
+              }
+            : {
+                id: EventId.make(`concurrent-${race}`),
+                type: "provider-thread.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  ...previous,
+                  // Adapter updates need not advance the row/thread timestamp.
+                  ...(race === "background"
+                    ? { pendingBackgroundTasks: [{ taskId: "concurrent-task", kind: "monitor" }] }
+                    : { nativeMetadata: { title: "Retain this adapter update" } }),
+                },
+              };
+        yield* Effect.acquireUseRelease(
+          Effect.sync(() =>
+            vi
+              .spyOn(sink, "commitCommand")
+              .mockImplementationOnce((input) =>
+                Deferred.succeed(planned, undefined).pipe(
+                  Effect.andThen(Deferred.await(resume)),
+                  Effect.andThen(commit(input)),
+                ),
+              ),
+          ),
+          () =>
+            Effect.gen(function* () {
+              const renewal = yield* orchestrator
+                .dispatch(command)
+                .pipe(Effect.exit, Effect.forkChild);
+              yield* Deferred.await(planned);
+              // This is the transactional ingestion writer, without the command
+              // lock. A delayed event may retain the old snapshot timestamp.
+              yield* sink.write({ events: [ingested] });
+              const concurrent = yield* store.getThreadProjection(threadId);
+              yield* Deferred.succeed(resume, undefined);
+              const result = yield* Fiber.join(renewal);
+              const afterRace = yield* store.getThreadProjection(threadId);
+              if (race === "metadata") {
+                assert.isTrue(Exit.isSuccess(result));
+                assert.deepEqual(
+                  afterRace.providerThreads.find((row) => row.id === providerThreadId)
+                    ?.nativeMetadata,
+                  { title: "Retain this adapter update" },
+                );
+                assert.notEqual(afterRace.thread.activeProviderThreadId, providerThreadId);
+              } else {
+                assert.isTrue(Exit.isFailure(result), "NO: work arrived after renewal planning");
+                assert.deepEqual(afterRace, concurrent, "NO: refusal must preserve ingestion");
+                assert.isTrue(
+                  Exit.isFailure(yield* orchestrator.dispatch(command).pipe(Effect.exit)),
+                );
+                assert.deepEqual(yield* store.getThreadProjection(threadId), concurrent);
+              }
+            }),
+          (spy) =>
+            Deferred.succeed(resume, undefined).pipe(
+              Effect.andThen(Effect.sync(() => spy.mockRestore())),
+            ),
+        );
+        return;
+      }
       yield* orchestrator.dispatch(command);
       const after = yield* store.getThreadProjection(threadId);
       assert.equal(after.thread.id, before.thread.id);

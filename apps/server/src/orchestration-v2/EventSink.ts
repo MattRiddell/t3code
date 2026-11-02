@@ -1,5 +1,6 @@
 import {
   CommandId,
+  type OrchestrationV2Command,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
@@ -34,6 +35,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { prepareFreshProviderThread } from "./freshProviderContext.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -151,6 +153,11 @@ export interface EventSinkV2Shape {
     readonly acceptedAt: DateTime.Utc;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
+    /** Recheck renewal safety against ingestion in the same transaction as its events. */
+    readonly freshProviderRenewal?: Extract<
+      OrchestrationV2Command,
+      { type: "provider-session.renew" }
+    >;
     readonly cancelUnsettledEffects?: {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
@@ -708,11 +715,58 @@ const layerBase: Layer.Layer<
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
           }
 
+          let events = input.events;
+          if (input.freshProviderRenewal !== undefined) {
+            const records = yield* projectionStore.getThreadRecords(input.threadId, [
+              "providerThreads",
+              "runs",
+              "providerTurns",
+              "runtimeRequests",
+              "subagents",
+              "turnItems",
+            ]);
+            const prepared = prepareFreshProviderThread(
+              records,
+              input.freshProviderRenewal,
+              input.acceptedAt,
+            );
+            if (typeof prepared === "string") {
+              const receipt: CommandReceiptStore.CommandReceiptV2 = {
+                commandId: input.commandId,
+                threadId: input.threadId,
+                commandType: input.commandType,
+                acceptedAt: input.acceptedAt,
+                resultSequence: yield* eventStore.latestSequence({ threadId: input.threadId }),
+                status: "rejected",
+                error: prepared,
+              };
+              yield* commandReceipts.upsert(receipt);
+              return {
+                receipt,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+                committed: false as const,
+                cancelledEffectIds: [],
+              };
+            }
+            // Ingestion does not take the command lock. Rebuild from the current
+            // row so even an unrelated adapter update keeps all of its fields.
+            events = events.map((event) =>
+              event.type !== "provider-thread.updated"
+                ? event
+                : {
+                    ...event,
+                    payload:
+                      event.payload.id === prepared.previous.id
+                        ? prepared.previous
+                        : prepared.fresh,
+                  },
+            );
+          }
           const runId = input.updateDelegatedCompletionOnlyRunId;
           const normalized = yield* normalizeEvents(
             runId === undefined
-              ? input.events
-              : yield* updateDelegatedCompletionOnly(input.events, (id) => id === runId),
+              ? events
+              : yield* updateDelegatedCompletionOnly(events, (id) => id === runId),
           );
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,
