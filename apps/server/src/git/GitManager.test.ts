@@ -10,6 +10,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -1669,6 +1670,53 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
 
       expect(second).toBeNull();
       expect(listed(providerCalls)).toHaveLength(2);
+    }),
+  );
+
+  it.effect("lets only a background reader reuse an open branch lookup, for ten minutes", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/background-reuse"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/background-reuse"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      const openPullRequest = {
+        number: 301,
+        title: "Background reuse",
+        url: "https://github.com/acme/web/pull/301",
+        baseRefName: "main",
+        headRefName: "feature/background-reuse",
+        state: "open" as const,
+        updatedAt: "2026-04-06T15:00:00Z",
+      };
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: { prListSequence: Array.from({ length: 8 }, () => [openPullRequest]) },
+      });
+      const branch = { cwd: repoDir, branch: "feature/background-reuse" };
+
+      yield* manager.branchPullRequest(branch);
+      const hostReads = listed(providerCalls).length;
+      expect(hostReads).toBeGreaterThan(0);
+
+      yield* TestClock.adjust("9 minutes");
+      yield* manager.branchPullRequest(branch, { background: true });
+      expect(listed(providerCalls)).toHaveLength(hostReads);
+
+      // The same age is too old for a reader someone is waiting on.
+      yield* manager.branchPullRequest(branch);
+      expect(listed(providerCalls).length).toBeGreaterThan(hostReads);
+
+      const afterForeground = listed(providerCalls).length;
+      yield* TestClock.adjust("10 minutes");
+      yield* manager.branchPullRequest(branch, { background: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterForeground);
+
+      const afterExpiry = listed(providerCalls).length;
+      yield* manager.branchPullRequest(branch, { refresh: true, background: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterExpiry);
     }),
   );
 

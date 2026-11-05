@@ -82,6 +82,7 @@ import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.t
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import { detachStackFrame } from "./detachStackFrame.ts";
+import { BACKGROUND_PULL_REQUEST_MAX_AGE } from "./backgroundPullRequestPoll.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -136,7 +137,12 @@ export class GitManager extends Context.Service<
     /** refresh queries the host; freshGitState rereads only git state and is required before persisting. */
     readonly branchPullRequest: (
       input: { readonly cwd: string; readonly branch: string },
-      options?: { readonly refresh?: boolean; readonly freshGitState?: boolean },
+      options?: {
+        readonly refresh?: boolean;
+        readonly freshGitState?: boolean;
+        /** Nobody is watching this read, so it may reuse one up to the background age limit. */
+        readonly background?: boolean;
+      },
     ) => Effect.Effect<GitBranchPullRequest | null, GitManagerServiceError>;
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
@@ -1219,20 +1225,21 @@ export const make = Effect.gen(function* () {
         ...(remoteName.length > 0 ? { remoteName } : {}),
       };
       return Effect.gen(function* () {
+        const readAtMs = yield* Clock.currentTimeMillis;
         const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
         if (!lookup) {
-          return { latest: null, headContext };
+          return { latest: null, headContext, readAtMs };
         }
         if (
           details.localBranchExists &&
           details.upstreamRef === null &&
           (yield* isUnpublishedBranch(cwd, headContext))
         ) {
-          return { latest: null, headContext };
+          return { latest: null, headContext, readAtMs };
         }
         const latest = yield* findLatestPrForHeadContext(cwd, headContext);
         if (latest !== null) yield* noteLookupState(latest);
-        return { latest, headContext };
+        return { latest, headContext, readAtMs };
       });
     },
     {
@@ -1240,15 +1247,34 @@ export const make = Effect.gen(function* () {
       timeToLive: (exit, key) => {
         if (Exit.isSuccess(exit)) {
           prLookupFailureStreakByKey.delete(key);
-          return exit.value.latest?.state === "open"
-            ? PR_LOOKUP_CACHE_TTL
-            : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
+          // Held for the oldest reader; getPrLookup applies each reader's own limit.
+          return BACKGROUND_PULL_REQUEST_MAX_AGE;
         }
         return nextPrLookupFailureTtl(key);
       },
     },
   );
-  const getPrLookup = (key: string) => detachStackFrame(Cache.get(prLookupCache, key));
+  const readPrLookup = (key: string) => detachStackFrame(Cache.get(prLookupCache, key));
+  const getPrLookup = (key: string, options?: { readonly background?: boolean }) =>
+    readPrLookup(key).pipe(
+      Effect.flatMap((entry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (nowMs) => {
+          const maxAge =
+            options?.background === true
+              ? BACKGROUND_PULL_REQUEST_MAX_AGE
+              : entry.latest?.state === "open"
+                ? PR_LOOKUP_CACHE_TTL
+                : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
+          if (nowMs - entry.readAtMs < Duration.toMillis(maxAge)) return Effect.succeed(entry);
+          // Only this stale read: concurrent readers must join a lookup already replacing it.
+          return Cache.invalidateWhen(
+            prLookupCache,
+            key,
+            (current) => current.readAtMs === entry.readAtMs,
+          ).pipe(Effect.andThen(readPrLookup(key)));
+        }),
+      ),
+    );
   interface LastKnownPr {
     readonly pr: ReturnType<typeof toStatusPr> | null;
     readonly upstreamRef: string | null;
@@ -2458,7 +2484,11 @@ export const make = Effect.gen(function* () {
   const lookupBranchPullRequest = Effect.fn("lookupBranchPullRequest")(function* (
     cacheCwd: string,
     branch: string,
-    options: { readonly refresh: boolean; readonly freshGitState: boolean },
+    options: {
+      readonly refresh: boolean;
+      readonly freshGitState: boolean;
+      readonly background: boolean;
+    },
   ) {
     const remember = <E>(key: string, read: Effect.Effect<string | null, E>) =>
       rememberPrLookupGitState(cacheCwd, key, options.freshGitState, read);
@@ -2568,7 +2598,7 @@ export const make = Effect.gen(function* () {
       );
       if (Option.isSome(cached)) yield* Cache.invalidate(prLookupCache, cacheKey);
     }
-    let cached = yield* getPrLookup(cacheKey);
+    let cached = yield* getPrLookup(cacheKey, { background: options.background });
     // Lookup may use a fork instead of the saved upstream; verify the remote actually queried.
     const identityRemoteName = (headContext: BranchHeadContext) =>
       headContext.remoteName ?? remoteName ?? undefined;
@@ -2637,14 +2667,17 @@ export const make = Effect.gen(function* () {
     const cacheCwd = yield* normalizeStatusCacheKey(cwd);
     const refresh = options?.refresh === true;
     const freshGitState = refresh || options?.freshGitState === true;
+    const background = options?.background === true;
     const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
       refresh,
       freshGitState,
+      background,
     });
     if (pullRequest === null || pullRequest.state === "open" || freshGitState) return pullRequest;
     return yield* lookupBranchPullRequest(cacheCwd, branch, {
       refresh: false,
       freshGitState: true,
+      background,
     });
   });
   const invalidateLocalStatus: GitManager["Service"]["invalidateLocalStatus"] = Effect.fn(

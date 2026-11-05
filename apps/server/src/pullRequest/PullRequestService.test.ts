@@ -2750,6 +2750,73 @@ it.effect("reads the fresh diff when detail or summary discovers a changed revis
   }),
 );
 
+it.effect("lets only a background reader reuse a summary, for ten minutes", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "web", workspaceRoot: "/a", repository: "acme/web" })],
+      providers: [
+        fakePullRequestProvider(SourceControlProviderKind.make("github"), {
+          getChangeRequestSummary: () =>
+            Effect.sync(() => {
+              reads += 1;
+              return changeRequest(7, "2026-07-02T00:00:00Z");
+            }),
+        }),
+      ],
+    });
+    const reference = { projectId: "p1" as ProjectId, repository: "acme/web", number: 7 };
+    const background = { recoverTransientFailure: false, background: true };
+    yield* service.summary(reference, { recoverTransientFailure: false });
+    assert.strictEqual(reads, 1);
+
+    yield* TestClock.adjust("9 minutes");
+    yield* service.summary(reference, background);
+    assert.strictEqual(reads, 1);
+
+    // The same age is too old for a reader someone is waiting on, or for a read past stale.
+    yield* service.summary(reference, { recoverTransientFailure: false });
+    assert.strictEqual(reads, 2);
+    yield* TestClock.adjust("61 seconds");
+    yield* service.summary({ ...reference, allowStale: false }, background);
+    assert.strictEqual(reads, 3);
+
+    yield* TestClock.adjust("10 minutes");
+    yield* service.summary(reference, background);
+    assert.strictEqual(reads, 4);
+
+    yield* service.invalidate({ reference });
+    yield* service.summary(reference, background);
+    assert.strictEqual(reads, 5);
+  }),
+);
+
+it.effect("carries a scheduled poll through the summary cache to the provider", () =>
+  Effect.gen(function* () {
+    const seen: Array<boolean> = [];
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "web", workspaceRoot: "/a", repository: "acme/web" })],
+      providers: [
+        fakePullRequestProvider(SourceControlProviderKind.make("github"), {
+          getChangeRequestSummary: () =>
+            Effect.map(SourceControlRateLimit.ScheduledPoll, (scheduledPoll) => {
+              seen.push(scheduledPoll);
+              return changeRequest(7, "2026-07-02T00:00:00Z");
+            }),
+        }),
+      ],
+    });
+    const read = (number: number) =>
+      service.summary(
+        { projectId: "p1" as ProjectId, repository: "acme/web", number },
+        { recoverTransientFailure: false },
+      );
+    yield* read(7).pipe(Effect.provideService(SourceControlRateLimit.ScheduledPoll, true));
+    yield* read(8);
+    assert.deepStrictEqual(seen, [true, false]);
+  }),
+);
+
 it.effect("keeps routed reads separate when the GitHub account changes", () =>
   Effect.gen(function* () {
     for (const operation of ["summary", "detail", "checks", "diff", "filesViewed"] as const) {

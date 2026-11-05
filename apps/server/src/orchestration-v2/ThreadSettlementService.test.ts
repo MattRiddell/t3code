@@ -22,6 +22,7 @@ import {
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1185,6 +1186,81 @@ describe("ThreadSettlementServiceV2 worker", () => {
             );
             assert.deepStrictEqual(yield* Ref.get(fixture.invalidatedCwds), ["/workspace/project"]);
             yield* reactor.drain;
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
+
+  it.effect("sweeps an unlinked branch on the background read, in the poll's window", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const reads = yield* Ref.make<ReadonlyArray<unknown>>([]);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("unlinked", {
+              branch: "feature",
+              latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+            }),
+          ]),
+          branchPullRequest: (_input, lookupOptions) =>
+            Effect.gen(function* () {
+              const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
+              yield* Ref.update(reads, (seen) => [...seen, { lookupOptions, scheduledPoll }]);
+              return makeBranchPullRequest("open");
+            }),
+        });
+
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+          expect(yield* Ref.get(reads)).toEqual([
+            { lookupOptions: { background: true }, scheduledPoll: true },
+          ]);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect.each([
+    { fresh: "open", settles: false },
+    { fresh: "closed", settles: true },
+  ] as const)(
+    "confirms a held closed pull request before settling (fresh=$fresh)",
+    ({ fresh, settles }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const reads = yield* Ref.make<ReadonlyArray<boolean | undefined>>([]);
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([
+              makeThread("held-closed", {
+                latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+                linkedPullRequest: {
+                  projectId: PROJECT_ID,
+                  repository: "owner/repository",
+                  number: 42,
+                  url: "https://example.test/owner/repository/pull/42",
+                },
+              }),
+            ]),
+            pullRequestSummary: (input, readOptions) =>
+              Ref.update(reads, (seen) => [...seen, readOptions?.background]).pipe(
+                Effect.as({
+                  ...makePullRequestSummary({
+                    ...input,
+                    state: readOptions?.background === true ? "closed" : fresh,
+                  }),
+                  closedAt: "2026-08-28T00:00:00.000Z",
+                }),
+              ),
+          });
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            expect(yield* Ref.get(reads)).toEqual([true, undefined]);
+            expect(yield* Ref.get(fixture.commands)).toHaveLength(settles ? 1 : 0);
           }).pipe(Effect.provide(fixture.layer));
         }),
       ),

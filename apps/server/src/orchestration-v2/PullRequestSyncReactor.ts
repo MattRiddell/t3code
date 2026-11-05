@@ -10,6 +10,7 @@ import {
   type ThreadPullRequestStack,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import {
   threadPullRequestKeyOf,
   normalizeThreadPullRequestKey,
@@ -22,6 +23,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -30,6 +32,7 @@ import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -38,12 +41,11 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { isTerminalRunStatus } from "./ThreadManagementService.ts";
 
-const SLOW_SYNC_INTERVAL_MS = 15 * 60 * 1_000;
-// Every server polls every open linked pull request, and most of them sit untouched for days.
-// One nobody has updated for QUIET_AFTER_MS is read on the quiet cadence instead of each sweep;
-// requested refreshes, watches and a host CLI's merge command still read it at once.
-const QUIET_AFTER_MS = 30 * 60 * 1_000;
-const QUIET_SYNC_INTERVAL_MS = 5 * 60 * 1_000;
+// Every linked pull request is read on one tick, so a tick costs one summary document however
+// many are linked. Requested refreshes, new links and a host CLI's merge command read at once.
+const POLL_INTERVAL_MS = Duration.toMillis(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
+// A read the tick lost to a failure or a pause retries here, after the tick's own sweep has ended.
+const MISSED_POLL_RETRY_AFTER_MS = POLL_INTERVAL_MS + 60_000;
 
 const isChangeRequestCloseCommand = (command: string) =>
   sourceControlDefinitions.definitions.some(
@@ -174,6 +176,9 @@ export function changeRequestsCreatedBy(input: string, output: string) {
 const isPullRequestProviderError = Schema.is(PullRequestProviderError);
 
 type SnapshotFields = Omit<ThreadPullRequestSnapshot, "syncedAt">;
+
+/** poll reads every link; all reads only what is owed; requested reads what was asked for. */
+type SweepScope = "poll" | "all" | "requested";
 
 interface LinkEntry {
   readonly thread: ProjectionStore.ProjectionThreadPullRequests;
@@ -329,7 +334,12 @@ export const make = Effect.gen(function* () {
   // Pause per project and host because credentials are project-specific; leave paused PRs due until reset.
   const pausedUntil = new Map<string, number>();
 
-  const isDue = (key: string, entries: ReadonlyArray<LinkEntry>, nowMs: number): boolean => {
+  const isDue = (
+    key: string,
+    entries: ReadonlyArray<LinkEntry>,
+    nowMs: number,
+    polling: boolean,
+  ): boolean => {
     if (requested.has(key) || retryStacks.has(key)) return true;
     if (entries.some((entry) => entry.link.snapshot === null)) return true;
     const active = entries.filter((entry) => isUnsettled(entry.thread));
@@ -341,17 +351,9 @@ export const make = Effect.gen(function* () {
     ) {
       return false;
     }
+    if (polling) return true;
     const last = lastSyncedAt.get(key);
-    const sinceLastMs = last === undefined ? Number.POSITIVE_INFINITY : nowMs - last;
-    const open = active.filter((entry) => entry.link.snapshot?.state === "open");
-    if (open.length > 0) {
-      const quiet = open.every((entry) => {
-        const updatedAt = entry.link.snapshot?.updatedAt;
-        return updatedAt != null && nowMs - Date.parse(updatedAt) >= QUIET_AFTER_MS;
-      });
-      return !quiet || sinceLastMs >= QUIET_SYNC_INTERVAL_MS;
-    }
-    return sinceLastMs >= SLOW_SYNC_INTERVAL_MS;
+    return last === undefined || nowMs - last >= MISSED_POLL_RETRY_AFTER_MS;
   };
 
   const logSkipped =
@@ -359,7 +361,7 @@ export const make = Effect.gen(function* () {
     <E>(cause: Cause.Cause<E>): Effect.Effect<void, E> =>
       Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.logWarning(message, fields);
 
-  const sweep = Effect.fn("PullRequestSyncReactor.sweep")(function* (scope: "all" | "requested") {
+  const sweep = Effect.fn("PullRequestSyncReactor.sweep")(function* (scope: SweepScope) {
     const threads = yield* projections.getThreadsWithPullRequests();
     const now = yield* DateTime.now;
     const nowMs = DateTime.toEpochMillis(now);
@@ -574,7 +576,12 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(
       groups,
       ([key, entries]) => {
-        if (!((scope === "all" || requested.has(key)) && isDue(key, entries, nowMs))) {
+        if (
+          !(
+            (scope !== "requested" || requested.has(key)) &&
+            isDue(key, entries, nowMs, scope === "poll")
+          )
+        ) {
           return Effect.void;
         }
         const first = entries[0]!;
@@ -596,11 +603,14 @@ export const make = Effect.gen(function* () {
     }
   });
 
-  const worker = yield* makeDrainableWorker((scope: "all" | "requested") =>
+  const worker = yield* makeDrainableWorker((scope: SweepScope) =>
     Effect.suspend(() => {
       if (scope === "requested") requestedSweepQueued = false;
       return pullRequests.withSharedProjectReads(sweep(scope));
-    }).pipe(Effect.catchCause(logSkipped("pull request sync sweep failed", {}))),
+    }).pipe(
+      Effect.provideService(SourceControlRateLimit.ScheduledPoll, scope === "poll"),
+      Effect.catchCause(logSkipped("pull request sync sweep failed", {})),
+    ),
   );
 
   // Threads that ran a close command this run, with the commands already read for.
@@ -704,6 +714,16 @@ export const make = Effect.gen(function* () {
         yield* worker.enqueue("all");
         yield* worker.drain;
       }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),
+    );
+    yield* forkParked(
+      Effect.gen(function* () {
+        yield* worker.enqueue("poll");
+        yield* worker.drain;
+      }).pipe(
+        Effect.repeat(Schedule.spaced(BACKGROUND_PULL_REQUEST_POLL_INTERVAL)),
+        Effect.delay(BACKGROUND_PULL_REQUEST_POLL_INTERVAL),
+        Effect.asVoid,
+      ),
     );
   });
 

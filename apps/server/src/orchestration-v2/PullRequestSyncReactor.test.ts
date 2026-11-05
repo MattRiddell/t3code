@@ -22,6 +22,7 @@ import {
   type ThreadPullRequestLink,
   type ThreadPullRequestSnapshot,
 } from "@t3tools/contracts";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import { assert, describe, it } from "@effect/vitest";
 import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
@@ -35,6 +36,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import { TestClock } from "effect/testing";
 
+import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerActivation from "../serverActivation.ts";
@@ -294,6 +296,16 @@ const startAndSweep = Effect.fn("startPullRequestSyncHarness")(function* (fixtur
   yield* Queue.take(fixture.snapshotReads);
   yield* reactor.drain;
   return reactor;
+});
+
+const pollAgain = Effect.fn("pollPullRequestSyncHarness")(function* (
+  fixture: Harness,
+  reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
+) {
+  yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
+  yield* Queue.take(fixture.snapshotReads);
+  yield* reactor.drain;
+  yield* Queue.clear(fixture.snapshotReads);
 });
 
 const sweepAgain = Effect.fn("sweepPullRequestSyncHarness")(function* (
@@ -748,7 +760,7 @@ describe("PullRequestSyncReactor", () => {
             );
             yield* Ref.update(fixture.snapshots, (snapshot) => applySync(snapshot, commands));
             failing = false;
-            yield* sweepAgain(fixture, reactor);
+            yield* pollAgain(fixture, reactor);
             assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 3);
             assert.strictEqual(
               (yield* Ref.get(fixture.summaryCalls)).at(-1)?.projectId,
@@ -803,7 +815,7 @@ describe("PullRequestSyncReactor", () => {
           assert.strictEqual(firstSweep.length, 1);
           yield* Ref.update(fixture.snapshots, (snapshot) => applySync(snapshot, firstSweep));
 
-          yield* sweepAgain(fixture, reactor);
+          yield* pollAgain(fixture, reactor);
 
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
           assert.strictEqual((yield* Ref.get(fixture.stackCalls)).length, 1);
@@ -885,7 +897,7 @@ describe("PullRequestSyncReactor", () => {
 
         yield* Effect.gen(function* () {
           const reactor = yield* startAndSweep(fixture);
-          yield* sweepAgain(fixture, reactor);
+          yield* pollAgain(fixture, reactor);
 
           assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
           assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
@@ -931,7 +943,7 @@ describe("PullRequestSyncReactor", () => {
           assert.strictEqual(firstSweep.at(-1)?.snapshot.mergedAt, "2026-08-27T00:00:00.000Z");
           yield* Ref.update(fixture.snapshots, (snapshot) => applySync(snapshot, firstSweep));
 
-          for (let index = 0; index < 15; index += 1) yield* sweepAgain(fixture, reactor);
+          for (let index = 0; index < 15; index += 1) yield* pollAgain(fixture, reactor);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 1);
         }).pipe(Effect.provide(fixture.layer));
       }),
@@ -1154,7 +1166,7 @@ describe("PullRequestSyncReactor", () => {
 
         yield* Effect.gen(function* () {
           const reactor = yield* startAndSweep(fixture);
-          for (let index = 0; index < 15; index += 1) yield* sweepAgain(fixture, reactor);
+          for (let index = 0; index < 15; index += 1) yield* pollAgain(fixture, reactor);
           assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
 
           yield* Ref.update(fixture.snapshots, (snapshot) => ({
@@ -1312,12 +1324,15 @@ describe("PullRequestSyncReactor", () => {
           const reactor = yield* startAndSweep(fixture);
           yield* applyRecordedSyncs(fixture);
 
-          // 30 s later a state change refreshes #18, which caches its two-layer read until 90 s.
-          yield* TestClock.adjust("30 seconds");
+          // 30 s before the next poll a state change refreshes #18, which caches its two-layer read
+          // past that poll.
+          yield* TestClock.adjust("540 seconds");
+          yield* reactor.drain;
+          yield* Queue.clear(fixture.snapshotReads);
           yield* requestAndApply(fixture, reactor, 18);
 
-          // #83 is pushed on top and linked as the scheduled sweep at 60 s starts, so that sweep
-          // reads #83 for the first time while #18's summary is still in flight.
+          // #83 is pushed on top and linked as the poll starts, so that poll reads #83 for the
+          // first time while #18's summary is still in flight.
           stack.grow();
           yield* linkPullRequest83(fixture);
           holdSummary = true;
@@ -1367,9 +1382,96 @@ describe("PullRequestSyncReactor", () => {
           yield* applyRecordedSyncs(fixture);
           assert.strictEqual((yield* Ref.get(fixture.stackCalls)).length, 2);
 
-          yield* sweepAgain(fixture, reactor);
-          yield* sweepAgain(fixture, reactor);
+          yield* pollAgain(fixture, reactor);
+          yield* pollAgain(fixture, reactor);
           assert.strictEqual((yield* Ref.get(fixture.stackCalls)).length, 2);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("reads every linked pull request in one poll and none between polls", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const polled = yield* Ref.make<ReadonlyArray<boolean>>([]);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("busy", {
+              pullRequests: [makeLink(1, { state: "open" }), makeLink(2, { state: "open" })],
+            }),
+            makeThread("closed", { pullRequests: [makeLink(3, { state: "closed" })] }),
+          ]),
+          summary: (input) =>
+            Effect.gen(function* () {
+              const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
+              yield* Ref.update(polled, (reads) => [...reads, scheduledPoll]);
+              return makeSummary(input);
+            }),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          yield* Ref.set(fixture.summaryCalls, []);
+          yield* Ref.set(polled, []);
+
+          // Open links updated seconds ago wait too: the ten-minute limit is what they are owed.
+          for (let minute = 1; minute <= 9; minute += 1) {
+            yield* TestClock.adjust("1 minute");
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+          }
+          assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
+
+          yield* TestClock.adjust("30 seconds");
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number).toSorted(),
+            [1, 2, 3],
+          );
+          assert.deepStrictEqual(yield* Ref.get(polled), [true, true, true]);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("retries a read the poll lost instead of waiting for the next poll", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const failing = yield* Ref.make(false);
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("flaky", { pullRequests: [makeLink(7, { state: "open" })] }),
+          ]),
+          summary: (input) =>
+            Effect.flatMap(Ref.get(failing), (down) =>
+              down
+                ? Effect.fail(
+                    new PullRequestOperationError({ operation: "summary", detail: "host down" }),
+                  )
+                : Effect.succeed(makeSummary(input)),
+            ),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          yield* Ref.set(failing, true);
+          yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          yield* Queue.clear(fixture.snapshotReads);
+          yield* Ref.set(failing, false);
+          yield* Ref.set(fixture.summaryCalls, []);
+
+          yield* TestClock.adjust("90 seconds");
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
+            [7],
+          );
         }).pipe(Effect.provide(fixture.layer));
       }),
     ),

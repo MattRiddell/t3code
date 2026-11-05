@@ -452,6 +452,40 @@ describe("GitHubSourceControlProvider change request lookups by head", () => {
   });
 });
 
+describe("GitHubSourceControlProvider scheduled poll batching", () => {
+  const staggeredReads = (scheduledPoll: boolean) => {
+    const { layer, graphqlCalls } = harness({
+      remotes: remotesOutput(["origin", "git@github.com:acme/web.git"]),
+      graphql: () => ({ pullRequests: { nodes: [] } }),
+    });
+    return Effect.gen(function* () {
+      const gh = yield* GitHubSourceControlProvider.make;
+      const read = (headSelector: string) =>
+        gh
+          .listChangeRequests({ cwd: "/repo", headSelector, state: "all", limit: 20 })
+          .pipe(
+            Effect.provideService(SourceControlRateLimit.ScheduledPoll, scheduledPoll),
+            Effect.forkChild,
+          );
+      const first = yield* read("first");
+      yield* TestClock.adjust("2 seconds");
+      const second = yield* read("second");
+      yield* TestClock.adjust("3 seconds");
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+      return graphqlCalls.length;
+    }).pipe(Effect.provide(layer));
+  };
+
+  it.effect("puts a poll's staggered head lookups in one document", () =>
+    Effect.map(staggeredReads(true), (documents) => assert.strictEqual(documents, 1)),
+  );
+
+  it.effect("sends other background lookups on their own short window", () =>
+    Effect.map(staggeredReads(false), (documents) => assert.strictEqual(documents, 2)),
+  );
+});
+
 describe("GitHubSourceControlProvider.getChangeRequest", () => {
   it.effect("reads a pull request by number, and by URL on its own repository", () => {
     const { layer, graphqlCalls } = harness({

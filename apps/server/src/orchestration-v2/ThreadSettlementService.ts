@@ -12,6 +12,7 @@ import {
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -438,6 +439,8 @@ export const make = Effect.gen(function* () {
       });
     });
 
+    const scheduledRead = Effect.provideService(SourceControlRateLimit.ScheduledPoll, true);
+
     const pullRequestFor = Effect.fnUntraced(function* (
       group: ReadonlyArray<(typeof lookupCandidates)[number]>,
     ) {
@@ -453,20 +456,33 @@ export const make = Effect.gen(function* () {
         if (!matchesMerge && !projects.has(reference.projectId)) {
           return yield* Effect.die(new Error("linked pull request project not found"));
         }
-        const summary = matchesMerge
+        const pullRequestRef = {
+          projectId: reference.projectId,
+          repository: reference.repository,
+          number: reference.number,
+        };
+        const reading = matchesMerge
           ? ({
               state: "merged",
               closedAt: null,
               mergedAt: mergedPullRequest.mergedAt,
             } satisfies SettlementPullRequest)
-          : yield* pullRequests.summary(
-              {
-                projectId: reference.projectId,
-                repository: reference.repository,
-                number: reference.number,
-              },
-              { recoverTransientFailure: false },
+          : yield* scheduledRead(
+              pullRequests.summary(pullRequestRef, {
+                recoverTransientFailure: false,
+                background: true,
+              }),
             );
+        // A closed pull request can reopen, so a held closed state is confirmed before it settles.
+        const summary =
+          reading.state === "closed" &&
+          (yield* wouldSettle(group, {
+            state: reading.state,
+            closedAt: reading.closedAt ?? null,
+            mergedAt: reading.mergedAt ?? null,
+          }))
+            ? yield* pullRequests.summary(pullRequestRef, { recoverTransientFailure: false })
+            : reading;
         const terminal = {
           state: summary.state,
           closedAt: summary.closedAt ?? null,
@@ -496,7 +512,20 @@ export const make = Effect.gen(function* () {
         return yield* Effect.die(new Error("thread project not found"));
       }
       const refresh = group.filter((member) => shellClosedThreads.delete(member.id)).length > 0;
-      return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh });
+      if (refresh) {
+        return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh });
+      }
+      const detected = yield* scheduledRead(
+        git.branchPullRequest({ cwd, branch: thread.branch }, { background: true }),
+      );
+      return detected?.state === "closed" &&
+        (yield* wouldSettle(group, {
+          state: detected.state,
+          closedAt: detected.closedAt ?? null,
+          mergedAt: detected.mergedAt ?? null,
+        }))
+        ? yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh: true })
+        : detected;
     });
 
     yield* Effect.forEach(
