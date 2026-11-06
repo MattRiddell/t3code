@@ -29,6 +29,8 @@ export function preserveFreshContext(
 
 // Refuse before emitting anything. The command's timestamp is a compare-and-swap
 // against the saved handoff's snapshot, including input queued since that snapshot.
+// The idle window is the client's: automated turns bump updatedAt, so only the
+// client can measure time since the human's last message.
 export function prepareFreshProviderThread(
   records: ProjectionRecords<
     "providerThreads" | "runs" | "providerTurns" | "runtimeRequests" | "subagents" | "turnItems"
@@ -56,12 +58,6 @@ export function prepareFreshProviderThread(
     DateTime.toEpochMillis(seed.expectedUpdatedAt)
   ) {
     return "Thread changed since the handoff snapshot.";
-  }
-  if (
-    DateTime.toEpochMillis(now) - DateTime.toEpochMillis(records.thread.updatedAt) <
-    30 * 60_000
-  ) {
-    return "Thread has not been idle for 30 minutes.";
   }
   if (!seed.bootstrap.trim() || new TextEncoder().encode(seed.bootstrap).length >= 5_000) {
     return "Bootstrap must contain fewer than 5000 UTF-8 bytes.";
