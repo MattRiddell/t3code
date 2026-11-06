@@ -155,12 +155,13 @@ it.effect.each(["none", "background", "turn", "metadata"] as const)(
           bootstrap: "Role; complete handoff; lessons pointer.",
         },
       };
+      // The idle policy is the client's: a just-completed, unchanged snapshot is accepted.
       assert.equal(
         typeof prepareFreshProviderThread(before, command, now),
-        "string",
-        "NO: less than 30 minutes",
+        "object",
+        "server must not re-impose a thread-updatedAt idle window",
       );
-      yield* TestClock.adjust("31 minutes");
+      yield* TestClock.adjust("1 minute");
       const later = yield* DateTime.now;
       const refuse = (records: typeof before, cmd = command) =>
         assert.equal(typeof prepareFreshProviderThread(records, cmd, later), "string");
