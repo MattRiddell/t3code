@@ -3384,7 +3384,7 @@ export const layer = Layer.unwrap(
             ),
           ),
         );
-        const framedRpcWebSocketHttpEffect = url.value.searchParams.has(
+        const framedRpcWebSocketHttpEffect = requestUrl.value.searchParams.has(
           SOCKET_FRAME_PARTS_QUERY_PARAM,
         )
           ? rpcWebSocketHttpEffect.pipe(
