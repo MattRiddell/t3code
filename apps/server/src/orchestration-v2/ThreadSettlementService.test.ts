@@ -1191,6 +1191,58 @@ describe("ThreadSettlementServiceV2 worker", () => {
       ),
   );
 
+  it.effect.each(["linked", "unlinked"] as const)(
+    "fills one bounded GraphQL document before waiting for %s settlement lookups",
+    (kind) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const releaseReads = yield* Deferred.make<void>();
+          const reads = yield* Ref.make(0);
+          const recordRead = Ref.update(reads, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.await(releaseReads)),
+          );
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot(
+              Array.from({ length: 26 }, (_, index) =>
+                makeThread(`batch-${index}`, {
+                  branch: `feature-${index}`,
+                  latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+                  ...(kind === "linked"
+                    ? {
+                        linkedPullRequest: {
+                          projectId: PROJECT_ID,
+                          repository: "owner/repository",
+                          number: index + 1,
+                          url: `https://example.test/owner/repository/pull/${index + 1}`,
+                        },
+                      }
+                    : {}),
+                }),
+              ),
+            ),
+            branchPullRequest: () => recordRead.pipe(Effect.as(makeBranchPullRequest("open"))),
+            pullRequestSummary: (input) =>
+              recordRead.pipe(Effect.as(makePullRequestSummary({ ...input, state: "open" }))),
+          });
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* service.start();
+            yield* Deferred.succeed(fixture.activation, undefined);
+            yield* Queue.take(fixture.snapshotReads);
+            yield* TestClock.adjust("1 second");
+            // The resolver accepts 25 aliases. Eight slots fragment a single document;
+            // unbounded concurrency would also start the twenty-sixth lookup here.
+            expect(yield* Ref.get(reads)).toBe(25);
+            yield* Deferred.succeed(releaseReads, undefined);
+            yield* service.drain;
+            expect(yield* Ref.get(reads)).toBe(26);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
+
   it.effect("sweeps an unlinked branch on the background read, in the poll's window", () =>
     Effect.scoped(
       Effect.gen(function* () {

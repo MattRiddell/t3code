@@ -42,6 +42,8 @@ export interface SettlementPullRequest {
   readonly mergedAt?: string | null;
 }
 
+const SETTLEMENT_LOOKUP_CONCURRENCY = 25;
+
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
 
@@ -547,7 +549,9 @@ export const make = Effect.gen(function* () {
               }),
           ),
         ),
-      { concurrency: 8, discard: true },
+      // Match the scheduled GitHub resolver's 25-alias document limit. A smaller
+      // worker pool waits for partially filled documents before queuing more reads.
+      { concurrency: SETTLEMENT_LOOKUP_CONCURRENCY, discard: true },
     );
   });
 
