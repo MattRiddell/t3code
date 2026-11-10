@@ -3,6 +3,7 @@ import {
   isOrchestrationV2WorkActive,
   type OrchestrationV2Command,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type { ProjectionRecords } from "./ProjectionStore.ts";
@@ -25,6 +26,32 @@ export function preserveFreshContext(
     return { ...incoming, freshContext: saved };
   }
   return { ...incoming, freshContext };
+}
+
+const FINISHED_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "rolled_back",
+]);
+
+// Stale, not live: an approval or question whose runtime request is resolved, or any item of a
+// run that ended (an interrupt cancels the request but can leave its item "waiting"). Link and
+// secret requests wait on a person across runs; an unseen run or request counts as live.
+function isLiveTurnItem(
+  item: OrchestrationV2TurnItem,
+  records: ProjectionRecords<"runs" | "runtimeRequests">,
+): boolean {
+  if (!isOrchestrationV2WorkActive(item.status)) return false;
+  if (item.type === "link_request" || item.type === "secret_request") return true;
+  if (item.type === "approval_request" || item.type === "user_input_request") {
+    const request = records.runtimeRequests.find((row) => row.id === item.requestId);
+    if (request !== undefined && request.status !== "pending") return false;
+  }
+  if (item.runId === null) return true;
+  const run = records.runs.find((row) => row.id === item.runId);
+  return run === undefined || !FINISHED_RUN_STATUSES.has(run.status);
 }
 
 // Refuse before emitting anything. The command's timestamp is a compare-and-swap
@@ -72,14 +99,11 @@ export function prepareFreshProviderThread(
     latest.completedAt === null ||
     latest.providerThreadId !== previous.id ||
     !Number.isSafeInteger(latest.ordinal + 1) ||
-    records.runs.some(
-      (run) =>
-        !["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(run.status),
-    ) ||
+    records.runs.some((run) => !FINISHED_RUN_STATUSES.has(run.status)) ||
     records.providerTurns.some((turn) => turn.status === "pending" || turn.status === "running") ||
     records.runtimeRequests.some((request) => request.status === "pending") ||
     records.subagents.some((task) => isOrchestrationV2WorkActive(task.status)) ||
-    records.turnItems.some((item) => isOrchestrationV2WorkActive(item.status)) ||
+    records.turnItems.some((item) => isLiveTurnItem(item, records)) ||
     records.providerThreads.some((row) => (row.pendingBackgroundTasks?.length ?? 0) > 0)
   ) {
     return "Thread has active, queued, waiting or uncompleted work.";

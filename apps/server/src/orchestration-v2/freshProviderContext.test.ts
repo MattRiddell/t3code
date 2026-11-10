@@ -11,8 +11,11 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
+  TurnItemId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -185,6 +188,103 @@ it.effect.each(["none", "background", "turn", "metadata"] as const)(
           pendingBackgroundTasks: [{ taskId: "active-background", kind: "monitor" as const }],
         })),
       });
+      // A request item its run or runtime request left "waiting" is not live work.
+      const oldRun = before.runs.find((row) => row.id === RunId.make("old-run"))!;
+      const requestId = RuntimeRequestId.make("old-approval");
+      const approval = {
+        id: TurnItemId.make("old-approval-item"),
+        threadId,
+        runId: oldRun.id,
+        nodeId: null,
+        providerThreadId,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 17,
+        status: "waiting",
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "approval_request",
+        requestId,
+        requestKind: "command",
+      } as unknown as OrchestrationV2TurnItem;
+      const request = (status: "pending" | "cancelled") =>
+        ({
+          id: requestId,
+          nodeId: NodeId.make("old-approval-node"),
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "command",
+          status,
+          responseCapability: { type: "not_resumable", reason: "The run was interrupted." },
+          createdAt: now,
+          resolvedAt: status === "pending" ? null : now,
+        }) as unknown as (typeof before.runtimeRequests)[number];
+      const withItems = (
+        items: ReadonlyArray<OrchestrationV2TurnItem>,
+        requests: typeof before.runtimeRequests = [request("cancelled")],
+        runs: typeof before.runs = before.runs,
+      ) => ({ ...before, turnItems: [...items], runtimeRequests: [...requests], runs: [...runs] });
+      const accept = (records: typeof before) =>
+        assert.equal(typeof prepareFreshProviderThread(records, command, now), "object");
+      // The live shape: an earlier run ended with the item still "waiting", a later run completed.
+      for (const status of [
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "rolled_back",
+      ] as const) {
+        const ended = [
+          { ...oldRun, status },
+          { ...oldRun, id: RunId.make("next-run"), ordinal: 2 },
+        ];
+        accept(withItems([approval], [request("cancelled")], ended));
+        // Even with the request row missing, the ended run alone releases the item.
+        accept(withItems([approval], [], ended));
+      }
+      accept(withItems([approval], [request("cancelled")]));
+      accept(withItems([{ ...approval, type: "reasoning" } as OrchestrationV2TurnItem], []));
+      // A resolved request releases its item even when the item names no run.
+      accept(withItems([{ ...approval, runId: null }], [request("cancelled")]));
+      // Must say NO: work that can still move.
+      refuse(withItems([approval], [request("pending")]));
+      refuse(withItems([{ ...approval, runId: null }], []));
+      refuse(withItems([{ ...approval, runId: RunId.make("unseen-run") }], []));
+      refuse(
+        withItems(
+          [
+            {
+              ...approval,
+              type: "reasoning",
+              runId: RunId.make("unseen-run"),
+            } as OrchestrationV2TurnItem,
+          ],
+          [],
+        ),
+      );
+      for (const type of ["link_request", "secret_request"] as const) {
+        refuse(withItems([{ ...approval, type } as unknown as OrchestrationV2TurnItem], []));
+      }
+      for (const status of ["pending", "running", "waiting"] as const) {
+        refuse(
+          withItems(
+            [
+              approval,
+              {
+                ...approval,
+                id: TurnItemId.make("live-item"),
+                type: "reasoning",
+                runId: RunId.make("unseen-run"),
+                status,
+              } as OrchestrationV2TurnItem,
+            ],
+            [request("cancelled")],
+          ),
+        );
+      }
       if (race !== "none") {
         const sink = yield* EventSink.EventSinkV2;
         const commit = sink.commitCommand;
