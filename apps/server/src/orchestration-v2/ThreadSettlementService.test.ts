@@ -1283,7 +1283,9 @@ describe("ThreadSettlementServiceV2 worker", () => {
       Effect.scoped(
         Effect.gen(function* () {
           yield* TestClock.setTime(Date.parse(NOW));
-          const reads = yield* Ref.make<ReadonlyArray<boolean | undefined>>([]);
+          const reads = yield* Ref.make<
+            ReadonlyArray<{ background: boolean | undefined; scheduledPoll: boolean }>
+          >([]);
           const fixture = yield* makeHarness({
             snapshot: makeSnapshot([
               makeThread("held-closed", {
@@ -1297,21 +1299,29 @@ describe("ThreadSettlementServiceV2 worker", () => {
               }),
             ]),
             pullRequestSummary: (input, readOptions) =>
-              Ref.update(reads, (seen) => [...seen, readOptions?.background]).pipe(
-                Effect.as({
+              Effect.gen(function* () {
+                const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
+                yield* Ref.update(reads, (seen) => [
+                  ...seen,
+                  { background: readOptions?.background, scheduledPoll },
+                ]);
+                return {
                   ...makePullRequestSummary({
                     ...input,
                     state: readOptions?.background === true ? "closed" : fresh,
                   }),
                   closedAt: "2026-08-28T00:00:00.000Z",
-                }),
-              ),
+                };
+              }),
           });
 
           yield* Effect.gen(function* () {
             const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
             yield* startHarness(service, fixture.activation, fixture.snapshotReads);
-            expect(yield* Ref.get(reads)).toEqual([true, undefined]);
+            expect(yield* Ref.get(reads)).toEqual([
+              { background: true, scheduledPoll: true },
+              { background: undefined, scheduledPoll: true },
+            ]);
             expect(yield* Ref.get(fixture.commands)).toHaveLength(settles ? 1 : 0);
           }).pipe(Effect.provide(fixture.layer));
         }),
