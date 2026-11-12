@@ -23,33 +23,34 @@ import { openZipArchive } from "../zipArchive.ts";
 
 // Update the version, sizes and hashes from each chrome-headless-shell zip listed at
 // https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json
-// Never pin below 156.0.8078.70: the shell has no CRLSet and older SPKI blocklists trust
-// compromised eMudhra intermediates (crrev.com/c/8627687).
-const VERSION = "157.0.8103.38";
+// Never pin below 157.0.8103.50: older shells have the CVE-2026-125350 use-after-free in XML
+// (fixed in 157.0.8103.50), and below 156.0.8078.70 the shell has no CRLSet and older SPKI
+// blocklists trust compromised eMudhra intermediates (crrev.com/c/8627687).
+const VERSION = "157.0.8103.50";
 const ARCHIVES = {
   linux64: {
-    bytes: 128_168_542,
-    sha256: "deafffa74660b34853a4119c361fd427ac8c9fcb62db51ddb8a797cd83a4ba2d",
+    bytes: 128_166_087,
+    sha256: "7bf0d41e424efd1d6281c4162993ab9dc5de92fac213c211614905a71c057d0f",
   },
   "linux-arm64": {
-    bytes: 128_171_139,
-    sha256: "b9b910a57b2a15eb3e55000a2339f93a973934a413ebfc6e585a50ec6c42fd6c",
+    bytes: 128_169_705,
+    sha256: "55add1fa634756811fd644094ec226fc7e405be698fb07dbf0634bca689e293a",
   },
   "mac-arm64": {
-    bytes: 104_773_711,
-    sha256: "e6a6b13551aa12f951d0891d79282606b13742837c8fa0505e1272bae116ce82",
+    bytes: 104_775_379,
+    sha256: "082e3fe8fcfac75aec2ef0949d70e8d2254a99ea465450e287e6c06a3f1863ed",
   },
   "mac-x64": {
-    bytes: 110_442_262,
-    sha256: "79821745d0a72d2ba752d981284ed0a9e6fa320dad133596941a17dba6186de3",
+    bytes: 110_442_622,
+    sha256: "886beb07d8237b8acc2b879843a3506b3a56284264b82c806c7d80546e24e0ad",
   },
   win32: {
-    bytes: 120_390_416,
-    sha256: "35e0d45c0136448f7b587f6fb7195a0686127a4dfdc23ef3b0e04b5e9ffe16cd",
+    bytes: 120_390_768,
+    sha256: "7622162c88977542696559825d7611bb305f6236bb8505dfd5b449316ee68fe2",
   },
   win64: {
-    bytes: 126_513_060,
-    sha256: "1ff4540855478ba0848e03f1ef8d455f77d058b38285df91bc34273788a73446",
+    bytes: 126_512_350,
+    sha256: "9e59432baf484387bdc9cc4a8efca499fb558aeda93e536eb8b859a065ddb884",
   },
 } as const;
 
