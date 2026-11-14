@@ -241,6 +241,8 @@ export class PullRequestService extends Context.Service<
     readonly activity: (
       input: PullRequestRef,
     ) => Effect.Effect<PullRequestActivity, PullRequestError>;
+    /** Emits when the host reports a change; empty where the host has no event feed. */
+    readonly changes: (input: PullRequestRef) => Stream.Stream<void>;
     readonly threadComments: (
       input: PullRequestThreadCommentsInput,
     ) => Effect.Effect<PullRequestThreadCommentsResult, PullRequestError>;
@@ -575,6 +577,10 @@ function withRateLimitBackoff(
             api.getChangeRequestWatchFingerprint,
           ),
         }),
+    // A long-lived feed, not a read: the quota guard would hold its lease for hours.
+    ...(api.changeRequestEvents === undefined
+      ? {}
+      : { changeRequestEvents: api.changeRequestEvents }),
     getChangeRequestActivity: wrap("getChangeRequestActivity", api.getChangeRequestActivity),
     ...(api.getReviewThreadComments === undefined
       ? {}
@@ -1088,6 +1094,23 @@ export const make = Effect.gen(function* () {
       repository: project.repository,
     };
   });
+
+  const changes: PullRequestService["Service"]["changes"] = (input) =>
+    Stream.unwrap(
+      requireProject(input).pipe(
+        Effect.map((project) =>
+          project.api.changeRequestEvents === undefined
+            ? Stream.empty
+            : project.api.changeRequestEvents({
+                cwd: project.project.workspaceRoot,
+                repository: project.repository,
+                host: project.host,
+                number: input.number,
+              }),
+        ),
+        Effect.orElseSucceed(() => Stream.empty),
+      ),
+    );
 
   // Access can change after page load; recheck every write.
   const viewerPermissionsOf = (
@@ -3843,6 +3866,7 @@ export const make = Effect.gen(function* () {
       Cache.get(watchFingerprintCache, refCacheKey(input)),
     ),
     activity: credentialCached(activity),
+    changes,
     preview: credentialCached(preview),
     threadComments,
     diff: credentialCached(diff),

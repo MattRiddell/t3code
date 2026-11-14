@@ -104,7 +104,7 @@ interface RefreshRequest {
 
 type RefreshJob =
   | { readonly type: "refresh"; readonly request: RefreshRequest }
-  | { readonly type: "activity"; readonly threadId: ThreadId }
+  | { readonly type: "activity"; readonly threadId: ThreadId; refresh: boolean }
   | { readonly type: "poll" };
 
 const branchKeyOf = (
@@ -434,12 +434,18 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const queuedThreadRequests = new Map<ThreadId, Extract<RefreshJob, { type: "activity" }>>();
+
   const worker = yield* makeDrainableWorker((job: RefreshJob) => {
     switch (job.type) {
       case "refresh":
         return refresh(job.request);
       case "activity":
-        return refreshAfterActivity(job.threadId).pipe(
+        queuedThreadRequests.delete(job.threadId);
+        return (job.refresh
+          ? refreshAfterActivity(job.threadId)
+          : refresh({ threadId: job.threadId, refresh: false, background: true })
+        ).pipe(
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
@@ -454,20 +460,29 @@ export const make = Effect.gen(function* () {
     }
   });
 
-  const enqueueActivity = (threadId: ThreadId) => worker.enqueue({ type: "activity", threadId });
+  // Keep one queued request per thread. A later turn-end upgrades a metadata read.
+  // Remove it when work starts, so events during a lookup queue a fresh read.
+  const enqueueThread = (threadId: ThreadId, refresh: boolean) =>
+    Effect.suspend(() => {
+      const queued = queuedThreadRequests.get(threadId);
+      if (queued !== undefined) {
+        queued.refresh ||= refresh;
+        return Effect.void;
+      }
+      const job = { type: "activity" as const, threadId, refresh };
+      queuedThreadRequests.set(threadId, job);
+      return worker.enqueue(job);
+    });
 
   const processEvent = (event: OrchestrationV2DomainEvent) => {
     switch (event.type) {
       case "thread.created":
       case "thread.unarchived":
       case "thread.metadata-updated":
-        return worker.enqueue({
-          type: "refresh",
-          request: { threadId: event.threadId, refresh: false, background: true },
-        });
+        return enqueueThread(event.threadId, false);
       case "thread.unsettled":
       case "checkpoint.captured":
-        return enqueueActivity(event.threadId);
+        return enqueueThread(event.threadId, true);
       case "run.updated":
         if (
           event.payload.status === "completed" ||
@@ -475,7 +490,7 @@ export const make = Effect.gen(function* () {
           event.payload.status === "cancelled" ||
           event.payload.status === "interrupted"
         ) {
-          return enqueueActivity(event.threadId);
+          return enqueueThread(event.threadId, true);
         }
         break;
     }
