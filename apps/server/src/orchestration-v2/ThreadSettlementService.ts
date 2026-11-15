@@ -471,7 +471,10 @@ export const make = Effect.gen(function* () {
       });
     });
 
-    const scheduledRead = Effect.provideService(SourceControlRateLimit.ScheduledPoll, true);
+    const scheduledSettlementRead = Effect.provideService(
+      SourceControlRateLimit.ScheduledPoll,
+      true,
+    );
 
     const pullRequestFor = Effect.fnUntraced(function* (
       group: ReadonlyArray<(typeof lookupCandidates)[number]>,
@@ -499,7 +502,7 @@ export const make = Effect.gen(function* () {
               closedAt: null,
               mergedAt: mergedPullRequest.mergedAt,
             } satisfies SettlementPullRequest)
-          : yield* scheduledRead(
+          : yield* scheduledSettlementRead(
               pullRequests.summary(pullRequestRef, {
                 recoverTransientFailure: false,
                 background: true,
@@ -547,7 +550,7 @@ export const make = Effect.gen(function* () {
       if (refresh) {
         return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh });
       }
-      const detected = yield* scheduledRead(
+      const detected = yield* scheduledSettlementRead(
         git.branchPullRequest({ cwd, branch: thread.branch }, { background: true }),
       );
       return detected?.state === "closed" &&
@@ -564,7 +567,8 @@ export const make = Effect.gen(function* () {
       groups.values(),
       (group) =>
         Effect.gen(function* () {
-          const pullRequest = yield* pullRequestFor(group);
+          // Fresh terminal-state confirmations still belong to the scheduled sweep's batch.
+          const pullRequest = yield* scheduledSettlementRead(pullRequestFor(group));
           if (pullRequest === undefined) return;
           yield* Effect.forEach(group, (thread) => settleThread(thread, pullRequest), {
             discard: true,
