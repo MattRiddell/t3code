@@ -1720,6 +1720,66 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  // Staggered expiry sent one nearly empty GraphQL document per settlement sweep.
+  it.effect("expires background branch lookups together at the poll-tick boundary", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      for (const name of ["feature/tick-early", "feature/tick-late"]) {
+        yield* runGit(repoDir, ["checkout", "-b", name]);
+        yield* runGit(repoDir, ["push", "-u", "origin", name]);
+        yield* runGit(repoDir, ["checkout", "main"]);
+      }
+      const openPullRequest = (number: number, headRefName: string) => ({
+        number,
+        title: headRefName,
+        url: `https://github.com/acme/web/pull/${number}`,
+        baseRefName: "main",
+        headRefName,
+        state: "open" as const,
+        updatedAt: "2026-04-06T15:00:00Z",
+      });
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: {
+          prListSequence: Array.from({ length: 4 }, () => [
+            openPullRequest(401, "feature/tick-early"),
+            openPullRequest(402, "feature/tick-late"),
+          ]),
+        },
+      });
+      const early = { cwd: repoDir, branch: "feature/tick-early" };
+      const late = { cwd: repoDir, branch: "feature/tick-late" };
+      const tickMs = 570_000;
+      const tickStart = tickMs * 3_000_000;
+
+      yield* TestClock.setTime(tickStart);
+      yield* manager.branchPullRequest(early, { background: true });
+      const afterEarly = listed(providerCalls).length;
+      expect(afterEarly).toBeGreaterThan(0);
+      yield* TestClock.adjust("5 minutes");
+      yield* manager.branchPullRequest(late, { background: true });
+      const afterLate = listed(providerCalls).length;
+      expect(afterLate).toBeGreaterThan(afterEarly);
+
+      // MUST-SAY-NO: 9 minutes old, inside the same tick, is still served from cache.
+      yield* TestClock.setTime(tickStart + tickMs - 30_000);
+      yield* manager.branchPullRequest(early, { background: true });
+      yield* manager.branchPullRequest(late, { background: true });
+      expect(listed(providerCalls)).toHaveLength(afterLate);
+
+      // MUST-SAY-NO: the later read is only 4.5 minutes old, yet it is not reused past the boundary.
+      yield* TestClock.setTime(tickStart + tickMs);
+      yield* manager.branchPullRequest(late, { background: true });
+      const afterBoundaryLate = listed(providerCalls).length;
+      expect(afterBoundaryLate).toBeGreaterThan(afterLate);
+      yield* manager.branchPullRequest(early, { background: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterBoundaryLate);
+    }),
+  );
+
   // regression: #8600 settle threads server-side
   it.effect("branch PR lookup propagates provider failures", () =>
     Effect.gen(function* () {

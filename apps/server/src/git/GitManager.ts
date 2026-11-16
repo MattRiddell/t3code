@@ -82,7 +82,10 @@ import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.t
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import { detachStackFrame } from "./detachStackFrame.ts";
-import { BACKGROUND_PULL_REQUEST_MAX_AGE } from "./backgroundPullRequestPoll.ts";
+import {
+  BACKGROUND_PULL_REQUEST_MAX_AGE,
+  isBackgroundReadFresh,
+} from "./backgroundPullRequestPoll.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -1259,13 +1262,17 @@ export const make = Effect.gen(function* () {
     readPrLookup(key).pipe(
       Effect.flatMap((entry) =>
         Effect.flatMap(Clock.currentTimeMillis, (nowMs) => {
-          const maxAge =
+          // Background readers share tick-aligned expiry so one sweep refills them in one document.
+          const fresh =
             options?.background === true
-              ? BACKGROUND_PULL_REQUEST_MAX_AGE
-              : entry.latest?.state === "open"
-                ? PR_LOOKUP_CACHE_TTL
-                : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
-          if (nowMs - entry.readAtMs < Duration.toMillis(maxAge)) return Effect.succeed(entry);
+              ? isBackgroundReadFresh(entry.readAtMs, nowMs)
+              : nowMs - entry.readAtMs <
+                Duration.toMillis(
+                  entry.latest?.state === "open"
+                    ? PR_LOOKUP_CACHE_TTL
+                    : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL,
+                );
+          if (fresh) return Effect.succeed(entry);
           // Only this stale read: concurrent readers must join a lookup already replacing it.
           return Cache.invalidateWhen(
             prLookupCache,
