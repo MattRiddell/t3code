@@ -9,6 +9,7 @@ import {
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -21,7 +22,10 @@ import * as Stream from "effect/Stream";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
-import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
+import {
+  BACKGROUND_PULL_REQUEST_POLL_INTERVAL,
+  isIdleThread,
+} from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -208,15 +212,20 @@ export const make = Effect.gen(function* () {
             worktreeExists && first.worktreePath !== null
               ? first.worktreePath
               : project.workspaceRoot;
+          // A background read of a branch whose threads are all idle shares the idle window.
+          const nowMs = yield* Clock.currentTimeMillis;
+          const background =
+            request.background !== true
+              ? {}
+              : group.every((thread) => isIdleThread(thread, nowMs))
+                ? { background: true, idle: true }
+                : { background: true };
           const detected =
             first.branch === null
               ? null
               : yield* git.branchPullRequest(
                   { cwd, branch: first.branch },
-                  {
-                    refresh: request.refresh,
-                    ...(request.background === true ? { background: true } : {}),
-                  },
+                  { refresh: request.refresh, ...background },
                 );
           if (detected !== null && !pullRequestMatchesProject(detected, resolvedProject)) {
             return finishBackfill(group);
@@ -294,10 +303,7 @@ export const make = Effect.gen(function* () {
           if (detected !== null && first.branch !== null) {
             const current = yield* git.branchPullRequest(
               { cwd, branch: first.branch },
-              {
-                freshGitState: true,
-                ...(request.background === true ? { background: true } : {}),
-              },
+              { freshGitState: true, ...background },
             );
             const currentIdentity = yield* repositoryIdentities.resolve(project.workspaceRoot, {
               refresh: true,
@@ -418,8 +424,10 @@ export const make = Effect.gen(function* () {
     const owedBranches = new Set(owed.map(([branchKey]) => branchKey));
     const readers = owed.flatMap(([, threadIds]) => [...threadIds].slice(0, 1));
     const followers = owed.flatMap(([, threadIds]) => [...threadIds].slice(1));
+    // Nobody asked for the sweep's reads, so they share the tick's background window with the
+    // settlement sweep's lookups of the same branches instead of reading them again.
     const sweep = (branchFilter: (branchKey: string) => boolean) =>
-      sweeping ? [refresh({ threadId: null, refresh: false, branchFilter })] : [];
+      sweeping ? [refresh({ threadId: null, refresh: false, background: true, branchFilter })] : [];
     yield* Effect.all(
       [
         ...sweep((branchKey) => !owedBranches.has(branchKey)),

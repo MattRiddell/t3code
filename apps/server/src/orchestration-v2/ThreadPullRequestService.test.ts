@@ -104,6 +104,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     readonly branch: string;
     readonly refresh: boolean;
     readonly background: boolean;
+    readonly idle?: true;
     readonly scheduled: boolean;
   }
 
@@ -153,6 +154,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
                 branch: input.branch,
                 refresh: lookupOptions?.refresh ?? false,
                 background: lookupOptions?.background ?? false,
+                ...(lookupOptions?.idle === true ? { idle: true as const } : {}),
                 scheduled: yield* SourceControlRateLimit.ScheduledPoll,
               });
               yield* Queue.offer(pollLookup, undefined);
@@ -295,6 +297,42 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           ]);
         }),
     });
+  });
+
+  // The client-lease sweep read every branch fresh each tick, apart from the settlement sweep's
+  // background reads of the same branches.
+  it.effect("sweeps on the background read, an idle thread's branch in the idle window", () => {
+    const active = branchThread("active", "feature/active");
+    const idle = {
+      ...branchThread("idle", "feature/idle"),
+      createdAt: DateTime.subtract(NOW, { hours: 3 }),
+      updatedAt: DateTime.subtract(NOW, { hours: 3 }),
+    };
+    return TestClock.setTime(DateTime.toEpochMillis(NOW)).pipe(
+      Effect.andThen(
+        runDiscovery({
+          threads: [active, idle],
+          clientConnected: true,
+          scenario: ({ lookups, reachPoll, service }) =>
+            Effect.gen(function* () {
+              yield* reachPoll;
+              yield* service.drain;
+              // MUST-SAY-NO: neither sweep read is a fresh foreground read, and the thread
+              // created ten minutes ago is not idle.
+              expect(lookups.toSorted((a, b) => a.branch.localeCompare(b.branch))).toEqual([
+                { branch: "feature/active", refresh: false, background: true, scheduled: true },
+                {
+                  branch: "feature/idle",
+                  refresh: false,
+                  background: true,
+                  idle: true,
+                  scheduled: true,
+                },
+              ]);
+            }),
+        }),
+      ),
+    );
   });
 
   it.effect("lets a metadata event reuse a recent read, unlike a finished turn", () => {

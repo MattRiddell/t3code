@@ -83,8 +83,9 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import { detachStackFrame } from "./detachStackFrame.ts";
 import {
-  BACKGROUND_PULL_REQUEST_MAX_AGE,
+  IDLE_BACKGROUND_READ_MAX_AGE,
   isBackgroundReadFresh,
+  isIdleBackgroundReadFresh,
 } from "./backgroundPullRequestPoll.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
@@ -145,6 +146,8 @@ export class GitManager extends Context.Service<
         readonly freshGitState?: boolean;
         /** Nobody is watching this read, so it may reuse one up to the background age limit. */
         readonly background?: boolean;
+        /** With background, the thread is idle: reuse a read across the idle window's ticks. */
+        readonly idle?: boolean;
       },
     ) => Effect.Effect<GitBranchPullRequest | null, GitManagerServiceError>;
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
@@ -1250,22 +1253,28 @@ export const make = Effect.gen(function* () {
       timeToLive: (exit, key) => {
         if (Exit.isSuccess(exit)) {
           prLookupFailureStreakByKey.delete(key);
-          // Held for the oldest reader; getPrLookup applies each reader's own limit.
-          return BACKGROUND_PULL_REQUEST_MAX_AGE;
+          // Held for the oldest reader, an idle thread's; getPrLookup applies each reader's own limit.
+          return IDLE_BACKGROUND_READ_MAX_AGE;
         }
         return nextPrLookupFailureTtl(key);
       },
     },
   );
   const readPrLookup = (key: string) => detachStackFrame(Cache.get(prLookupCache, key));
-  const getPrLookup = (key: string, options?: { readonly background?: boolean }) =>
+  const getPrLookup = (
+    key: string,
+    options?: { readonly background?: boolean; readonly idle?: boolean },
+  ) =>
     readPrLookup(key).pipe(
       Effect.flatMap((entry) =>
         Effect.flatMap(Clock.currentTimeMillis, (nowMs) => {
-          // Background readers share tick-aligned expiry so one sweep refills them in one document.
+          // Background readers share tick-aligned expiry so one sweep refills them in one document;
+          // idle threads share a window of several ticks, so most ticks read none of them.
           const fresh =
             options?.background === true
-              ? isBackgroundReadFresh(entry.readAtMs, nowMs)
+              ? options.idle === true
+                ? isIdleBackgroundReadFresh(entry.readAtMs, nowMs)
+                : isBackgroundReadFresh(entry.readAtMs, nowMs)
               : nowMs - entry.readAtMs <
                 Duration.toMillis(
                   entry.latest?.state === "open"
@@ -2495,6 +2504,7 @@ export const make = Effect.gen(function* () {
       readonly refresh: boolean;
       readonly freshGitState: boolean;
       readonly background: boolean;
+      readonly idle: boolean;
     },
   ) {
     const remember = <E>(key: string, read: Effect.Effect<string | null, E>) =>
@@ -2605,7 +2615,10 @@ export const make = Effect.gen(function* () {
       );
       if (Option.isSome(cached)) yield* Cache.invalidate(prLookupCache, cacheKey);
     }
-    let cached = yield* getPrLookup(cacheKey, { background: options.background });
+    let cached = yield* getPrLookup(cacheKey, {
+      background: options.background,
+      idle: options.idle,
+    });
     // Lookup may use a fork instead of the saved upstream; verify the remote actually queried.
     const identityRemoteName = (headContext: BranchHeadContext) =>
       headContext.remoteName ?? remoteName ?? undefined;
@@ -2675,16 +2688,19 @@ export const make = Effect.gen(function* () {
     const refresh = options?.refresh === true;
     const freshGitState = refresh || options?.freshGitState === true;
     const background = options?.background === true;
+    const idle = background && options?.idle === true;
     const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
       refresh,
       freshGitState,
       background,
+      idle,
     });
     if (pullRequest === null || pullRequest.state === "open" || freshGitState) return pullRequest;
     return yield* lookupBranchPullRequest(cacheCwd, branch, {
       refresh: false,
       freshGitState: true,
       background,
+      idle,
     });
   });
   const invalidateLocalStatus: GitManager["Service"]["invalidateLocalStatus"] = Effect.fn(

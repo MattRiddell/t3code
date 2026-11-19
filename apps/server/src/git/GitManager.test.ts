@@ -1780,6 +1780,65 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
+  // Idle threads' lookups filled most of every tick's head document.
+  it.effect("shares an idle thread's background lookup across the idle window's ticks", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/idle"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/idle"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: {
+          prListSequence: Array.from({ length: 6 }, () => [
+            {
+              number: 411,
+              title: "Idle branch",
+              url: "https://github.com/acme/web/pull/411",
+              baseRefName: "main",
+              headRefName: "feature/idle",
+              state: "open" as const,
+              updatedAt: "2026-04-06T15:00:00Z",
+            },
+          ]),
+        },
+      });
+      const idle = { cwd: repoDir, branch: "feature/idle" };
+      const tickMs = 570_000;
+      const windowMs = tickMs * 6;
+      const windowStart = windowMs * 500_000;
+
+      yield* TestClock.setTime(windowStart);
+      yield* manager.branchPullRequest(idle, { background: true, idle: true });
+      const afterFirst = listed(providerCalls).length;
+      expect(afterFirst).toBeGreaterThan(0);
+
+      // MUST-SAY-NO: 50 minutes and five tick boundaries later, the idle reader asks nobody.
+      yield* TestClock.setTime(windowStart + 50 * 60_000);
+      yield* manager.branchPullRequest(idle, { background: true, idle: true });
+      expect(listed(providerCalls)).toHaveLength(afterFirst);
+
+      // The same read for a thread someone works on still expires at the tick boundary.
+      yield* manager.branchPullRequest(idle, { background: true });
+      const afterActive = listed(providerCalls).length;
+      expect(afterActive).toBeGreaterThan(afterFirst);
+
+      // An idle flag without background is a foreground read: its own TTL, not the window.
+      yield* TestClock.adjust("2 minutes");
+      yield* manager.branchPullRequest(idle, { idle: true });
+      const afterForeground = listed(providerCalls).length;
+      expect(afterForeground).toBeGreaterThan(afterActive);
+
+      // MUST-SAY-NO: the idle window ends for everyone at its boundary, however fresh the read.
+      yield* TestClock.setTime(windowStart + windowMs);
+      yield* manager.branchPullRequest(idle, { background: true, idle: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterForeground);
+    }),
+  );
+
   // regression: #8600 settle threads server-side
   it.effect("branch PR lookup propagates provider failures", () =>
     Effect.gen(function* () {

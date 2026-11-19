@@ -1243,35 +1243,40 @@ describe("ThreadSettlementServiceV2 worker", () => {
       ),
   );
 
-  it.effect("sweeps an unlinked branch on the background read, in the poll's window", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
-        const reads = yield* Ref.make<ReadonlyArray<unknown>>([]);
-        const fixture = yield* makeHarness({
-          snapshot: makeSnapshot([
-            makeThread("unlinked", {
-              branch: "feature",
-              latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
-            }),
-          ]),
-          branchPullRequest: (_input, lookupOptions) =>
-            Effect.gen(function* () {
-              const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
-              yield* Ref.update(reads, (seen) => [...seen, { lookupOptions, scheduledPoll }]);
-              return makeBranchPullRequest("open");
-            }),
-        });
+  // A thread worked on in the last two hours reads in the tick's window; an idle one shares the
+  // idle window across ticks. MUST-SAY-NO twin: the active thread is not marked idle.
+  it.effect.each([
+    { activity: "2026-08-27T00:00:00.000Z", lookupOptions: { background: true, idle: true } },
+    { activity: "2026-08-28T11:30:00.000Z", lookupOptions: { background: true } },
+  ])(
+    "sweeps an unlinked branch last active $activity on the background read, in its window",
+    ({ activity, lookupOptions }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const reads = yield* Ref.make<ReadonlyArray<unknown>>([]);
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([
+              makeThread("unlinked", {
+                branch: "feature",
+                latestUserMessageAt: DateTime.makeUnsafe(activity),
+              }),
+            ]),
+            branchPullRequest: (_input, lookupOptions) =>
+              Effect.gen(function* () {
+                const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
+                yield* Ref.update(reads, (seen) => [...seen, { lookupOptions, scheduledPoll }]);
+                return makeBranchPullRequest("open");
+              }),
+          });
 
-        yield* Effect.gen(function* () {
-          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
-          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
-          expect(yield* Ref.get(reads)).toEqual([
-            { lookupOptions: { background: true }, scheduledPoll: true },
-          ]);
-        }).pipe(Effect.provide(fixture.layer));
-      }),
-    ),
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            expect(yield* Ref.get(reads)).toEqual([{ lookupOptions, scheduledPoll: true }]);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
   );
 
   it.effect.each([

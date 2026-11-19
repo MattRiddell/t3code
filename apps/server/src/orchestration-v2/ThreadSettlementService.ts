@@ -25,6 +25,7 @@ import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import { isIdleThread } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -520,8 +521,14 @@ export const make = Effect.gen(function* () {
       if (refresh) {
         return yield* git.branchPullRequest({ cwd, branch: thread.branch }, { refresh });
       }
+      // A branch whose threads are all idle shares a several-tick window, so most ticks' documents
+      // carry only the branches someone is working on.
+      const idle = group.every((member) => isIdleThread(member, nowMs));
       const detected = yield* scheduledSettlementRead(
-        git.branchPullRequest({ cwd, branch: thread.branch }, { background: true }),
+        git.branchPullRequest(
+          { cwd, branch: thread.branch },
+          idle ? { background: true, idle: true } : { background: true },
+        ),
       );
       return detected?.state === "closed" &&
         (yield* wouldSettle(group, {

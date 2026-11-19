@@ -298,6 +298,9 @@ const startAndSweep = Effect.fn("startPullRequestSyncHarness")(function* (fixtur
   return reactor;
 });
 
+/** A person's refresh or run action; other requests wait for the next poll or retry sweep. */
+const PERSON_REQUEST = { immediate: true } as const;
+
 const pollAgain = Effect.fn("pollPullRequestSyncHarness")(function* (
   fixture: Harness,
   reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
@@ -308,11 +311,14 @@ const pollAgain = Effect.fn("pollPullRequestSyncHarness")(function* (
   yield* Queue.clear(fixture.snapshotReads);
 });
 
+// Sweeps run every half tick from startup: the retry sweep between polls, then the poll.
+const HALF_TICK = Duration.millis(Duration.toMillis(BACKGROUND_PULL_REQUEST_POLL_INTERVAL) / 2);
+
 const sweepAgain = Effect.fn("sweepPullRequestSyncHarness")(function* (
   fixture: Harness,
   reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
 ) {
-  yield* TestClock.adjust("1 minute");
+  yield* TestClock.adjust(HALF_TICK);
   yield* Queue.take(fixture.snapshotReads);
   yield* reactor.drain;
 });
@@ -483,7 +489,10 @@ const requestAndApply = Effect.fn("requestPullRequestSyncHarness")(function* (
   reactor: PullRequestSyncReactor.PullRequestSyncReactor["Service"],
   number: number,
 ) {
-  yield* reactor.requestSync({ host: "github.com", repository: "owner/repository", number });
+  yield* reactor.requestSync(
+    { host: "github.com", repository: "owner/repository", number },
+    PERSON_REQUEST,
+  );
   yield* Queue.take(fixture.snapshotReads);
   yield* reactor.drain;
   yield* applyRecordedSyncs(fixture);
@@ -598,11 +607,14 @@ describe("PullRequestSyncReactor", () => {
         yield* Effect.gen(function* () {
           const reactor = yield* startAndSweep(fixture);
           assert.strictEqual((yield* Ref.get(fixture.stackCalls)).length, 0);
-          yield* reactor.requestSync({
-            host: "github.com",
-            repository: "owner/repository",
-            number: 7,
-          });
+          yield* reactor.requestSync(
+            {
+              host: "github.com",
+              repository: "owner/repository",
+              number: 7,
+            },
+            PERSON_REQUEST,
+          );
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
           assert.strictEqual((yield* Ref.get(fixture.stackCalls)).length, 1);
@@ -735,7 +747,7 @@ describe("PullRequestSyncReactor", () => {
           yield* Effect.gen(function* () {
             const reactor = yield* startAndSweep(fixture);
             assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
-            yield* reactor.requestSync(link);
+            yield* reactor.requestSync(link, PERSON_REQUEST);
             yield* Queue.take(fixture.snapshotReads);
             yield* reactor.drain;
             const commands = yield* Ref.get(fixture.syncCommands);
@@ -854,11 +866,14 @@ describe("PullRequestSyncReactor", () => {
         yield* Effect.gen(function* () {
           const reactor = yield* startAndSweep(fixture);
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
-          yield* reactor.requestSync({
-            host: "github.com",
-            repository: "owner/repository",
-            number: 42,
-          });
+          yield* reactor.requestSync(
+            {
+              host: "github.com",
+              repository: "owner/repository",
+              number: 42,
+            },
+            PERSON_REQUEST,
+          );
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
           assert.sameMembers(
@@ -902,11 +917,14 @@ describe("PullRequestSyncReactor", () => {
           assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
           assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
 
-          yield* reactor.requestSync({
-            host: "github.com",
-            repository: "owner/repository",
-            number: 1,
-          });
+          yield* reactor.requestSync(
+            {
+              host: "github.com",
+              repository: "owner/repository",
+              number: 1,
+            },
+            PERSON_REQUEST,
+          );
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
 
@@ -1057,9 +1075,9 @@ describe("PullRequestSyncReactor", () => {
             ]),
           );
           const key = { host: "github.com", repository: "owner/repository", number: 2 };
-          yield* reactor.requestSync(key);
+          yield* reactor.requestSync(key, PERSON_REQUEST);
           yield* Deferred.await(reading);
-          yield* reactor.requestSync(key);
+          yield* reactor.requestSync(key, PERSON_REQUEST);
           yield* Deferred.succeed(release, undefined);
           yield* reactor.drain;
           assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
@@ -1097,7 +1115,10 @@ describe("PullRequestSyncReactor", () => {
             ),
           );
           const request = (number: number) =>
-            reactor.requestSync({ host: "github.com", repository: "owner/repository", number });
+            reactor.requestSync(
+              { host: "github.com", repository: "owner/repository", number },
+              PERSON_REQUEST,
+            );
           yield* request(1);
           yield* Deferred.await(reading);
           yield* Effect.forEach([2, 3, 4], request, { discard: true });
@@ -1415,15 +1436,14 @@ describe("PullRequestSyncReactor", () => {
           yield* Ref.set(fixture.summaryCalls, []);
           yield* Ref.set(polled, []);
 
-          // Open links updated seconds ago wait too: the ten-minute limit is what they are owed.
-          for (let minute = 1; minute <= 9; minute += 1) {
-            yield* TestClock.adjust("1 minute");
-            yield* Queue.take(fixture.snapshotReads);
-            yield* reactor.drain;
-          }
+          // MUST-SAY-NO: the retry sweep between polls reads nothing already read this tick; open
+          // links updated seconds ago wait too, since the ten-minute limit is what they are owed.
+          yield* TestClock.adjust(HALF_TICK);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
           assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
 
-          yield* TestClock.adjust("30 seconds");
+          yield* TestClock.adjust(HALF_TICK);
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
           assert.deepStrictEqual(
@@ -1465,12 +1485,102 @@ describe("PullRequestSyncReactor", () => {
           yield* Ref.set(failing, false);
           yield* Ref.set(fixture.summaryCalls, []);
 
-          yield* TestClock.adjust("90 seconds");
+          // MUST-SAY-NO: a minute later nothing has swept; the retry waits for half the tick, so
+          // a failing group costs one document between polls instead of one a minute.
+          yield* TestClock.adjust("1 minute");
+          assert.strictEqual(yield* Queue.size(fixture.snapshotReads), 0);
+          assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
+
+          yield* TestClock.adjust(Duration.subtract(HALF_TICK, Duration.minutes(1)));
           yield* Queue.take(fixture.snapshotReads);
           yield* reactor.drain;
           assert.deepStrictEqual(
             (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
             [7],
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  // Repeated state changes for the same pull requests made the summary bursts.
+  it.effect("reads a state change at once only the first time in a tick for its pull request", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // 30 seconds before a tick boundary.
+        yield* TestClock.setTime(Date.parse(NOW));
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("busy", { pullRequests: [makeLink(7, { state: "open" })] }),
+          ]),
+        });
+        const key = { host: "github.com", repository: "owner/repository", number: 7 };
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          yield* Ref.set(fixture.summaryCalls, []);
+
+          yield* Queue.offer(fixture.stateChanges, key);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
+            [7],
+          );
+          yield* Ref.set(fixture.summaryCalls, []);
+
+          // MUST-SAY-NO: the same pull request changing again this tick does not read again; it
+          // waits for the retry sweep, half a tick at most, the only sweep until then.
+          yield* Queue.offer(fixture.stateChanges, key);
+          yield* TestClock.adjust(HALF_TICK);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.strictEqual(yield* Queue.size(fixture.snapshotReads), 0);
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
+            [7],
+          );
+          yield* Ref.set(fixture.summaryCalls, []);
+
+          // A new tick reads its first change at once again.
+          yield* Queue.offer(fixture.stateChanges, key);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
+            [7],
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
+  it.effect("MUST-SAY-NO: a person's request reads at once however often it comes in a tick", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse(NOW));
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("busy", { pullRequests: [makeLink(7, { state: "open" })] }),
+          ]),
+        });
+        const key = { host: "github.com", repository: "owner/repository", number: 7 };
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          yield* Ref.set(fixture.summaryCalls, []);
+
+          yield* Queue.offer(fixture.stateChanges, key);
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          for (let index = 0; index < 2; index += 1) {
+            yield* reactor.requestSync(key, PERSON_REQUEST);
+            yield* Queue.take(fixture.snapshotReads);
+            yield* reactor.drain;
+          }
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
+            [7, 7, 7],
           );
         }).pipe(Effect.provide(fixture.layer));
       }),
