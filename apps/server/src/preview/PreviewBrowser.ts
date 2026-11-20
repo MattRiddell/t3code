@@ -26,7 +26,7 @@ import { openZipArchive } from "../zipArchive.ts";
 // Never pin below 157.0.8103.50: older shells have the CVE-2026-125350 use-after-free in XML
 // (fixed in 157.0.8103.50), and below 156.0.8078.70 the shell has no CRLSet and older SPKI
 // blocklists trust compromised eMudhra intermediates (crrev.com/c/8627687).
-const VERSION = "157.0.8103.78";
+export const VERSION = "157.0.8103.78";
 const ARCHIVES = {
   linux64: {
     bytes: 127_965_683,
