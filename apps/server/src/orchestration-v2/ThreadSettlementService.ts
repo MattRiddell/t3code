@@ -27,6 +27,7 @@ import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import { isIdleThread } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -618,6 +619,9 @@ export const make = Effect.gen(function* () {
       const refresh = group.filter((member) => shellClosedThreads.delete(member.id)).length > 0;
       const key = lookupKey(thread);
       if (scheduledLookups !== null && !refresh && !scheduledLookups.has(key)) return undefined;
+      // A branch whose threads are all idle shares a several-tick window, so most ticks' documents
+      // carry only the branches someone is working on.
+      const idle = group.every((member) => isIdleThread(member, nowMs));
       // Remembered git state is enough to rule a thread out; only an answer
       // that would settle it is confirmed against fresh git state.
       const remembered = refresh
@@ -628,7 +632,9 @@ export const make = Effect.gen(function* () {
         : yield* scheduledSettlementRead(
             git.branchPullRequest(
               { cwd, branch: thread.branch },
-              { confirmTerminal: false, background: true },
+              idle
+                ? { confirmTerminal: false, background: true, idle: true }
+                : { confirmTerminal: false, background: true },
             ),
           );
       noPullRequestRechecks.record(key, nowMs, remembered !== null);

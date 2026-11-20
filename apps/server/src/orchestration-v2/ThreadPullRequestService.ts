@@ -24,7 +24,10 @@ import * as Stream from "effect/Stream";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
-import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
+import {
+  BACKGROUND_PULL_REQUEST_POLL_INTERVAL,
+  isIdleThread,
+} from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -244,17 +247,20 @@ export const make = Effect.gen(function* () {
               .pipe(Effect.orElseSucceed(() => true)))
               ? first.worktreePath
               : project.workspaceRoot;
+          // A background read of a branch whose threads are all idle shares the idle window.
+          const background =
+            request.background !== true
+              ? {}
+              : group.every((thread) => isIdleThread(thread, nowMs))
+                ? { background: true, idle: true }
+                : { background: true };
           // A detected PR is confirmed against fresh git state before it is saved.
           const detected =
             first.branch === null
               ? null
               : yield* git.branchPullRequest(
                   { cwd, branch: first.branch },
-                  {
-                    refresh: request.refresh,
-                    confirmTerminal: false,
-                    ...(request.background === true ? { background: true } : {}),
-                  },
+                  { refresh: request.refresh, confirmTerminal: false, ...background },
                 );
           if (first.branch !== null) noPullRequestRechecks.record(key, nowMs, detected !== null);
           if (detected !== null && !pullRequestMatchesProject(detected, resolvedProject)) {
@@ -346,10 +352,7 @@ export const make = Effect.gen(function* () {
           if (detected !== null && first.branch !== null) {
             const current = yield* git.branchPullRequest(
               { cwd, branch: first.branch },
-              {
-                freshGitState: true,
-                ...(request.background === true ? { background: true } : {}),
-              },
+              { freshGitState: true, ...background },
             );
             const currentIdentity = yield* repositoryIdentities.resolve(project.workspaceRoot, {
               refresh: true,
@@ -472,8 +475,10 @@ export const make = Effect.gen(function* () {
     const owedBranches = new Set(owed.map(([branchKey]) => branchKey));
     const readers = owed.flatMap(([, threadIds]) => [...threadIds].slice(0, 1));
     const followers = owed.flatMap(([, threadIds]) => [...threadIds].slice(1));
+    // Nobody asked for the sweep's reads, so they share the tick's background window with the
+    // settlement sweep's lookups of the same branches instead of reading them again.
     const sweep = (branchFilter: (branchKey: string) => boolean) =>
-      sweeping ? [refresh({ threadId: null, refresh: false, branchFilter })] : [];
+      sweeping ? [refresh({ threadId: null, refresh: false, background: true, branchFilter })] : [];
     yield* Effect.all(
       [
         ...sweep((branchKey) => !owedBranches.has(branchKey)),
