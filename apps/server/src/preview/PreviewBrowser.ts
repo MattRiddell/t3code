@@ -26,31 +26,31 @@ import { openZipArchive } from "../zipArchive.ts";
 // Never pin below 157.0.8103.50: older shells have the CVE-2026-125350 use-after-free in XML
 // (fixed in 157.0.8103.50), and below 156.0.8078.70 the shell has no CRLSet and older SPKI
 // blocklists trust compromised eMudhra intermediates (crrev.com/c/8627687).
-const VERSION = "157.0.8103.50";
+const VERSION = "157.0.8103.78";
 const ARCHIVES = {
   linux64: {
-    bytes: 128_166_087,
-    sha256: "7bf0d41e424efd1d6281c4162993ab9dc5de92fac213c211614905a71c057d0f",
+    bytes: 127_965_683,
+    sha256: "f90329720fb61e5a76da9b6b509b6ad12a484c9c5df0359403e935177c6d153a",
   },
   "linux-arm64": {
-    bytes: 128_169_705,
-    sha256: "55add1fa634756811fd644094ec226fc7e405be698fb07dbf0634bca689e293a",
+    bytes: 128_047_138,
+    sha256: "912fbf877e53de34d7b3cca5104f3b95607d41bd35412ccc6cd2a599ff0c0dbf",
   },
   "mac-arm64": {
-    bytes: 104_775_379,
-    sha256: "082e3fe8fcfac75aec2ef0949d70e8d2254a99ea465450e287e6c06a3f1863ed",
+    bytes: 104_822_985,
+    sha256: "17bf66d53c1b1104dcb641c5b331cd4ac5d200c778f5feed0934a0b92deaf8d6",
   },
   "mac-x64": {
-    bytes: 110_442_622,
-    sha256: "886beb07d8237b8acc2b879843a3506b3a56284264b82c806c7d80546e24e0ad",
+    bytes: 110_132_547,
+    sha256: "f1a6a9561eaf1f409849538de663695d36d72fbf1ebca4d42e47c7b5f2a157f3",
   },
   win32: {
-    bytes: 120_390_768,
-    sha256: "7622162c88977542696559825d7611bb305f6236bb8505dfd5b449316ee68fe2",
+    bytes: 120_403_126,
+    sha256: "d9829c59dcc79d9e6e920f8ab841f2a9a055dcf54229d756ac0b42dfec303910",
   },
   win64: {
-    bytes: 126_512_350,
-    sha256: "9e59432baf484387bdc9cc4a8efca499fb558aeda93e536eb8b859a065ddb884",
+    bytes: 126_047_001,
+    sha256: "2138c1583d25d6f3abec5269943b2f430207d87a539895aa9e90cc4697ec0e1f",
   },
 } as const;
 
