@@ -627,6 +627,7 @@ export class GitHubPullRequestApi extends Context.Service<
       readonly repository: string;
       readonly host: string;
       readonly number: number;
+      readonly includeCommitStats?: boolean;
     }) => Effect.Effect<GitHubPullRequestActivity, GitHubPullRequestApiError>;
 
     readonly getPullRequestDiff: (input: {
@@ -2280,7 +2281,7 @@ export const make = Effect.gen(function* () {
         const [, commitStats] = yield* Effect.all(
           [
             laterPages,
-            nonMergeCommitIds.length === 0
+            input.includeCommitStats === false || nonMergeCommitIds.length === 0
               ? Effect.succeed(emptyStats)
               : client.PullRequestCommitStats({ ids: nonMergeCommitIds }).pipe(
                   graphql(target),

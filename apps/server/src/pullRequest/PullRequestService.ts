@@ -256,6 +256,7 @@ export class PullRequestService extends Context.Service<
     ) => Effect.Effect<ProviderChangeRequestWatchFingerprint | null, PullRequestError>;
     readonly activity: (
       input: PullRequestRef,
+      options?: { readonly includeCommitStats?: boolean },
     ) => Effect.Effect<PullRequestActivity, PullRequestError>;
     /** Emits when the host reports a change; empty where the host has no event feed. */
     readonly changes: (input: PullRequestRef) => Stream.Stream<void>;
@@ -2027,7 +2028,7 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-  const activityUncached: PullRequestService["Service"]["activity"] = (input) =>
+  const activityUncached: PullRequestService["Service"]["activity"] = (input, options) =>
     requireProject(input).pipe(
       Effect.flatMap((project) =>
         project.api
@@ -2036,6 +2037,7 @@ export const make = Effect.gen(function* () {
             repository: project.repository,
             host: project.host,
             number: input.number,
+            ...(options?.includeCommitStats === false ? { includeCommitStats: false } : {}),
           })
           .pipe(
             Effect.mapError(toPullRequestError("activity")),
@@ -3551,16 +3553,14 @@ export const make = Effect.gen(function* () {
       : lastGoodDetail.serveHeld(key, read);
   };
 
-  const activityCache = yield* Cache.makeWith(
-    (key: string) => {
-      return activityUncached(refOfCacheKey(key));
-    },
-    {
+  const makeActivityCache = (includeCommitStats: boolean) =>
+    Cache.makeWith((key: string) => activityUncached(refOfCacheKey(key), { includeCommitStats }), {
       capacity: DETAIL_CACHE_CAPACITY,
       timeToLive: (exit, key) =>
         Exit.isSuccess(exit) ? detailTimeToLive(lastGoodSummary.peek(key)?.state) : Duration.zero,
-    },
-  );
+    });
+  const activityCache = yield* makeActivityCache(true);
+  const conversationCache = yield* makeActivityCache(false);
 
   const changeBreakdownCache = yield* Cache.makeWith(
     (key: string) => {
@@ -3609,9 +3609,18 @@ export const make = Effect.gen(function* () {
       ),
     );
   };
-  const activity: PullRequestService["Service"]["activity"] = (input) => {
+  const activity: PullRequestService["Service"]["activity"] = (input, options) => {
     const key = refCacheKey(input);
-    return Cache.get(activityCache, key);
+    return options?.includeCommitStats === false
+      ? Cache.getSuccess(activityCache, key).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Cache.get(conversationCache, key),
+              onSome: Effect.succeed,
+            }),
+          ),
+        )
+      : Cache.get(activityCache, key);
   };
 
   const diffCache = yield* Cache.makeWith(

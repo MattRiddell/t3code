@@ -18,6 +18,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FiberSet from "effect/FiberSet";
 import * as FileSystem from "effect/FileSystem";
@@ -27,7 +28,11 @@ import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-import { isIdleThread } from "../git/backgroundPullRequestPoll.ts";
+import {
+  IDLE_THREAD_AFTER,
+  isBackgroundReadFresh,
+  isIdleThread,
+} from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -346,6 +351,7 @@ export const make = Effect.gen(function* () {
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
   const noPullRequestRechecks = makeNoPullRequestRechecks();
+  let lastIdleBatchAt = Number.NEGATIVE_INFINITY;
 
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
@@ -648,18 +654,26 @@ export const make = Effect.gen(function* () {
     });
 
     // A merge, a shell close and a thread's own events read at once; only scheduled sweeps wait.
-    const scheduledLookups =
-      mergedPullRequest !== null || threadId !== undefined
-        ? null
-        : noPullRequestRechecks.select(
-            nowMs,
-            [...groups]
-              .filter(([key]) => key.startsWith('["branch",'))
-              .map(([key, group]) => ({
-                key,
-                activityAtMs: Math.max(...group.map(threadActivityAtMs)),
-              })),
-          );
+    const scheduledLookups = (() => {
+      if (mergedPullRequest !== null || threadId !== undefined) return null;
+      // Keep processing local settlement every minute. Batch unknown idle branches once per
+      // shared GitHub poll tick so small misses do not open a new document each minute.
+      const runIdleBatch = !isBackgroundReadFresh(lastIdleBatchAt, nowMs);
+      if (runIdleBatch) lastIdleBatchAt = nowMs;
+      return noPullRequestRechecks.select(
+        nowMs,
+        [...groups]
+          .filter(([key]) => key.startsWith('["branch",'))
+          .map(([key, group]) => ({
+            key,
+            activityAtMs: Math.max(...group.map(threadActivityAtMs)),
+          })),
+        {
+          activityCutoffMs: nowMs - Duration.toMillis(IDLE_THREAD_AFTER),
+          limit: runIdleBatch ? SETTLEMENT_LOOKUP_CONCURRENCY : 0,
+        },
+      );
+    })();
 
     yield* Effect.forEach(
       groups.values(),

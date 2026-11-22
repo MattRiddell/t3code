@@ -570,7 +570,9 @@ const make = Effect.gen(function* () {
         wants("summary") || wants("checks")
           ? pullRequests.detail({ ...ref, allowStale: false }).pipe(Effect.asSome)
           : Effect.succeedNone,
-        wants("conversation") ? pullRequests.activity(ref).pipe(Effect.asSome) : Effect.succeedNone,
+        wants("conversation")
+          ? pullRequests.activity(ref, { includeCommitStats: false }).pipe(Effect.asSome)
+          : Effect.succeedNone,
         wants("diff")
           ? pullRequests
               .diff({ ...ref, ...(diffCursor === undefined ? {} : { cursor: diffCursor }) })

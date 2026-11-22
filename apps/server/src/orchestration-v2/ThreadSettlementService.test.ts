@@ -1807,6 +1807,46 @@ describe("ThreadSettlementServiceV2 worker", () => {
       ),
   );
 
+  it.effect("batches idle misses across minute sweeps and reads active branches promptly", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // Start exactly on the shared clock's tick so all eight intermediate sweeps are in it.
+        yield* TestClock.setTime(Math.floor(Date.parse(NOW) / 570_000) * 570_000);
+        const reads = yield* Ref.make<ReadonlyArray<string>>([]);
+        const idleThreads = Array.from({ length: 26 }, (_, index) =>
+          makeThread(`idle-${index}`, {
+            branch: `idle-${index}`,
+            latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+          }),
+        );
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            ...idleThreads,
+            makeThread("active", {
+              branch: "active",
+              latestUserMessageAt: DateTime.makeUnsafe("2026-08-28T11:30:00.000Z"),
+            }),
+          ]),
+          branchPullRequest: ({ branch }) =>
+            Ref.update(reads, (seen) => [...seen, branch]).pipe(Effect.as(null)),
+        });
+        yield* Effect.gen(function* () {
+          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+          expect(yield* Ref.get(reads)).toHaveLength(25);
+          expect(yield* Ref.get(reads)).toContain("active");
+          yield* TestClock.adjust("9 minutes");
+          yield* service.drain;
+          expect(yield* Ref.get(reads)).toHaveLength(25);
+          yield* TestClock.adjust("1 minute");
+          yield* service.drain;
+          expect(new Set(yield* Ref.get(reads)).size).toBe(27);
+          expect(yield* Ref.get(reads)).toHaveLength(27);
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
   // A thread worked on in the last two hours reads in the tick's window; an idle one shares the
   // idle window across ticks. MUST-SAY-NO twin: the active thread is not marked idle.
   it.effect.each([

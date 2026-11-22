@@ -913,11 +913,12 @@ layer("GitHubPullRequestApi.layer", (it) => {
     }),
   );
 
-  it.effect.each(["mixed", "merges", "unavailable"] as const)(
+  it.effect.each(["mixed", "merges", "unavailable", "conversation-only"] as const)(
     "reads stats only for displayed non-merge commits (%s)",
     (kind) =>
       Effect.gen(function* () {
         const oids = kind === "merges" ? ["merge"] : ["regular", "merge"];
+        const readsStats = kind !== "merges" && kind !== "conversation-only";
         mockedExecute.mockReturnValueOnce(
           Effect.succeed(
             output(
@@ -949,7 +950,7 @@ layer("GitHubPullRequestApi.layer", (it) => {
         );
         if (kind === "unavailable") {
           mockedExecute.mockReturnValueOnce(Effect.succeed(output("{}", false, false, {}, 503)));
-        } else if (kind !== "merges") {
+        } else if (readsStats) {
           mockedExecute.mockReturnValueOnce(
             Effect.succeed(
               output(
@@ -963,7 +964,11 @@ layer("GitHubPullRequestApi.layer", (it) => {
           );
         }
         const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
-        const activity = yield* cli.getPullRequestActivity(pullRequestInput);
+        const activity = yield* cli.getPullRequestActivity(
+          kind === "conversation-only"
+            ? { ...pullRequestInput, includeCommitStats: false }
+            : pullRequestInput,
+        );
         expect(activity.commits.map((commit) => commit.oid)).toEqual(oids);
         expect(activity.commits.find((commit) => commit.oid === "merge")).not.toHaveProperty(
           "additions",
@@ -973,13 +978,13 @@ layer("GitHubPullRequestApi.layer", (it) => {
         );
         if (kind === "mixed") {
           expect(activity.commits[0]).toMatchObject({ additions: 18, deletions: 7 });
-        } else if (kind === "unavailable") {
+        } else if (kind === "unavailable" || kind === "conversation-only") {
           expect(activity.commits[0]).not.toHaveProperty("additions");
         }
         expect(variablesOf("PullRequestCommitStats")).toEqual(
-          kind === "merges" ? [] : [{ ids: ["node-regular"] }],
+          readsStats ? [{ ids: ["node-regular"] }] : [],
         );
-        expect(mockedExecute).toHaveBeenCalledTimes(kind === "merges" ? 1 : 2);
+        expect(mockedExecute).toHaveBeenCalledTimes(readsStats ? 2 : 1);
       }),
   );
 
