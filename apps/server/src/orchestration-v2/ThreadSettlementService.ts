@@ -19,6 +19,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FiberSet from "effect/FiberSet";
 import * as FileSystem from "effect/FileSystem";
@@ -332,6 +333,11 @@ export function autoSettlementSettingsKey(
   ]);
 }
 
+// Bound idle misses to one batch per window while keeping active branches eligible every sweep.
+const IDLE_SETTLEMENT_BATCH_INTERVAL_MS = 570_000;
+const IDLE_SETTLEMENT_AFTER_MS = Duration.toMillis(Duration.hours(2));
+const IDLE_SETTLEMENT_BATCH_LIMIT = 25;
+
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -366,6 +372,7 @@ export const make = Effect.gen(function* () {
   // Repeated thread.settled retains settledAt; run the action only once per settlement.
   const settleActionRunAt = new Map<ThreadId, number>();
   const noPullRequestRechecks = makeNoPullRequestRechecks();
+  let lastIdleBatchTick: number | undefined;
 
   const sweep = Effect.fn("ThreadSettlementServiceV2.sweep")(function* (
     mergedPullRequest: PullRequestService.PullRequestMergeEvent | null,
@@ -716,21 +723,30 @@ export const make = Effect.gen(function* () {
     });
 
     // A merge, a shell close and a thread's own events read at once; only scheduled sweeps wait.
-    const scheduledLookups =
-      mergedPullRequest !== null || threadId !== undefined
-        ? null
-        : noPullRequestRechecks.select(
-            nowMs,
-            [...groups]
-              .filter(
-                ([key, group]) =>
-                  key.startsWith('["branch",') && !group.some((member) => deferred.has(member.id)),
-              )
-              .map(([key, group]) => ({
-                key,
-                activityAtMs: Math.max(...group.map(threadActivityAtMs)),
-              })),
-          );
+    const scheduledLookups = (() => {
+      if (mergedPullRequest !== null || threadId !== undefined) return null;
+      // Keep processing local settlement every minute. Batch unknown idle branches once per
+      // 9.5-minute window so small misses do not open a new document each minute.
+      const idleBatchTick = Math.floor(nowMs / IDLE_SETTLEMENT_BATCH_INTERVAL_MS);
+      const runIdleBatch = idleBatchTick !== lastIdleBatchTick;
+      if (runIdleBatch) lastIdleBatchTick = idleBatchTick;
+      return noPullRequestRechecks.select(
+        nowMs,
+        [...groups]
+          .filter(
+            ([key, group]) =>
+              key.startsWith('["branch",') && !group.some((member) => deferred.has(member.id)),
+          )
+          .map(([key, group]) => ({
+            key,
+            activityAtMs: Math.max(...group.map(threadActivityAtMs)),
+          })),
+        {
+          activityCutoffMs: nowMs - IDLE_SETTLEMENT_AFTER_MS,
+          limit: runIdleBatch ? IDLE_SETTLEMENT_BATCH_LIMIT : 0,
+        },
+      );
+    })();
 
     const settleDeferred = (group: ReadonlyArray<(typeof lookupCandidates)[number]>) =>
       Effect.forEach(

@@ -483,7 +483,10 @@ export interface PullRequestProviderApi {
   ) => Effect.Effect<ProviderChangeRequestStack | null, PullRequestProviderError>;
 
   readonly getChangeRequestActivity: (
-    input: ProviderRepositoryRef & { readonly number: number },
+    input: ProviderRepositoryRef & {
+      readonly number: number;
+      readonly includeCommitStats?: boolean;
+    },
   ) => Effect.Effect<ProviderChangeRequestActivity, PullRequestProviderError>;
 
   readonly getReviewThreadComments?: (

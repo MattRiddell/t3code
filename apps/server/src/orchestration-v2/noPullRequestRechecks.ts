@@ -17,6 +17,7 @@ export function makeNoPullRequestRechecks() {
     select: (
       nowMs: number,
       branches: ReadonlyArray<{ readonly key: string; readonly activityAtMs: number }>,
+      idleBatch?: { readonly activityCutoffMs: number; readonly limit: number },
     ): ReadonlySet<string> => {
       const selected = new Set<string>();
       const due: Array<{ key: string; activityAtMs: number; readAtMs: number }> = [];
@@ -39,7 +40,19 @@ export function makeNoPullRequestRechecks() {
           : left.readAtMs - right.readAtMs,
       );
       // Stamped before the lookup, so one that keeps failing cannot hold a place in every sweep.
-      for (const { key } of due.slice(0, RECHECKS_PER_SWEEP)) {
+      const active = due
+        .filter(
+          ({ activityAtMs }) =>
+            idleBatch === undefined || activityAtMs > idleBatch.activityCutoffMs,
+        )
+        .slice(0, RECHECKS_PER_SWEEP);
+      const idle =
+        idleBatch === undefined || idleBatch.limit === 0
+          ? []
+          : due
+              .filter(({ activityAtMs }) => activityAtMs <= idleBatch.activityCutoffMs)
+              .slice(0, Math.max(0, idleBatch.limit - active.length));
+      for (const { key } of [...active, ...idle]) {
         selected.add(key);
         reads.set(key, { readAtMs: nowMs, found: false });
       }

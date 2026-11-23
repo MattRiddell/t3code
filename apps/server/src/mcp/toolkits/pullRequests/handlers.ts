@@ -588,7 +588,7 @@ const make = Effect.gen(function* () {
       [
         // Agents pin merges to this headSha, so it must not come from a stale snapshot.
         pullRequests.detail({ ...ref, allowStale: false }),
-        pullRequests.activity(ref),
+        pullRequests.activity(ref, { includeCommitStats: false }),
         wants("diff")
           ? pullRequests
               .diff({ ...ref, ...(diffCursor === undefined ? {} : { cursor: diffCursor }) })
