@@ -26,6 +26,12 @@ export const Interactive = Context.Reference<boolean>(
   { defaultValue: () => false },
 );
 
+/** A scheduled poll nobody is waiting on: it holds its reads longer so they share one document. */
+export const ScheduledPoll = Context.Reference<boolean>(
+  "@t3tools/source-control-core/server/SourceControlRateLimit/ScheduledPoll",
+  { defaultValue: () => false },
+);
+
 interface RateLimitKey {
   readonly provider: SourceControlProviderKind;
   readonly host: string;

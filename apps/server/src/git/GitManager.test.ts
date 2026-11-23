@@ -2248,6 +2248,175 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       }),
   );
 
+  it.effect("lets only a background reader reuse an open branch lookup, for ten minutes", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/background-reuse"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/background-reuse"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      const openPullRequest = {
+        number: 301,
+        title: "Background reuse",
+        url: "https://github.com/acme/web/pull/301",
+        baseRefName: "main",
+        headRefName: "feature/background-reuse",
+        state: "open" as const,
+        updatedAt: "2026-04-06T15:00:00Z",
+      };
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: { prListSequence: Array.from({ length: 8 }, () => [openPullRequest]) },
+      });
+      const branch = { cwd: repoDir, branch: "feature/background-reuse" };
+
+      // Background reads expire at the 570 s poll tick, and this layer's tests share one TestClock
+      // that an earlier test may leave mid-tick: start on a tick boundary so 9 minutes stays inside it.
+      yield* TestClock.setTime(570_000 * 2_000_000);
+      yield* manager.branchPullRequest(branch);
+      const hostReads = listed(providerCalls).length;
+      expect(hostReads).toBeGreaterThan(0);
+
+      yield* TestClock.adjust("9 minutes");
+      yield* manager.branchPullRequest(branch, { background: true });
+      expect(listed(providerCalls)).toHaveLength(hostReads);
+
+      // The same age is too old for a reader someone is waiting on.
+      yield* manager.branchPullRequest(branch);
+      expect(listed(providerCalls).length).toBeGreaterThan(hostReads);
+
+      const afterForeground = listed(providerCalls).length;
+      yield* TestClock.adjust("10 minutes");
+      yield* manager.branchPullRequest(branch, { background: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterForeground);
+
+      const afterExpiry = listed(providerCalls).length;
+      yield* manager.branchPullRequest(branch, { refresh: true, background: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterExpiry);
+    }),
+  );
+
+  // Staggered expiry sent one nearly empty GraphQL document per settlement sweep.
+  it.effect("expires background branch lookups together at the poll-tick boundary", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      for (const name of ["feature/tick-early", "feature/tick-late"]) {
+        yield* runGit(repoDir, ["checkout", "-b", name]);
+        yield* runGit(repoDir, ["push", "-u", "origin", name]);
+        yield* runGit(repoDir, ["checkout", "main"]);
+      }
+      const openPullRequest = (number: number, headRefName: string) => ({
+        number,
+        title: headRefName,
+        url: `https://github.com/acme/web/pull/${number}`,
+        baseRefName: "main",
+        headRefName,
+        state: "open" as const,
+        updatedAt: "2026-04-06T15:00:00Z",
+      });
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: {
+          prListSequence: Array.from({ length: 4 }, () => [
+            openPullRequest(401, "feature/tick-early"),
+            openPullRequest(402, "feature/tick-late"),
+          ]),
+        },
+      });
+      const early = { cwd: repoDir, branch: "feature/tick-early" };
+      const late = { cwd: repoDir, branch: "feature/tick-late" };
+      const tickMs = 570_000;
+      const tickStart = tickMs * 3_000_000;
+
+      yield* TestClock.setTime(tickStart);
+      yield* manager.branchPullRequest(early, { background: true });
+      const afterEarly = listed(providerCalls).length;
+      expect(afterEarly).toBeGreaterThan(0);
+      yield* TestClock.adjust("5 minutes");
+      yield* manager.branchPullRequest(late, { background: true });
+      const afterLate = listed(providerCalls).length;
+      expect(afterLate).toBeGreaterThan(afterEarly);
+
+      // MUST-SAY-NO: 9 minutes old, inside the same tick, is still served from cache.
+      yield* TestClock.setTime(tickStart + tickMs - 30_000);
+      yield* manager.branchPullRequest(early, { background: true });
+      yield* manager.branchPullRequest(late, { background: true });
+      expect(listed(providerCalls)).toHaveLength(afterLate);
+
+      // MUST-SAY-NO: the later read is only 4.5 minutes old, yet it is not reused past the boundary.
+      yield* TestClock.setTime(tickStart + tickMs);
+      yield* manager.branchPullRequest(late, { background: true });
+      const afterBoundaryLate = listed(providerCalls).length;
+      expect(afterBoundaryLate).toBeGreaterThan(afterLate);
+      yield* manager.branchPullRequest(early, { background: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterBoundaryLate);
+    }),
+  );
+
+  // Idle threads' lookups filled most of every tick's head document.
+  it.effect("shares an idle thread's background lookup across the idle window's ticks", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/idle"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/idle"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      const { manager, providerCalls } = yield* makeManager({
+        providerScenario: {
+          prListSequence: Array.from({ length: 6 }, () => [
+            {
+              number: 411,
+              title: "Idle branch",
+              url: "https://github.com/acme/web/pull/411",
+              baseRefName: "main",
+              headRefName: "feature/idle",
+              state: "open" as const,
+              updatedAt: "2026-04-06T15:00:00Z",
+            },
+          ]),
+        },
+      });
+      const idle = { cwd: repoDir, branch: "feature/idle" };
+      const tickMs = 570_000;
+      const windowMs = tickMs * 6;
+      const windowStart = windowMs * 500_000;
+
+      yield* TestClock.setTime(windowStart);
+      yield* manager.branchPullRequest(idle, { background: true, idle: true });
+      const afterFirst = listed(providerCalls).length;
+      expect(afterFirst).toBeGreaterThan(0);
+
+      // MUST-SAY-NO: 50 minutes and five tick boundaries later, the idle reader asks nobody.
+      yield* TestClock.setTime(windowStart + 50 * 60_000);
+      yield* manager.branchPullRequest(idle, { background: true, idle: true });
+      expect(listed(providerCalls)).toHaveLength(afterFirst);
+
+      // The same read for a thread someone works on still expires at the tick boundary.
+      yield* manager.branchPullRequest(idle, { background: true });
+      const afterActive = listed(providerCalls).length;
+      expect(afterActive).toBeGreaterThan(afterFirst);
+
+      // An idle flag without background is a foreground read: its own TTL, not the window.
+      yield* TestClock.adjust("2 minutes");
+      yield* manager.branchPullRequest(idle, { idle: true });
+      const afterForeground = listed(providerCalls).length;
+      expect(afterForeground).toBeGreaterThan(afterActive);
+
+      // MUST-SAY-NO: the idle window ends for everyone at its boundary, however fresh the read.
+      yield* TestClock.setTime(windowStart + windowMs);
+      yield* manager.branchPullRequest(idle, { background: true, idle: true });
+      expect(listed(providerCalls).length).toBeGreaterThan(afterForeground);
+    }),
+  );
+
   // regression: #8600 settle threads server-side
   it.effect("branch PR lookup propagates provider failures", () =>
     Effect.gen(function* () {

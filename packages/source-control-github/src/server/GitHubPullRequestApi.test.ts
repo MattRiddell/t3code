@@ -1303,6 +1303,42 @@ layer("GitHubPullRequestApi.layer", (it) => {
     }),
   );
 
+  const staggeredSummaries = Effect.fn("staggeredSummaries")(function* (scheduledPoll: boolean) {
+    mockedExecute.mockReturnValue(
+      Effect.succeed(
+        output(
+          encodeJson({
+            data: { _0_repository: { pullRequest: null }, _1_repository: { pullRequest: null } },
+          }),
+        ),
+      ),
+    );
+    const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+    const read = (number: number) =>
+      cli
+        .getPullRequestSummary({ cwd: "/w", repository: "acme/web", host: "github.com", number })
+        .pipe(
+          Effect.provideService(SourceControlRateLimit.ScheduledPoll, scheduledPoll),
+          Effect.result,
+          Effect.forkChild,
+        );
+    const first = yield* read(7);
+    yield* TestClock.adjust("1 second");
+    const second = yield* read(8);
+    yield* TestClock.adjust("1 second");
+    yield* Fiber.join(first);
+    yield* Fiber.join(second);
+    return mockedExecute.mock.calls.length;
+  });
+
+  it.effect("puts a poll's staggered summaries in one document", () =>
+    Effect.map(staggeredSummaries(true), (documents) => assert.strictEqual(documents, 1)),
+  );
+
+  it.effect("sends other summaries on their own short window", () =>
+    Effect.map(staggeredSummaries(false), (documents) => assert.strictEqual(documents, 2)),
+  );
+
   it.effect(
     "fails only the pull request GitHub cannot find, and answers the rest of its batch",
     () =>

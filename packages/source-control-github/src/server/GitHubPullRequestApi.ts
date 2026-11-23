@@ -476,6 +476,8 @@ export interface GitHubPullRequestStat {
 const STAT_ALIASES_PER_REQUEST = 25;
 // Cache checks stagger reads across scheduler ticks; allow time to batch.
 const SUMMARY_BATCH_WINDOW = "10 millis";
+/** A poll's reads pass through cache checks one by one; one window keeps them in one document. */
+const SCHEDULED_POLL_SUMMARY_BATCH_WINDOW = "2 seconds";
 
 export interface GitHubPullRequestSearchBatch {
   readonly items: ReadonlyArray<GitHubPullRequestSearchItem>;
@@ -1862,10 +1864,15 @@ export const make = Effect.gen(function* () {
     );
 
   // Batch by host/credential; isolate missing PRs.
-  const summaryResolver = GraphQLResolver.aliased(client.PullRequestSummary, {
+  const unwindowedSummaryResolver = GraphQLResolver.aliased(client.PullRequestSummary, {
     batchKey: GitHubGraphQlClient.batchKey,
-  }).pipe(
+  });
+  const summaryResolver = unwindowedSummaryResolver.pipe(
     RequestResolver.setDelay(SUMMARY_BATCH_WINDOW),
+    RequestResolver.batchN(STAT_ALIASES_PER_REQUEST),
+  );
+  const scheduledPollSummaryResolver = unwindowedSummaryResolver.pipe(
+    RequestResolver.setDelay(SCHEDULED_POLL_SUMMARY_BATCH_WINDOW),
     RequestResolver.batchN(STAT_ALIASES_PER_REQUEST),
   );
   const getPullRequestSummary: GitHubPullRequestApi["Service"]["getPullRequestSummary"] = Effect.fn(
@@ -1879,9 +1886,10 @@ export const make = Effect.gen(function* () {
           operation: "getPullRequestSummary",
         });
       }
+      const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
       const result = yield* GraphQLResolver.request(
         { ...lookup, stacks: input.host.toLowerCase() === "github.com" },
-        summaryResolver,
+        scheduledPoll ? scheduledPollSummaryResolver : summaryResolver,
       );
       const pullRequest = result.repository?.pullRequest;
       if (pullRequest == null) {

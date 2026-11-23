@@ -2,6 +2,7 @@ import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwarene
 import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
+import { preserveFreshContext } from "./freshProviderContext.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -965,6 +966,16 @@ function attributePendingBackgroundTasks(
   };
 }
 
+// Upstream attributes pending background tasks to their run; the fork also keeps the
+// accepted fresh-context receipt (#27890) that a later snapshot can predate.
+function withPreviousProviderThread(
+  previous: OrchestrationV2ProviderThread | undefined,
+  next: OrchestrationV2ProviderThread,
+  runId: OrchestrationV2DomainEvent["runId"],
+): OrchestrationV2ProviderThread {
+  return preserveFreshContext(previous, attributePendingBackgroundTasks(next, previous, runId));
+}
+
 function upsertProviderTurn(
   turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
   next: OrchestrationV2ProviderTurn,
@@ -1173,9 +1184,9 @@ export function applyToProjection(
             : base.thread,
         providerThreads: upsertById(
           base.providerThreads,
-          attributePendingBackgroundTasks(
-            event.payload,
+          withPreviousProviderThread(
             base.providerThreads.find((thread) => thread.id === event.payload.id),
+            event.payload,
             event.runId,
           ),
         ),
@@ -2882,25 +2893,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "provider-thread.updated": {
-              const existingRows = (event.payload.pendingBackgroundTasks ?? []).some(
-                (task) => task.runId === undefined,
-              )
-                ? yield* sql<PayloadRow>`
-                    SELECT payload_json
-                    FROM orchestration_v2_projection_provider_threads
-                    WHERE provider_thread_id = ${event.payload.id}
-                    LIMIT 1
-                  `
-                : [];
-              const existing = existingRows[0];
+              // The fork always reads the saved row: its fresh-context receipt must survive too.
+              const existing = yield* sql<PayloadRow>`
+              SELECT payload_json FROM orchestration_v2_projection_provider_threads
+              WHERE provider_thread_id = ${event.payload.id}
+              LIMIT 1
+            `;
+              const previous =
+                existing[0] === undefined
+                  ? undefined
+                  : yield* decodeProviderThreadPayload(existing[0].payload_json);
               const payloadJson = yield* encodeProviderThreadPayload(
-                attributePendingBackgroundTasks(
-                  event.payload,
-                  existing === undefined
-                    ? undefined
-                    : yield* decodeProviderThreadPayload(existing.payload_json),
-                  event.runId,
-                ),
+                withPreviousProviderThread(previous, event.payload, event.runId),
               );
               const payload = parseEncodedPayload(payloadJson);
               yield* sql`

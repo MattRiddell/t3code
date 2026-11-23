@@ -1089,6 +1089,12 @@ export const layer: Layer.Layer<
       const tokenCap = yield* handoffTokenCapConfig.pipe(
         Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
       );
+      const freshBootstrapForThread = (loaded: OrchestrationV2ProviderThread) =>
+        providerThread.freshContext !== undefined &&
+        (providerThread.freshContext.acceptedNativeThreadId === undefined ||
+          providerThread.freshContext.acceptedNativeThreadId !== loaded.nativeThreadRef?.nativeId)
+          ? providerThread.freshContext.bootstrap
+          : "";
       const handoffContextForThread = (loadedProviderThread: OrchestrationV2ProviderThread) => {
         const measuredContext = latestNativeContextUsage(projection, providerThread);
         const previousSelection =
@@ -1235,7 +1241,9 @@ export const layer: Layer.Layer<
             return handoffBudget({
               tokenCap,
               modelContextWindow,
-              userText: restartNote === "" ? userText : `${restartNote}\n\n${userText}`,
+              userText: [freshBootstrapForThread(loadedProviderThread), restartNote, userText]
+                .filter(Boolean)
+                .join("\n\n"),
               attachments: providerMessage.attachments,
               providerThread: budgetProviderThread,
               nativeContextEstimate:
@@ -1316,7 +1324,10 @@ export const layer: Layer.Layer<
           const createdAt = yield* DateTime.now;
           const history = yield* projectionStore.getTurnStartHistory(input.threadId);
           const boundary = contextBoundaryOrdinal({ runs: projection.runs, turnItems: history });
-          const from = Math.max(1, boundary);
+          // A renewed native context (fork #27890) already holds runs through throughRunOrdinal.
+          const freshThrough = providerThread.freshContext?.throughRunOrdinal ?? 0;
+          const from = Math.max(1, boundary, freshThrough + 1);
+          const fromStart = boundary === 0 && providerThread.freshContext === undefined;
           const handoff = yield* contextHandoffService.prepareProviderHandoff({
             threadId: projection.thread.id,
             targetRunId: run.id,
@@ -1327,9 +1338,9 @@ export const layer: Layer.Layer<
             toProviderInstanceId: run.providerInstanceId,
             coveredRunOrdinals: { from, to: Math.max(from, run.ordinal - 1) },
             strategy: "full_thread_summary",
-            runs: projection.runs,
+            runs: projection.runs.filter((source) => source.ordinal > freshThrough),
             items: [
-              ...(boundary === 0
+              ...(fromStart
                 ? yield* ContextHandoffService.readInheritedHandoffItems(
                     projectionStore,
                     projection.thread,
@@ -1337,11 +1348,11 @@ export const layer: Layer.Layer<
                 : []),
               ...history.filter((item) =>
                 item.runId === null
-                  ? boundary === 0
+                  ? fromStart
                   : projection.runs.some(
                       (source) =>
                         source.id === item.runId &&
-                        source.ordinal >= boundary &&
+                        source.ordinal >= from &&
                         source.ordinal < run.ordinal &&
                         source.status !== "rolled_back",
                     ),
@@ -1793,6 +1804,11 @@ export const layer: Layer.Layer<
           });
           return undefined;
         }
+        if (
+          providerThread.freshContext !== undefined &&
+          run.ordinal <= providerThread.freshContext.throughRunOrdinal + 1
+        )
+          return replacement;
         const { handoff, transferId, createdAt } = yield* recoveryHandoff;
         const previousRun = projection.runs.findLast(
           (candidate) =>
@@ -1904,6 +1920,7 @@ export const layer: Layer.Layer<
       } = handoffContext;
       const retryHandoff = resumedRetryHandoff ?? (yield* prepareRetryHandoff(handoffContext));
       const carriesPendingContext =
+        providerThread.freshContext !== undefined ||
         effectiveHandoffs.length > 0 ||
         retryHandoff.handoffs.length > 0 ||
         retryHandoff.attachments.length > 0 ||
@@ -1936,6 +1953,7 @@ export const layer: Layer.Layer<
         providerSessionId,
         appThreadId: projection.thread.id,
         ownerNodeId: providerThread.ownerNodeId,
+        freshContext: providerThread.freshContext,
         firstRunOrdinal: providerThread.firstRunOrdinal ?? run.ordinal,
         lastRunOrdinal: run.ordinal,
         handoffIds:
@@ -2102,6 +2120,8 @@ export const layer: Layer.Layer<
       const retryHandoffIds = new Set(retryHandoff.handoffs.map((handoff) => handoff.id));
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
+          const freshBootstrap =
+            compact || goalCommand ? "" : freshBootstrapForThread(runningProviderThread);
           const delivery = yield* deliverContextHandoffs({
             handoffs: [...effectiveHandoffs, ...retryHandoff.handoffs],
             deferInline: compact || slashCommand,
@@ -2135,7 +2155,7 @@ export const layer: Layer.Layer<
             ),
             ...(sideChatContext === "" || sideChatHandoff === undefined ? [] : [sideChatHandoff]),
           ];
-          const context = [delivery.context, sideChatContext, restartNote]
+          const context = [freshBootstrap, delivery.context, sideChatContext, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
           const { restartContinuationOfRunId: _resumedRunId, ...promptedInput } = turnInput;
@@ -2195,6 +2215,36 @@ export const layer: Layer.Layer<
           yield* inlineDeliveryLock.withPermits(1)(
             Effect.gen(function* () {
               if (promptDroppedOnTerminal) return;
+              if (freshBootstrap !== "") {
+                yield* Effect.gen(function* () {
+                  const nativeId = runningProviderThread.nativeThreadRef?.nativeId;
+                  if (nativeId == null || runningProviderThread.freshContext === undefined) return;
+                  const acceptedAt = yield* DateTime.now;
+                  yield* eventSink.acceptFreshContext({
+                    id: yield* idAllocator.allocate.event({ threadId: input.threadId }),
+                    type: "provider-thread.updated",
+                    threadId: input.threadId,
+                    runId: run.id,
+                    providerInstanceId: run.providerInstanceId,
+                    occurredAt: acceptedAt,
+                    payload: {
+                      ...runningProviderThread,
+                      freshContext: {
+                        ...runningProviderThread.freshContext,
+                        acceptedNativeThreadId: nativeId,
+                      },
+                      updatedAt: acceptedAt,
+                    },
+                  });
+                }).pipe(
+                  Effect.catchCause(() =>
+                    Effect.logWarning("Failed to record accepted bootstrap", {
+                      runId: run.id,
+                      deliveryStatus: "pending",
+                    }),
+                  ),
+                );
+              }
               // After provider acceptance, failed delivery bookkeeping must not stop live ingestion.
               const nativeThreadId = runningProviderThread.nativeThreadRef?.nativeId;
               yield* Effect.forEach(

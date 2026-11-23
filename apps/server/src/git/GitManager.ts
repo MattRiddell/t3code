@@ -90,6 +90,11 @@ import { createdPullRequestKey } from "./linkCreatedPullRequest.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import { detachStackFrame } from "./detachStackFrame.ts";
+import {
+  IDLE_BACKGROUND_READ_MAX_AGE,
+  isBackgroundReadFresh,
+  isIdleBackgroundReadFresh,
+} from "./backgroundPullRequestPoll.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -174,6 +179,10 @@ export class GitManager extends Context.Service<
         readonly confirmTerminal?: boolean;
         /** Also accept a pull request merged inside a fork when the host searched upstream. */
         readonly includeHeadRepository?: boolean;
+        /** Nobody is watching this read, so it may reuse one up to the background age limit. */
+        readonly background?: boolean;
+        /** With background, the thread is idle: reuse a read across the idle window's ticks. */
+        readonly idle?: boolean;
       },
     ) => Effect.Effect<GitBranchPullRequest | null, GitManagerServiceError>;
     /** Whether T3 checked this pull request out onto the branch, which ties it to later threads. */
@@ -1479,16 +1488,17 @@ export const make = Effect.gen(function* () {
       return withActivePrLookupGitReads(
         cwd,
         Effect.gen(function* () {
+          const readAtMs = yield* Clock.currentTimeMillis;
           const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
           if (!lookup) {
-            return { latest: null, headContext };
+            return { latest: null, headContext, readAtMs };
           }
           if (
             details.localBranchExists &&
             (details.upstreamRef === null || headContext.remoteName === null) &&
             (yield* isUnpublishedBranch(cwd, headContext))
           ) {
-            return { latest: null, headContext };
+            return { latest: null, headContext, readAtMs };
           }
           const shared = yield* prLookupGitReads;
           if (isActivePrLookupGitReads(shared, cwd)) {
@@ -1496,7 +1506,7 @@ export const make = Effect.gen(function* () {
           }
           const latest = yield* findLatestPrForHeadContext(cwd, headContext, details.defaultBranch);
           if (latest !== null) yield* noteLookupState(latest);
-          return { latest, headContext };
+          return { latest, headContext, readAtMs };
         }),
       );
     },
@@ -1505,15 +1515,44 @@ export const make = Effect.gen(function* () {
       timeToLive: (exit, key) => {
         if (Exit.isSuccess(exit)) {
           prLookupFailureStreakByKey.delete(key);
-          return exit.value.latest?.state === "open"
-            ? PR_LOOKUP_CACHE_TTL
-            : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL;
+          // Held for the oldest reader, an idle thread's; getPrLookup applies each reader's own limit.
+          return IDLE_BACKGROUND_READ_MAX_AGE;
         }
         return nextPrLookupFailureTtl(key);
       },
     },
   );
-  const getPrLookup = (key: string) => detachStackFrame(Cache.get(prLookupCache, key));
+  const readPrLookup = (key: string) => detachStackFrame(Cache.get(prLookupCache, key));
+  const getPrLookup = (
+    key: string,
+    options?: { readonly background?: boolean; readonly idle?: boolean },
+  ) =>
+    readPrLookup(key).pipe(
+      Effect.flatMap((entry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (nowMs) => {
+          // Background readers share tick-aligned expiry so one sweep refills them in one document;
+          // idle threads share a window of several ticks, so most ticks read none of them.
+          const fresh =
+            options?.background === true
+              ? options.idle === true
+                ? isIdleBackgroundReadFresh(entry.readAtMs, nowMs)
+                : isBackgroundReadFresh(entry.readAtMs, nowMs)
+              : nowMs - entry.readAtMs <
+                Duration.toMillis(
+                  entry.latest?.state === "open"
+                    ? PR_LOOKUP_CACHE_TTL
+                    : PR_LOOKUP_NO_OPEN_PR_CACHE_TTL,
+                );
+          if (fresh) return Effect.succeed(entry);
+          // Only this stale read: concurrent readers must join a lookup already replacing it.
+          return Cache.invalidateWhen(
+            prLookupCache,
+            key,
+            (current) => current.readAtMs === entry.readAtMs,
+          ).pipe(Effect.andThen(readPrLookup(key)));
+        }),
+      ),
+    );
   interface LastKnownPr {
     readonly pr: ReturnType<typeof toStatusPr> | null;
     readonly headSha: string | null;
@@ -3309,6 +3348,8 @@ export const make = Effect.gen(function* () {
       readonly refresh: boolean;
       readonly freshGitState: boolean;
       readonly includeHeadRepository?: boolean | undefined;
+      readonly background: boolean;
+      readonly idle: boolean;
     },
   ) {
     const remember = <E>(key: string, read: Effect.Effect<string | null, E>) =>
@@ -3400,7 +3441,10 @@ export const make = Effect.gen(function* () {
       );
       if (Option.isSome(cached)) yield* Cache.invalidate(prLookupCache, cacheKey);
     }
-    let cached = yield* getPrLookup(cacheKey);
+    let cached = yield* getPrLookup(cacheKey, {
+      background: options.background,
+      idle: options.idle,
+    });
     // Lookup may use a fork instead of the saved upstream; verify the remote actually queried.
     const identityRemoteName = (headContext: BranchHeadContext) =>
       headContext.remoteName ?? remoteName ?? undefined;
@@ -3480,10 +3524,14 @@ export const make = Effect.gen(function* () {
     const cacheCwd = yield* normalizeStatusCacheKey(cwd);
     const refresh = options?.refresh === true;
     const freshGitState = refresh || options?.freshGitState === true;
+    const background = options?.background === true;
+    const idle = background && options?.idle === true;
     const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
       refresh,
       freshGitState,
       includeHeadRepository: options?.includeHeadRepository,
+      background,
+      idle,
     });
     if (
       pullRequest === null ||
@@ -3512,6 +3560,8 @@ export const make = Effect.gen(function* () {
       refresh: false,
       freshGitState: true,
       includeHeadRepository: options?.includeHeadRepository,
+      background,
+      idle,
     });
     settledPrLookupByBranchKey.delete(settledKey);
     if (confirmed !== null && confirmed.state !== "open") {

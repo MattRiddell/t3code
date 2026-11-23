@@ -14,6 +14,7 @@ import {
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -28,6 +29,7 @@ import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import { isIdleThread } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -51,6 +53,8 @@ export interface SettlementPullRequest {
   readonly closedAt?: string | null;
   readonly mergedAt?: string | null;
 }
+
+const SETTLEMENT_LOOKUP_CONCURRENCY = 25;
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
@@ -566,6 +570,11 @@ export const make = Effect.gen(function* () {
       });
     });
 
+    const scheduledSettlementRead = Effect.provideService(
+      SourceControlRateLimit.ScheduledPoll,
+      true,
+    );
+
     const pullRequestFor = Effect.fnUntraced(function* (
       group: ReadonlyArray<(typeof lookupCandidates)[number]>,
     ) {
@@ -588,6 +597,11 @@ export const make = Effect.gen(function* () {
         if (!matchesMerge && !projects.has(reference.projectId)) {
           return yield* Effect.die(new Error("linked pull request project not found"));
         }
+        const pullRequestRef = {
+          projectId: reference.projectId,
+          repository: reference.repository,
+          number: reference.number,
+        };
         const readKey = quietReadKey(reference);
         const shellClosed =
           group.filter((member) => shellClosedThreads.delete(member.id)).length > 0;
@@ -595,20 +609,34 @@ export const make = Effect.gen(function* () {
         else if (!matchesMerge && quietOpenReadAt.has(readKey)) {
           return { state: "open", closedAt: null, mergedAt: null } satisfies SettlementPullRequest;
         }
-        const summary = matchesMerge
+        const reading = matchesMerge
           ? ({
               state: "merged",
               closedAt: null,
               mergedAt: mergedPullRequest.mergedAt,
             } satisfies SettlementPullRequest)
-          : yield* pullRequests.summary(
-              {
-                projectId: reference.projectId,
-                repository: reference.repository,
-                number: reference.number,
-              },
-              { recoverTransientFailure: false, bypassCache: shellClosed },
-            );
+          : shellClosed
+            ? yield* pullRequests.summary(pullRequestRef, {
+                recoverTransientFailure: false,
+                bypassCache: true,
+              })
+            : yield* scheduledSettlementRead(
+                pullRequests.summary(pullRequestRef, {
+                  recoverTransientFailure: false,
+                  background: true,
+                }),
+              );
+        // A closed pull request can reopen, so a held closed state is confirmed before it settles.
+        const summary =
+          !shellClosed &&
+          reading.state === "closed" &&
+          (yield* wouldSettle(group, {
+            state: reading.state,
+            closedAt: reading.closedAt ?? null,
+            mergedAt: reading.mergedAt ?? null,
+          }))
+            ? yield* pullRequests.summary(pullRequestRef, { recoverTransientFailure: false })
+            : reading;
         if (
           "updatedAt" in summary &&
           summary.state === "open" &&
@@ -651,12 +679,24 @@ export const make = Effect.gen(function* () {
       if (scheduledLookups !== null && !refresh && !hasDeferred && !scheduledLookups.has(key)) {
         return undefined;
       }
+      // A branch whose threads are all idle shares a several-tick window, so most ticks' documents
+      // carry only the branches someone is working on.
+      const idle = group.every((member) => isIdleThread(member, nowMs));
       // Remembered git state is enough to rule a thread out; only an answer
       // that would settle it is confirmed against fresh git state.
-      const remembered = yield* git.branchPullRequest(
-        { cwd, branch: thread.branch },
-        { refresh, confirmTerminal: false },
-      );
+      const remembered = refresh
+        ? yield* git.branchPullRequest(
+            { cwd, branch: thread.branch },
+            { refresh, confirmTerminal: false },
+          )
+        : yield* scheduledSettlementRead(
+            git.branchPullRequest(
+              { cwd, branch: thread.branch },
+              idle
+                ? { confirmTerminal: false, background: true, idle: true }
+                : { confirmTerminal: false, background: true },
+            ),
+          );
       noPullRequestRechecks.record(key, nowMs, remembered !== null);
       if (refresh || remembered === null || remembered.state === "open") {
         return ownedByAnotherThread(remembered) ? undefined : remembered;
@@ -668,10 +708,10 @@ export const make = Effect.gen(function* () {
       ) {
         return undefined;
       }
-      const fresh = yield* git.branchPullRequest(
+      const fresh = yield* scheduledSettlementRead(git.branchPullRequest(
         { cwd, branch: thread.branch },
-        { freshGitState: true },
-      );
+        remembered.state === "closed" ? { refresh: true } : { freshGitState: true },
+      ));
       return ownedByAnotherThread(fresh) ? undefined : fresh;
     });
 
@@ -730,7 +770,9 @@ export const make = Effect.gen(function* () {
               }).pipe(Effect.andThen(settleDeferred(group))),
           ),
         ),
-      { concurrency: 8, discard: true },
+      // Match the scheduled GitHub resolver's 25-alias document limit. A smaller
+      // worker pool waits for partially filled documents before queuing more reads.
+      { concurrency: SETTLEMENT_LOOKUP_CONCURRENCY, discard: true },
     );
     if (threadId === undefined) noPullRequestRechecks.retain(groups);
   });

@@ -15,6 +15,16 @@ Link each PR you create, take over, or push to: link_pull_request, or link_pull_
 If available, call link_issue for each issue you take on or file, even via CLI; skip issues you only read.
 </pull_request_linking>`;
 
+const TOOL_CALL_BATCHING_INSTRUCTIONS = `<tool_call_batching>
+When several independent read-only shell commands are already known, prefer one shell tool call that runs them sequentially.
+For example, read two known source files in one call instead of starting one shell tool call per file.
+Keep each command's output identifiable and check each exit status; report failures even when a later command succeeds.
+Use separate calls when an earlier result determines the next command, or when output needs inspection before continuing.
+Keep mutations, approval requests, and commands with different permissions in separate calls.
+Follow the user's instructions and tool safety requirements when they require separate calls.
+Batching reduces shell tool calls; starting one subprocess per command still incurs those process starts.
+</tool_call_batching>`;
+
 /** Omit model and effort when the harness manages them dynamically. */
 export function buildRuntimeInstructions(runtime: {
   readonly harness: string;
@@ -44,7 +54,7 @@ export function buildRuntimeInstructions(runtime: {
     runtime.pullRequestLinking === false
       ? runtimeInfo
       : `${runtimeInfo}\n\n${PULL_REQUEST_LINKING_INSTRUCTIONS}`;
-  return [linked + feedback, ...(workspace === "" ? [] : [workspace])].join("\n\n");
+  return [linked + feedback, TOOL_CALL_BATCHING_INSTRUCTIONS, ...(workspace === "" ? [] : [workspace])].join("\n\n");
 }
 
 function toSingleLine(value: string): string {

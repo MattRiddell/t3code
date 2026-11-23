@@ -1,5 +1,6 @@
 import {
   CommandId,
+  type OrchestrationV2Command,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
@@ -39,6 +40,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { prepareFreshProviderThread } from "./freshProviderContext.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -91,6 +93,15 @@ const projectedThreadIds = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =
   );
 
 export interface EventSinkV2Shape {
+  readonly acceptFreshContext: (
+    event: Extract<OrchestrationV2DomainEvent, { type: "provider-thread.updated" }>,
+  ) => Effect.Effect<
+    {
+      readonly committed: boolean;
+      readonly storedEvents: ReadonlyArray<OrchestrationV2StoredEvent>;
+    },
+    EventSinkV2Error
+  >;
   /** Items that are not provider snapshots, such as a consumer's own control items, never batch. */
   readonly consumeProviderEvents: <A extends { readonly type: string }, E, R, E2, R2>(
     source: Stream.Stream<A, E, R>,
@@ -211,6 +222,11 @@ export interface EventSinkV2Shape {
     readonly acceptedAt: DateTime.Utc;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
+    /** Recheck renewal safety against ingestion in the same transaction as its events. */
+    readonly freshProviderRenewal?: Extract<
+      OrchestrationV2Command,
+      { type: "provider-session.renew" }
+    >;
     readonly cancelUnsettledEffects?: {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
@@ -769,6 +785,55 @@ const layerBase: Layer.Layer<
       );
     });
 
+    const acceptFreshContextEffect = Effect.fn("orchestrationV2.EventSink.acceptFreshContext")(
+      function* (event: Parameters<EventSinkV2Shape["acceptFreshContext"]>[0]) {
+        return yield* commitThenPublish(
+          projectedThreadIds([event]),
+          Effect.gen(function* () {
+            const records = yield* projectionStore.getThreadRecords(event.threadId, [
+              "providerThreads",
+            ]);
+            const current = records.providerThreads.find((row) => row.id === event.payload.id);
+            const accepted = event.payload.freshContext;
+            const nativeId = event.payload.nativeThreadRef?.nativeId;
+            if (
+              nativeId == null ||
+              accepted?.acceptedNativeThreadId !== nativeId ||
+              current?.nativeThreadRef?.nativeId !== nativeId ||
+              current.freshContext?.bootstrap !== accepted.bootstrap ||
+              current.freshContext.throughRunOrdinal !== accepted.throughRunOrdinal ||
+              current.freshContext.acceptedNativeThreadId === nativeId
+            ) {
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
+            }
+            // Read and merge under the transaction so ingestion cannot invalidate
+            // acceptance by changing unrelated provider-thread fields.
+            const storedEvents = yield* eventStore.append({
+              events: [
+                {
+                  ...event,
+                  payload: {
+                    ...current,
+                    freshContext: { ...current.freshContext, acceptedNativeThreadId: nativeId },
+                    updatedAt: event.occurredAt,
+                  },
+                },
+              ],
+            });
+            const outcomes = yield* applyStoredEvents(storedEvents);
+            return { committed: true as const, storedEvents, outcomes };
+          }),
+          (result) =>
+            result.committed
+              ? publishStoredEvents(result.storedEvents, result.outcomes)
+              : Effect.void,
+        );
+      },
+    );
+
     const existingCommandResult =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(function* (commandId: CommandId) {
@@ -837,11 +902,58 @@ const layerBase: Layer.Layer<
             }
           }
 
+          let events = input.events;
+          if (input.freshProviderRenewal !== undefined) {
+            const records = yield* projectionStore.getThreadRecords(input.threadId, [
+              "providerThreads",
+              "runs",
+              "providerTurns",
+              "runtimeRequests",
+              "subagents",
+              "turnItems",
+            ]);
+            const prepared = prepareFreshProviderThread(
+              records,
+              input.freshProviderRenewal,
+              input.acceptedAt,
+            );
+            if (typeof prepared === "string") {
+              const receipt: CommandReceiptStore.CommandReceiptV2 = {
+                commandId: input.commandId,
+                threadId: input.threadId,
+                commandType: input.commandType,
+                acceptedAt: input.acceptedAt,
+                resultSequence: yield* eventStore.latestSequence({ threadId: input.threadId }),
+                status: "rejected",
+                error: prepared,
+              };
+              yield* commandReceipts.upsert(receipt);
+              return {
+                receipt,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+                committed: false as const,
+                cancelledEffectIds: [],
+              };
+            }
+            // Ingestion does not take the command lock. Rebuild from the current
+            // row so even an unrelated adapter update keeps all of its fields.
+            events = events.map((event) =>
+              event.type !== "provider-thread.updated"
+                ? event
+                : {
+                    ...event,
+                    payload:
+                      event.payload.id === prepared.previous.id
+                        ? prepared.previous
+                        : prepared.fresh,
+                  },
+            );
+          }
           const runId = input.updateDelegatedCompletionOnlyRunId;
           const normalized = yield* normalizeEvents(
             runId === undefined
-              ? input.events
-              : yield* updateDelegatedCompletionOnly(input.events, (id) => id === runId),
+              ? events
+              : yield* updateDelegatedCompletionOnly(events, (id) => id === runId),
           );
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,
@@ -1227,6 +1339,10 @@ const layerBase: Layer.Layer<
                 cause,
               }),
           ),
+        ),
+      acceptFreshContext: (event) =>
+        acceptFreshContextEffect(event).pipe(
+          Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 1, cause })),
         ),
       writeIfProviderThreadUnchanged: (input) =>
         writeIfProviderThreadUnchangedEffect(input).pipe(

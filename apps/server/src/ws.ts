@@ -2907,7 +2907,9 @@ export const layerWsRpc = (
             Effect.tap(() =>
               resolvePullRequestSyncKey(input).pipe(
                 Effect.flatMap((key) =>
-                  key === null ? Effect.void : pullRequestSync.requestSync(key),
+                  key === null
+                    ? Effect.void
+                    : pullRequestSync.requestSync(key, { immediate: true }),
                 ),
               ),
             ),
@@ -2936,7 +2938,9 @@ export const layerWsRpc = (
                   ? Effect.void
                   : resolvePullRequestSyncKey(input.reference).pipe(
                       Effect.flatMap((key) =>
-                        key === null ? Effect.void : pullRequestSync.requestSync(key),
+                        key === null
+                          ? Effect.void
+                          : pullRequestSync.requestSync(key, { immediate: true }),
                       ),
                     ),
               ),

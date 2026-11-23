@@ -504,6 +504,8 @@ const HEAD_LOOKUPS_PER_DOCUMENT = 50;
 /** Git reads stagger background lookups by ~300ms; gather batches before spending quota. */
 const HEAD_LOOKUP_BATCH_WINDOW = "50 millis";
 const BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW = "500 millis";
+/** A poll's git reads take seconds across a sweep; one window keeps the sweep in one document. */
+const SCHEDULED_POLL_HEAD_LOOKUP_BATCH_WINDOW = "5 seconds";
 /** For heads matching 100 PRs each, 50 lookups approached GitHub's ~10s limit; 25 took ~7s. */
 const BACKGROUND_HEAD_LOOKUPS_PER_DOCUMENT = 25;
 const HEAD_LOOKUP_MAX_RESPONSE_BYTES = 16_000_000;
@@ -647,6 +649,10 @@ export const make = Effect.gen(function* () {
     RequestResolver.batchN(BACKGROUND_HEAD_LOOKUPS_PER_DOCUMENT),
     RequestResolver.setDelay(BACKGROUND_HEAD_LOOKUP_BATCH_WINDOW),
   );
+  const scheduledPollHeadResolver = headResolver.pipe(
+    RequestResolver.batchN(BACKGROUND_HEAD_LOOKUPS_PER_DOCUMENT),
+    RequestResolver.setDelay(SCHEDULED_POLL_HEAD_LOOKUP_BATCH_WINDOW),
+  );
 
   const listByHead = Effect.fn("GitHubSourceControlProvider.listByHead")(function* (input: {
     readonly cwd: string;
@@ -695,6 +701,7 @@ export const make = Effect.gen(function* () {
         .filter((row) => input.state === "all" || row.state === input.state)
         .slice(0, limit);
     }
+    const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
     const result = yield* graphqlRead(
       {
         host: locator.host,
@@ -712,7 +719,11 @@ export const make = Effect.gen(function* () {
           states: GRAPHQL_STATES[input.state],
           first: limit,
         },
-        input.allowReserve ? interactiveHeadResolver : backgroundHeadResolver,
+        input.allowReserve
+          ? interactiveHeadResolver
+          : scheduledPoll
+            ? scheduledPollHeadResolver
+            : backgroundHeadResolver,
       ),
     );
     if (result.repository === null) return yield* notFound("The repository could not be read.");

@@ -26,6 +26,7 @@ import {
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1852,6 +1853,152 @@ describe("ThreadSettlementServiceV2 worker", () => {
           yield* reactor.drain;
         }).pipe(Effect.provide(fixture.layer));
       }),
+  );
+
+  // Linked pull requests only: upstream v0.1.10 reads at most four unlinked no-PR branches
+  // per scheduled sweep (noPullRequestRechecks), so they never fill a document.
+  it.effect.each(["linked"] as const)(
+    "fills one bounded GraphQL document before waiting for %s settlement lookups",
+    (kind) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const releaseReads = yield* Deferred.make<void>();
+          const reads = yield* Ref.make(0);
+          const recordRead = Ref.update(reads, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.await(releaseReads)),
+          );
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot(
+              Array.from({ length: 26 }, (_, index) =>
+                makeThread(`batch-${index}`, {
+                  branch: `feature-${index}`,
+                  latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+                  ...(kind === "linked"
+                    ? {
+                        linkedPullRequest: {
+                          projectId: PROJECT_ID,
+                          repository: "owner/repository",
+                          number: index + 1,
+                          url: `https://example.test/owner/repository/pull/${index + 1}`,
+                        },
+                      }
+                    : {}),
+                }),
+              ),
+            ),
+            branchPullRequest: () => recordRead.pipe(Effect.as(makeBranchPullRequest("open"))),
+            pullRequestSummary: (input) =>
+              recordRead.pipe(Effect.as(makePullRequestSummary({ ...input, state: "open" }))),
+          });
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* service.start();
+            yield* Deferred.succeed(fixture.activation, undefined);
+            yield* Queue.take(fixture.snapshotReads);
+            yield* TestClock.adjust("1 second");
+            // The resolver accepts 25 aliases. Eight slots fragment a single document;
+            // unbounded concurrency would also start the twenty-sixth lookup here.
+            expect(yield* Ref.get(reads)).toBe(25);
+            yield* Deferred.succeed(releaseReads, undefined);
+            yield* service.drain;
+            expect(yield* Ref.get(reads)).toBe(26);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
+
+  // A thread worked on in the last two hours reads in the tick's window; an idle one shares the
+  // idle window across ticks. MUST-SAY-NO twin: the active thread is not marked idle.
+  it.effect.each([
+    { activity: "2026-08-27T00:00:00.000Z", lookupOptions: { background: true, idle: true } },
+    { activity: "2026-08-28T11:30:00.000Z", lookupOptions: { background: true } },
+  ])(
+    "sweeps an unlinked branch last active $activity on the background read, in its window",
+    ({ activity, lookupOptions }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const reads = yield* Ref.make<ReadonlyArray<unknown>>([]);
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([
+              makeThread("unlinked", {
+                branch: "feature",
+                latestUserMessageAt: DateTime.makeUnsafe(activity),
+              }),
+            ]),
+            branchPullRequest: (_input, lookupOptions) =>
+              Effect.gen(function* () {
+                const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
+                yield* Ref.update(reads, (seen) => [...seen, { lookupOptions, scheduledPoll }]);
+                return makeBranchPullRequest("open");
+              }),
+          });
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            expect(yield* Ref.get(reads)).toEqual([
+              { lookupOptions: { confirmTerminal: false, ...lookupOptions }, scheduledPoll: true },
+            ]);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
+
+  it.effect.each([
+    { fresh: "open", settles: false },
+    { fresh: "closed", settles: true },
+  ] as const)(
+    "confirms a held closed pull request before settling (fresh=$fresh)",
+    ({ fresh, settles }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const reads = yield* Ref.make<
+            ReadonlyArray<{ background: boolean | undefined; scheduledPoll: boolean }>
+          >([]);
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([
+              makeThread("held-closed", {
+                latestUserMessageAt: DateTime.makeUnsafe("2026-08-27T00:00:00.000Z"),
+                linkedPullRequest: {
+                  projectId: PROJECT_ID,
+                  repository: "owner/repository",
+                  number: 42,
+                  url: "https://example.test/owner/repository/pull/42",
+                },
+              }),
+            ]),
+            pullRequestSummary: (input, readOptions) =>
+              Effect.gen(function* () {
+                const scheduledPoll = yield* SourceControlRateLimit.ScheduledPoll;
+                yield* Ref.update(reads, (seen) => [
+                  ...seen,
+                  { background: readOptions?.background, scheduledPoll },
+                ]);
+                return {
+                  ...makePullRequestSummary({
+                    ...input,
+                    state: readOptions?.background === true ? "closed" : fresh,
+                  }),
+                  closedAt: "2026-08-28T00:00:00.000Z",
+                };
+              }),
+          });
+
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            expect(yield* Ref.get(reads)).toEqual([
+              { background: true, scheduledPoll: true },
+              { background: undefined, scheduledPoll: true },
+            ]);
+            expect(yield* Ref.get(fixture.commands)).toHaveLength(settles ? 1 : 0);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
   );
 
   it.effect("reads a quiet open branch pull request every 5 minutes", () =>

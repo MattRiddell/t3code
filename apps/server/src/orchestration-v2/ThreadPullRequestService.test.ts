@@ -12,6 +12,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -22,7 +23,10 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
+
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
@@ -88,44 +92,84 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     };
   };
 
-  it.effect("does not sweep branch pull requests while no client is connected", () =>
+  const project: OrchestrationProjectShell = {
+    id: ProjectId.make("project-1"),
+    title: "Project",
+    workspaceRoot: "/workspace/project",
+    defaultModelSelection: null,
+    scripts: [],
+    createdAt: "2026-08-01T00:00:00.000Z",
+    updatedAt: "2026-08-01T00:00:00.000Z",
+  };
+
+  const branchThread = (id: string, branch: string): OrchestrationV2ThreadShell => ({
+    ...threadShell(id),
+    branch,
+  });
+
+  interface LookupRecord {
+    readonly branch: string;
+    readonly refresh: boolean;
+    readonly background: boolean;
+    readonly idle?: true;
+    readonly scheduled: boolean;
+  }
+
+  const runDiscovery = (options: {
+    readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
+    readonly viewedCwd?: string;
+    readonly clientConnected: boolean;
+    readonly scenario: (harness: {
+      readonly service: Effect.Success<typeof ThreadPullRequestService.make>;
+      readonly lookups: Array<LookupRecord>;
+      readonly offer: (event: OrchestrationV2DomainEvent) => Effect.Effect<void>;
+      readonly settle: Effect.Effect<void>;
+      readonly lookup: Effect.Effect<void>;
+      readonly reachPoll: Effect.Effect<void>;
+    }) => Effect.Effect<void>;
+  }) =>
     Effect.gen(function* () {
-      // Polling active branches without a connected client wastes GitHub requests.
-      const thread = { ...threadShell("idle-branch-thread"), branch: "feature/idle" };
-      const project: OrchestrationProjectShell = {
-        id: thread.projectId,
-        title: "Project",
-        workspaceRoot: "/workspace/project",
-        defaultModelSelection: null,
-        scripts: [],
-        createdAt: "2026-08-01T00:00:00.000Z",
-        updatedAt: "2026-08-01T00:00:00.000Z",
-      };
       const activation = yield* Deferred.make<void>();
       const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
-      const turnLookup = yield* Deferred.make<void>();
-      const lookups: Array<{ readonly refresh: boolean }> = [];
+      const scopeChecks = yield* Queue.unbounded<void>();
+      const startupSweep = yield* Deferred.make<void>();
+      const pollLookup = yield* Queue.unbounded<void>();
+      const lookups: Array<LookupRecord> = [];
       const dependencies = Layer.mergeAll(
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(domainEvents),
-          getPullRequestSnapshot: () =>
-            Effect.succeed({
-              schemaVersion: 2,
-              snapshotSequence: 1,
-              threads: [thread],
-              archivedThreads: [],
-            }),
+          getPullRequestSnapshot: ({ threadId }) =>
+            threadId !== undefined
+              ? Effect.succeed({
+                  snapshotSequence: 1,
+                  threads: options.threads.filter((thread) => thread.id === threadId),
+                })
+              : Deferred.succeed(startupSweep, undefined).pipe(
+                  Effect.as({
+                    schemaVersion: 2 as const,
+                    snapshotSequence: 1,
+                    threads: [...options.threads],
+                    archivedThreads: [],
+                  }),
+                ),
+          getThreadShell: (threadId) =>
+            Effect.succeed(options.threads.find((thread) => thread.id === threadId) ?? null),
         }),
         Layer.mock(ProjectStore.ProjectStoreV2)({
           listShells: () => Effect.succeed([project]),
           getShell: () => Effect.succeedSome(project),
         }),
         Layer.mock(GitManager.GitManager)({
-          branchPullRequest: (_input, options) =>
+          branchPullRequest: (input, lookupOptions) =>
             Effect.gen(function* () {
-              const refresh = options?.refresh ?? false;
-              lookups.push({ refresh });
-              if (refresh) yield* Deferred.succeed(turnLookup, undefined);
+              lookups.push({
+                branch: input.branch,
+                refresh: lookupOptions?.refresh ?? false,
+                background: lookupOptions?.background ?? false,
+                ...(lookupOptions?.idle === true ? { idle: true as const } : {}),
+                scheduled: yield* SourceControlRateLimit.ScheduledPoll,
+              });
+              yield* Queue.offer(pollLookup, undefined);
               return null;
             }),
         }),
@@ -146,10 +190,12 @@ describe("ThreadPullRequestServiceV2 reads", () => {
               name: "project",
             }),
         }),
-        // No client holds an activity lease.
         Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-          shouldRunScopeWork: () => Effect.succeed(false),
-          shouldRunOpportunisticWork: Effect.succeed(false),
+          shouldRunScopeWork: (scope) =>
+            Queue.offer(scopeChecks, undefined).pipe(
+              Effect.as(scope.type === "vcs-status" && scope.cwd === options.viewedCwd),
+            ),
+          shouldRunOpportunisticWork: Effect.succeed(options.clientConnected),
         }),
         Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
         Layer.succeed(
@@ -163,23 +209,175 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const service = yield* ThreadPullRequestService.make;
         yield* service.start();
         yield* Deferred.succeed(activation, undefined);
-
-        // A finished turn still discovers the pull request for its branch.
-        yield* Queue.offer(domainEvents, {
-          type: "checkpoint.captured",
-          threadId: thread.id,
-        } as OrchestrationV2DomainEvent);
-        yield* Deferred.await(turnLookup);
+        yield* Deferred.await(startupSweep);
         yield* service.drain;
-        const lookupsBeforeIdle = lookups.length;
-
-        yield* TestClock.adjust("10 minutes");
-        yield* service.drain;
-
-        expect(lookups.slice(lookupsBeforeIdle)).toEqual([]);
+        yield* Queue.clear(pollLookup);
+        lookups.length = 0;
+        yield* options.scenario({
+          service,
+          lookups,
+          offer: (event) => Queue.offer(domainEvents, event).pipe(Effect.asVoid),
+          // The policy check is the first thing a thread's activity does.
+          settle: Queue.take(scopeChecks).pipe(Effect.andThen(service.drain)),
+          // A read that skips the policy check, such as a metadata event's.
+          lookup: Queue.take(pollLookup).pipe(Effect.andThen(service.drain)),
+          reachPoll: TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL).pipe(
+            Effect.andThen(Queue.take(pollLookup)),
+            Effect.andThen(service.drain),
+          ),
+        });
       }).pipe(Effect.provide(dependencies));
-    }),
+    }).pipe(Effect.scoped);
+
+  const checkpointCaptured = (thread: OrchestrationV2ThreadShell) =>
+    ({ type: "checkpoint.captured", threadId: thread.id }) as OrchestrationV2DomainEvent;
+
+  it.effect(
+    "holds a hidden thread's turn for the poll, and sweeps nothing without a client",
+    () => {
+      const thread = branchThread("idle-branch-thread", "feature/idle");
+      return runDiscovery({
+        threads: [thread],
+        clientConnected: false,
+        scenario: ({ lookups, offer, settle, reachPoll, service }) =>
+          Effect.gen(function* () {
+            yield* offer(checkpointCaptured(thread));
+            yield* settle;
+            expect(lookups).toEqual([]);
+
+            // A finished turn still discovers the pull request for its branch, unwatched.
+            yield* reachPoll;
+            expect(lookups).toEqual([
+              { branch: "feature/idle", refresh: true, background: false, scheduled: true },
+            ]);
+
+            // Polling active branches without a connected client wastes GitHub requests.
+            yield* TestClock.adjust("20 minutes");
+            yield* service.drain;
+            expect(lookups).toHaveLength(1);
+          }),
+      });
+    },
   );
+
+  it.effect("refreshes a viewed thread's turn at once, outside the poll", () => {
+    const thread = branchThread("viewed-thread", "feature/viewed");
+    return runDiscovery({
+      threads: [thread],
+      viewedCwd: project.workspaceRoot,
+      clientConnected: true,
+      scenario: ({ lookups, offer, settle }) =>
+        Effect.gen(function* () {
+          yield* offer(checkpointCaptured(thread));
+          yield* settle;
+          expect(lookups).toEqual([
+            { branch: "feature/viewed", refresh: true, background: false, scheduled: false },
+          ]);
+        }),
+    });
+  });
+
+  it.effect("reads a branch once for every hidden thread waiting on it", () => {
+    const first = branchThread("first", "feature/shared");
+    const second = branchThread("second", "feature/shared");
+    const swept = branchThread("swept", "feature/shared");
+    const other = branchThread("other", "feature/other");
+    return runDiscovery({
+      threads: [first, second, swept, other],
+      clientConnected: true,
+      scenario: ({ lookups, offer, settle, reachPoll, service }) =>
+        Effect.gen(function* () {
+          yield* offer(checkpointCaptured(first));
+          yield* settle;
+          yield* offer(checkpointCaptured(second));
+          yield* settle;
+          expect(lookups).toEqual([]);
+
+          yield* reachPoll;
+          yield* service.drain;
+          const byRead = (read: (lookup: LookupRecord) => boolean) =>
+            lookups.filter(read).map((lookup) => lookup.branch);
+          // The owed refresh is the poll's one host read for the shared branch. Upstream's
+          // 30-minute no-PR recheck (v0.1.10) keeps the sweep off branches it read at startup,
+          // so feature/other waits for its recheck.
+          expect(byRead((lookup) => lookup.refresh)).toEqual(["feature/shared"]);
+          expect(byRead((lookup) => lookup.scheduled)).toEqual(["feature/shared"]);
+          // The rest of the shared branch reads what its reader cached: second, by id.
+          expect(byRead((lookup) => !lookup.refresh && !lookup.scheduled)).toEqual([
+            "feature/shared",
+          ]);
+        }),
+    });
+  });
+
+  // The client-lease sweep read every branch fresh each tick, apart from the settlement sweep's
+  // background reads of the same branches.
+  it.effect("sweeps on the background read, an idle thread's branch in the idle window", () => {
+    const active = branchThread("active", "feature/active");
+    const idle = {
+      ...branchThread("idle", "feature/idle"),
+      createdAt: DateTime.subtract(NOW, { hours: 3 }),
+      updatedAt: DateTime.subtract(NOW, { hours: 3 }),
+    };
+    return TestClock.setTime(DateTime.toEpochMillis(NOW)).pipe(
+      Effect.andThen(
+        runDiscovery({
+          threads: [active, idle],
+          clientConnected: true,
+          scenario: ({ lookups, reachPoll, service }) =>
+            Effect.gen(function* () {
+              // Upstream's 30-minute no-PR recheck (v0.1.10) keeps the sweeps off branches the
+              // startup sweep read, so the first poll that reads them again is the fourth.
+              yield* TestClock.adjust(
+                Duration.millis(Duration.toMillis(BACKGROUND_PULL_REQUEST_POLL_INTERVAL) * 3),
+              );
+              yield* service.drain;
+              expect(lookups).toEqual([]);
+              yield* reachPoll;
+              yield* service.drain;
+              // MUST-SAY-NO: neither sweep read is a fresh foreground read, and the thread
+              // created ten minutes ago is not idle.
+              expect(lookups.toSorted((a, b) => a.branch.localeCompare(b.branch))).toEqual([
+                { branch: "feature/active", refresh: false, background: true, scheduled: true },
+                {
+                  branch: "feature/idle",
+                  refresh: false,
+                  background: true,
+                  idle: true,
+                  scheduled: true,
+                },
+              ]);
+            }),
+        }),
+      ),
+    );
+  });
+
+  it.effect("lets a metadata event reuse a recent read, unlike a finished turn", () => {
+    const thread = branchThread("renamed-thread", "feature/renamed");
+    return runDiscovery({
+      threads: [thread],
+      viewedCwd: project.workspaceRoot,
+      clientConnected: true,
+      scenario: ({ lookups, offer, settle, lookup, service }) =>
+        Effect.gen(function* () {
+          yield* offer({
+            type: "thread.metadata-updated",
+            threadId: thread.id,
+            payload: thread,
+          } as unknown as OrchestrationV2DomainEvent);
+          // Let the metadata read finish first; queued together, the turn end would absorb it.
+          yield* lookup;
+          yield* offer(checkpointCaptured(thread));
+          yield* settle;
+          yield* service.drain;
+          expect(lookups).toEqual([
+            { branch: "feature/renamed", refresh: false, background: true, scheduled: false },
+            { branch: "feature/renamed", refresh: true, background: false, scheduled: false },
+          ]);
+        }),
+    });
+  });
 
   it.effect("refreshes linked-thread readers at most every 10s while activity reorders them", () =>
     Effect.gen(function* () {
@@ -318,6 +516,11 @@ describe("ThreadPullRequestServiceV2 reads", () => {
               ),
               archivedThreads: [],
             }),
+          // A finished turn's refresh reads the thread's placement first.
+          getThreadShell: (threadId) =>
+            Effect.succeed(
+              [thread, otherThread].find((candidate) => candidate.id === threadId) ?? null,
+            ),
         }),
         Layer.mock(ProjectStore.ProjectStoreV2)({
           listShells: () => Effect.succeed([project]),
@@ -358,7 +561,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
             }),
         }),
         Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-          shouldRunScopeWork: () => Effect.succeed(false),
+          shouldRunScopeWork: () => Effect.succeed(true),
           shouldRunOpportunisticWork: Effect.succeed(false),
         }),
         Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
@@ -719,6 +922,9 @@ describe("ThreadPullRequestServiceV2 reads", () => {
                     archivedThreads: [],
                   }),
                 ),
+          // The fork's activity refresh (#29552) places a thread from its shell.
+          getThreadShell: (threadId) =>
+            Effect.succeed([parent, child].find((thread) => thread.id === threadId) ?? null),
         }),
         Layer.mock(ProjectStore.ProjectStoreV2)({
           listShells: () => Effect.succeed([project]),
@@ -769,17 +975,22 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         yield* service.start();
         yield* Deferred.succeed(activation, undefined);
 
-        // Startup backfill sweep, then periodic sweeps: a branch without a pull request
-        // is reread after half an hour, not on every sweep.
+        // Startup backfill sweep, then the fork's poll (#29552): a branch without a pull request
+        // is reread after half an hour, on the first poll past it, not on every poll.
         yield* Queue.take(sweeps);
         yield* service.drain;
-        for (let minute = 1; minute <= 29; minute += 1) {
-          yield* TestClock.adjust("1 minute");
+        yield* TestClock.adjust("569 seconds");
+        expect(yield* Queue.size(sweeps)).toBe(0);
+        yield* TestClock.adjust("1 second");
+        yield* Queue.take(sweeps);
+        yield* service.drain;
+        for (let poll = 2; poll <= 3; poll += 1) {
+          yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
           yield* Queue.take(sweeps);
           yield* service.drain;
         }
         expect(lookups.map((lookup) => lookup.branch)).toEqual([parent.branch]);
-        yield* TestClock.adjust("1 minute");
+        yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
         yield* Queue.take(sweeps);
         yield* service.drain;
         const sweepLookups = lookups.map((lookup) => lookup.branch).toSorted();
@@ -1274,7 +1485,8 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         yield* Deferred.succeed(activation, undefined);
         yield* Queue.take(sweeps);
         yield* service.drain;
-        yield* TestClock.adjust("1 minute");
+        // The fork sweeps on the poll tick (#29552), not every minute.
+        yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
         yield* Queue.take(sweeps);
         yield* service.drain;
       }).pipe(Effect.provide(dependencies));

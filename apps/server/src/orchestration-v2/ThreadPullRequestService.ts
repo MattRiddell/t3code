@@ -21,7 +21,13 @@ import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
+
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
+import {
+  BACKGROUND_PULL_REQUEST_POLL_INTERVAL,
+  isIdleThread,
+} from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -117,7 +123,20 @@ interface RefreshRequest {
   readonly threadId: ThreadId | null;
   readonly refresh: boolean;
   readonly backfill?: boolean;
+  /** Nobody is watching this read, so it may reuse one up to the background age limit. */
+  readonly background?: boolean;
+  /** Limits a sweep to branches the filter accepts. */
+  readonly branchFilter?: (branchKey: string) => boolean;
 }
+
+type RefreshJob =
+  | { readonly type: "refresh"; readonly request: RefreshRequest }
+  | { readonly type: "activity"; readonly threadId: ThreadId; refresh: boolean }
+  | { readonly type: "poll" };
+
+const branchKeyOf = (
+  thread: Pick<OrchestrationV2ThreadShell, "projectId" | "worktreePath" | "branch">,
+) => JSON.stringify([thread.projectId, thread.worktreePath, thread.branch]);
 
 export const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -317,7 +336,7 @@ export const make = Effect.gen(function* () {
     );
 
     yield* Effect.forEach(
-      groups,
+      [...groups].filter(([key]) => request.branchFilter?.(key) !== false),
       ([key, group]) =>
         Effect.gen(function* () {
           const first = group[0]!;
@@ -330,13 +349,20 @@ export const make = Effect.gen(function* () {
             });
           if (first.branch !== null && repository === null) return finishBackfill(group);
           const cwd = lookupCwds.get(first.id) ?? project.workspaceRoot;
+          // A background read of a branch whose threads are all idle shares the idle window.
+          const background =
+            request.background !== true
+              ? {}
+              : group.every((thread) => isIdleThread(thread, nowMs))
+                ? { background: true, idle: true }
+                : { background: true };
           // A detected PR is confirmed against fresh git state before it is saved.
           const detected =
             first.branch === null
               ? null
               : yield* git.branchPullRequest(
                   { cwd, branch: first.branch },
-                  { refresh: request.refresh, confirmTerminal: false },
+                  { refresh: request.refresh, confirmTerminal: false, ...background },
                 );
           if (first.branch !== null) noPullRequestRechecks.record(key, nowMs, detected !== null);
           if (detected !== null && !pullRequestMatchesProject(detected, resolvedProject)) {
@@ -428,7 +454,7 @@ export const make = Effect.gen(function* () {
           if (detected !== null && first.branch !== null) {
             const current = yield* git.branchPullRequest(
               { cwd, branch: first.branch },
-              { freshGitState: true },
+              { freshGitState: true, ...background },
             );
             const currentIdentity = yield* repositoryIdentities.resolve(project.workspaceRoot, {
               refresh: true,
@@ -522,15 +548,8 @@ export const make = Effect.gen(function* () {
     if (request.threadId === null) noPullRequestRechecks.retain(groups);
   });
 
-  // At most one queued request per thread, so a turn end's events share one lookup.
-  // A request after that lookup starts queues another, so later host changes are still read.
-  const queuedThreadRequests = new Map<ThreadId, { threadId: ThreadId; refresh: boolean }>();
-
-  const worker = yield* makeDrainableWorker((request: RefreshRequest) =>
-    Effect.suspend(() => {
-      if (request.threadId !== null) queuedThreadRequests.delete(request.threadId);
-      return synchronize(request);
-    }).pipe(
+  const refresh = (request: RefreshRequest) =>
+    synchronize(request).pipe(
       Effect.provideService(GitVcsDriver.BackgroundGitWork, true),
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
@@ -539,9 +558,95 @@ export const make = Effect.gen(function* () {
             cause: Cause.pretty(cause),
           }),
       ),
-    ),
+    );
+
+  // A thread nobody is viewing waits for the next poll, where its branch shares the poll's
+  // document. Thread ids are grouped by branch: one read answers every thread on it.
+  const owedRefreshes = new Map<string, Set<ThreadId>>();
+
+  const refreshAfterActivity = Effect.fn("ThreadPullRequestServiceV2.refreshAfterActivity")(
+    function* (threadId: ThreadId) {
+      const placement = yield* Effect.gen(function* () {
+        const thread = yield* orchestrator.getThreadShell(threadId);
+        if (thread === null || thread.branch === null) return null;
+        const project = yield* projectStore.getShell(thread.projectId);
+        if (Option.isNone(project)) return null;
+        return {
+          branchKey: branchKeyOf(thread),
+          cwd: thread.worktreePath ?? project.value.workspaceRoot,
+        };
+      }).pipe(Effect.orElseSucceed(() => null));
+      if (
+        placement === null ||
+        (yield* backgroundPolicy.shouldRunScopeWork({ type: "vcs-status", cwd: placement.cwd }))
+      ) {
+        return yield* refresh({ threadId, refresh: true });
+      }
+      const owed = owedRefreshes.get(placement.branchKey) ?? new Set();
+      owedRefreshes.set(placement.branchKey, owed.add(threadId));
+    },
   );
 
+  const poll = Effect.fn("ThreadPullRequestServiceV2.poll")(function* () {
+    // The sweep only catches pull requests opened outside a turn, which
+    // nobody sees without a client. Thread events still refresh headless work.
+    const sweeping = yield* backgroundPolicy.shouldRunOpportunisticWork;
+    const owed = [...owedRefreshes];
+    owedRefreshes.clear();
+    const owedBranches = new Set(owed.map(([branchKey]) => branchKey));
+    const readers = owed.flatMap(([, threadIds]) => [...threadIds].slice(0, 1));
+    const followers = owed.flatMap(([, threadIds]) => [...threadIds].slice(1));
+    // Nobody asked for the sweep's reads, so they share the tick's background window with the
+    // settlement sweep's lookups of the same branches instead of reading them again.
+    const sweep = (branchFilter: (branchKey: string) => boolean) =>
+      sweeping ? [refresh({ threadId: null, refresh: false, background: true, branchFilter })] : [];
+    yield* Effect.all(
+      [
+        ...sweep((branchKey) => !owedBranches.has(branchKey)),
+        ...readers.map((threadId) => refresh({ threadId, refresh: true })),
+      ],
+      // One worker job, so the sweep and every owed branch reach the document window together.
+      { concurrency: "unbounded", discard: true },
+    ).pipe(Effect.provideService(SourceControlRateLimit.ScheduledPoll, true));
+    // Everything left on an owed branch reads the answer its reader just cached.
+    yield* Effect.all(
+      [
+        ...sweep((branchKey) => owedBranches.has(branchKey)),
+        ...followers.map((threadId) => refresh({ threadId, refresh: false })),
+      ],
+      { concurrency: 8, discard: true },
+    );
+  });
+
+  const queuedThreadRequests = new Map<ThreadId, Extract<RefreshJob, { type: "activity" }>>();
+
+  const worker = yield* makeDrainableWorker((job: RefreshJob) => {
+    switch (job.type) {
+      case "refresh":
+        return refresh(job.request);
+      case "activity":
+        queuedThreadRequests.delete(job.threadId);
+        return (
+          job.refresh
+            ? refreshAfterActivity(job.threadId)
+            : refresh({ threadId: job.threadId, refresh: false, background: true })
+        ).pipe(
+          Effect.catchCauseIf(
+            (cause) => !Cause.hasInterruptsOnly(cause),
+            (cause) =>
+              Effect.logWarning("thread pull request activity refresh failed", {
+                threadId: job.threadId,
+                cause: Cause.pretty(cause),
+              }),
+          ),
+        );
+      case "poll":
+        return poll();
+    }
+  });
+
+  // Keep one queued request per thread. A later turn-end upgrades a metadata read.
+  // Remove it when work starts, so events during a lookup queue a fresh read.
   const enqueueThread = (threadId: ThreadId, refresh: boolean) =>
     Effect.suspend(() => {
       const queued = queuedThreadRequests.get(threadId);
@@ -549,9 +654,9 @@ export const make = Effect.gen(function* () {
         queued.refresh ||= refresh;
         return Effect.void;
       }
-      const request = { threadId, refresh };
-      queuedThreadRequests.set(threadId, request);
-      return worker.enqueue(request);
+      const job = { type: "activity" as const, threadId, refresh };
+      queuedThreadRequests.set(threadId, job);
+      return worker.enqueue(job);
     });
 
   const linkedThreadsChange = makeLinkedThreadsChangeDetector();
@@ -609,15 +714,18 @@ export const make = Effect.gen(function* () {
     );
     yield* forkParked(
       Effect.gen(function* () {
-        yield* worker.enqueue({ threadId: null, refresh: false, backfill: true });
+        yield* worker.enqueue({
+          type: "refresh",
+          request: { threadId: null, refresh: false, backfill: true },
+        });
         yield* worker.drain;
         yield* Effect.gen(function* () {
-          // The sweep only catches pull requests opened outside a turn, which
-          // nobody sees without a client. Thread events still refresh headless work.
-          if (!(yield* backgroundPolicy.shouldRunOpportunisticWork)) return;
-          yield* worker.enqueue({ threadId: null, refresh: false });
+          yield* worker.enqueue({ type: "poll" });
           yield* worker.drain;
-        }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.delay("1 minute"));
+        }).pipe(
+          Effect.repeat(Schedule.spaced(BACKGROUND_PULL_REQUEST_POLL_INTERVAL)),
+          Effect.delay(BACKGROUND_PULL_REQUEST_POLL_INTERVAL),
+        );
       }).pipe(Effect.asVoid),
     );
   });

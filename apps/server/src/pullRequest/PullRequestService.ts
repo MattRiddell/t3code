@@ -77,6 +77,7 @@ import {
   type ThreadPullRequestKey,
 } from "@t3tools/contracts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { BACKGROUND_PULL_REQUEST_MAX_AGE } from "../git/backgroundPullRequestPoll.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 
 import * as ProjectService from "../project/ProjectService.ts";
@@ -202,6 +203,8 @@ export class PullRequestService extends Context.Service<
       input: PullRequestRef,
       options?: {
         readonly recoverTransientFailure?: boolean;
+        /** Nobody is watching this read, so it may reuse one up to the background age limit. */
+        readonly background?: boolean;
         /** Registration preflights must reach the provider despite a successful cached read. */
         readonly bypassCache?: boolean;
       },
@@ -3041,7 +3044,18 @@ export const make = Effect.gen(function* () {
       if (snapshot === undefined) return read(key, effect);
       return revalidate(read(key, effect)).pipe(Effect.as(snapshot.value));
     };
-    return { peek: (key: string) => held.get(key)?.value, read, record, serveHeld };
+    const peekYoungerThan = (key: string, maxAgeMs: number) =>
+      Effect.map(Clock.currentTimeMillis, (now) => {
+        const snapshot = held.get(key);
+        return snapshot !== undefined && now - snapshot.at < maxAgeMs ? snapshot.value : undefined;
+      });
+    return {
+      peek: (key: string) => held.get(key)?.value,
+      peekYoungerThan,
+      read,
+      record,
+      serveHeld,
+    };
   };
   const lastGoodSummary = makeLastGoodRead<PullRequestSummary>(DETAIL_CACHE_CAPACITY);
   const lastGoodDetail = makeLastGoodRead<PullRequestDetail>(DETAIL_CACHE_CAPACITY);
@@ -3200,24 +3214,37 @@ export const make = Effect.gen(function* () {
   const summaryCodec = Schema.fromJsonString(PullRequestSummary);
   const stackCodec = Schema.fromJsonString(Schema.NullOr(PullRequestStack));
 
-  const summary: PullRequestService["Service"]["summary"] = (input, options) => {
-    const key = refCacheKey(input);
-    const read =
-      options?.bypassCache === true
+  const summary: PullRequestService["Service"]["summary"] = Effect.fnUntraced(
+    function* (input, options) {
+      const key = refCacheKey(input);
+      const bypassCache = options?.bypassCache === true;
+      const held = lastGoodSummary.peek(key);
+      if (
+        !bypassCache &&
+        held !== undefined &&
+        input.allowStale !== false &&
+        (options?.recoverTransientFailure !== false || held.state === "merged")
+      ) {
+        return held;
+      }
+      const recent =
+        !bypassCache && options?.background === true && input.allowStale !== false
+          ? yield* lastGoodSummary.peekYoungerThan(
+              key,
+              Duration.toMillis(BACKGROUND_PULL_REQUEST_MAX_AGE),
+            )
+          : undefined;
+      if (recent !== undefined) return recent;
+      const read = bypassCache
         ? summaryUncached(input)
         : persistedRead(input, "summary", summaryCodec, summaryUncached(input));
-    const held = lastGoodSummary.peek(key);
-    return options?.bypassCache !== true &&
-      held !== undefined &&
-      input.allowStale !== false &&
-      (options?.recoverTransientFailure !== false || held.state === "merged")
-      ? Effect.succeed(held)
-      : read.pipe(
-          Effect.tap((value) =>
-            shouldReplaceHeldSummary(key, value) ? lastGoodSummary.record(key, value) : Effect.void,
-          ),
-        );
-  };
+      return yield* read.pipe(
+        Effect.tap((value) =>
+          shouldReplaceHeldSummary(key, value) ? lastGoodSummary.record(key, value) : Effect.void,
+        ),
+      );
+    },
+  );
 
   const batchesReads: PullRequestService["Service"]["batchesReads"] = Effect.fn(
     "PullRequestService.batchesReads",
