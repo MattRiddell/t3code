@@ -642,7 +642,9 @@ export const make = Effect.gen(function* () {
             closedAt: reading.closedAt ?? null,
             mergedAt: reading.mergedAt ?? null,
           }))
-            ? yield* pullRequests.summary(pullRequestRef, { recoverTransientFailure: false })
+            ? yield* scheduledSettlementRead(
+                pullRequests.summary(pullRequestRef, { recoverTransientFailure: false }),
+              )
             : reading;
         if (
           "updatedAt" in summary &&
@@ -715,10 +717,12 @@ export const make = Effect.gen(function* () {
       ) {
         return undefined;
       }
-      const fresh = yield* scheduledSettlementRead(git.branchPullRequest(
-        { cwd, branch: thread.branch },
-        remembered.state === "closed" ? { refresh: true } : { freshGitState: true },
-      ));
+      const fresh = yield* scheduledSettlementRead(
+        git.branchPullRequest(
+          { cwd, branch: thread.branch },
+          remembered.state === "closed" ? { refresh: true } : { freshGitState: true },
+        ),
+      );
       return ownedByAnotherThread(fresh) ? undefined : fresh;
     });
 
