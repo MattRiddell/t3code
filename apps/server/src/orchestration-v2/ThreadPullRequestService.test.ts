@@ -746,11 +746,13 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const activation = yield* Deferred.make<void>();
           const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
           const lookedUp = yield* Queue.unbounded<void>();
+          const scopeChecked = yield* Queue.unbounded<void>();
           const lookups: Array<{ readonly cwd: string; readonly branch: string }> = [];
           const dispatched: Array<OrchestrationV2ServerCommand> = [];
           const dependencies = Layer.mergeAll(
             Layer.mock(Orchestrator.OrchestratorV2)({
               streamDomainEvents: Stream.fromQueue(domainEvents),
+              getThreadShell: () => Effect.sync(() => thread),
               getPullRequestSnapshot: () =>
                 Effect.sync(() => ({
                   schemaVersion: 2,
@@ -810,9 +812,11 @@ describe("ThreadPullRequestServiceV2 reads", () => {
                 ),
             }),
             Layer.mock(PullRequestService.PullRequestService)({}),
-            Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({}),
+            Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+              resolve: () => Effect.succeed(null),
+            }),
             Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-              shouldRunScopeWork: () => Effect.succeed(false),
+              shouldRunScopeWork: () => Queue.offer(scopeChecked, undefined).pipe(Effect.as(false)),
               shouldRunOpportunisticWork: Effect.succeed(false),
             }),
             Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
@@ -835,9 +839,18 @@ describe("ThreadPullRequestServiceV2 reads", () => {
               type: "checkpoint.captured",
               threadId: thread.id,
             } as OrchestrationV2DomainEvent;
-            yield* Queue.offer(domainEvents, turnEnd);
-            yield* Queue.take(lookedUp);
-            yield* service.drain;
+            const discover = Effect.gen(function* () {
+              yield* Queue.offer(domainEvents, turnEnd);
+              if (thread.branch !== null) {
+                // A headless worktree waits for the next coalesced branch poll.
+                yield* Queue.take(scopeChecked);
+                yield* service.drain;
+                yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
+              }
+              yield* Queue.take(lookedUp);
+              yield* service.drain;
+            });
+            yield* discover;
 
             // Only the repository on a branch of its own is asked, and nothing touches the
             // thread's own branch.
@@ -868,9 +881,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
                 },
               ],
             };
-            yield* Queue.offer(domainEvents, turnEnd);
-            yield* Queue.take(lookedUp);
-            yield* service.drain;
+            yield* discover;
             expect(dispatched).toHaveLength(1);
           }).pipe(Effect.provide(dependencies));
         }),
