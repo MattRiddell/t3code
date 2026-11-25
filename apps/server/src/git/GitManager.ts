@@ -1586,6 +1586,9 @@ export const make = Effect.gen(function* () {
     string,
     Effect.Success<ReturnType<typeof readPrLookup>>
   >();
+  // Keys a reader was answered as owed to this boundary's refill before that refill ran, by tick.
+  // The reader moved the key's want to the new tick, so the refill takes these keys as well.
+  const backgroundOwedBeforeRefill = new Map<string, number>();
   const getPrLookup = (
     key: string,
     options?: { readonly background?: boolean; readonly idle?: boolean },
@@ -1619,6 +1622,7 @@ export const make = Effect.gen(function* () {
             !isBackgroundReadFresh(entry.readAtMs, nowMs) &&
             backgroundReadTick(entry.readAtMs) === tick - 1
           ) {
+            if (!backgroundRefilling.has(key)) backgroundOwedBeforeRefill.set(key, tick);
             return Effect.succeed(entry);
           }
           // Background readers share tick-aligned expiry so one sweep refills them in one document;
@@ -1654,7 +1658,7 @@ export const make = Effect.gen(function* () {
         backgroundWantTickByKey.delete(key);
         continue;
       }
-      if (wantTick !== tick - 1) continue;
+      if (wantTick !== tick - 1 && backgroundOwedBeforeRefill.get(key) !== tick) continue;
       const parts = key.split("\u0000");
       // A newer epoch (a person's refresh, a push) already moved readers to a new key.
       if (parts[6] !== String(prLookupEpoch(parts[0] ?? ""))) {
@@ -1664,6 +1668,7 @@ export const make = Effect.gen(function* () {
       owed.push(key);
       backgroundRefilling.add(key);
     }
+    backgroundOwedBeforeRefill.clear();
     yield* Effect.forEach(
       owed,
       (key) =>
