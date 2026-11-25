@@ -1,5 +1,7 @@
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
 
 /**
  * Every server-side pull request poll runs on this tick, so one tick's reads share one GraphQL
@@ -24,11 +26,32 @@ export function isBackgroundReadFresh(readAtMs: number, nowMs: number): boolean 
   );
 }
 
+/** The tick `nowMs` falls in; ticks start on wall-clock multiples of the interval. */
+export function backgroundReadTick(nowMs: number): number {
+  return Math.floor(nowMs / BACKGROUND_READ_WINDOW_MS);
+}
+
+/** Time from `nowMs` to the next tick boundary: a full tick when `nowMs` is on one. */
+export function untilNextBackgroundTick(nowMs: number): Duration.Duration {
+  const intoTick =
+    ((nowMs % BACKGROUND_READ_WINDOW_MS) + BACKGROUND_READ_WINDOW_MS) % BACKGROUND_READ_WINDOW_MS;
+  return Duration.millis(BACKGROUND_READ_WINDOW_MS - intoTick);
+}
+
+/**
+ * Sleeps to the next tick boundary. Every server-side poll wakes there instead of a tick after its
+ * own start, so their reads land in the same scheduled-poll document window as the boundary's refills.
+ */
+export const sleepUntilNextBackgroundTick: Effect.Effect<void> = Effect.flatMap(
+  Clock.currentTimeMillis,
+  (nowMs) => Effect.sleep(untilNextBackgroundTick(nowMs)),
+);
+
 /**
  * A thread with no run, message or wake for this long is idle. Its agent opens no pull request
  * meanwhile, so one opened outside a turn is the only thing a lookup for it can find.
  */
-export const IDLE_THREAD_AFTER = Duration.hours(2);
+const IDLE_THREAD_AFTER = Duration.hours(2);
 
 /** An idle thread's background lookup is shared across this many ticks (57 minutes). */
 export const IDLE_BACKGROUND_READ_TICKS = 6;

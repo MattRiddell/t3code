@@ -17,7 +17,12 @@ export function makeNoPullRequestRechecks() {
     select: (
       nowMs: number,
       branches: ReadonlyArray<{ readonly key: string; readonly activityAtMs: number }>,
-      idleBatch?: { readonly activityCutoffMs: number; readonly limit: number },
+      idleBatch?: {
+        readonly activityCutoffMs: number;
+        readonly limit: number;
+        /** Due active branches this sweep may read; RECHECKS_PER_SWEEP when unset. */
+        readonly activeLimit?: number;
+      },
     ): ReadonlySet<string> => {
       const selected = new Set<string>();
       const due: Array<{ key: string; activityAtMs: number; readAtMs: number }> = [];
@@ -45,7 +50,7 @@ export function makeNoPullRequestRechecks() {
           ({ activityAtMs }) =>
             idleBatch === undefined || activityAtMs > idleBatch.activityCutoffMs,
         )
-        .slice(0, RECHECKS_PER_SWEEP);
+        .slice(0, idleBatch?.activeLimit ?? RECHECKS_PER_SWEEP);
       const idle =
         idleBatch === undefined || idleBatch.limit === 0
           ? []

@@ -31,12 +31,15 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
-import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
+import {
+  BACKGROUND_PULL_REQUEST_POLL_INTERVAL,
+  sleepUntilNextBackgroundTick,
+  untilNextBackgroundTick,
+} from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -914,28 +917,26 @@ export const make = Effect.gen(function* () {
       }).pipe(Effect.catchCause(logSkipped("pull request sync event stream failed", {}))),
     );
     // Startup reads everything once; after that the retry sweep runs half a tick after each poll.
+    // Both keep to wall-clock tick boundaries, as every other background poll does, so the poll's
+    // summary reads share a document window with the settlement sweep's on the same boundary.
     const retrySweep = Effect.gen(function* () {
       yield* worker.enqueue("all");
       yield* worker.drain;
     });
+    const sleepUntilRetrySweep = Effect.flatMap(Clock.currentTimeMillis, (nowMs) =>
+      Effect.sleep(untilNextBackgroundTick(nowMs - Duration.toMillis(RETRY_SWEEP_OFFSET))),
+    );
     yield* forkParked(
       retrySweep.pipe(
-        Effect.andThen(Effect.sleep(RETRY_SWEEP_OFFSET)),
-        Effect.andThen(
-          retrySweep.pipe(Effect.repeat(Schedule.spaced(BACKGROUND_PULL_REQUEST_POLL_INTERVAL))),
-        ),
-        Effect.asVoid,
+        Effect.andThen(sleepUntilRetrySweep.pipe(Effect.andThen(retrySweep), Effect.forever)),
       ),
     );
     yield* forkParked(
       Effect.gen(function* () {
+        yield* sleepUntilNextBackgroundTick;
         yield* worker.enqueue("poll");
         yield* worker.drain;
-      }).pipe(
-        Effect.repeat(Schedule.spaced(BACKGROUND_PULL_REQUEST_POLL_INTERVAL)),
-        Effect.delay(BACKGROUND_PULL_REQUEST_POLL_INTERVAL),
-        Effect.asVoid,
-      ),
+      }).pipe(Effect.forever),
     );
   });
 

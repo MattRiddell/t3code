@@ -52,6 +52,10 @@ import * as PullRequestSyncReactor from "./PullRequestSyncReactor.ts";
 import { type PullRequestTestThread, v2PullRequestThread } from "./testkit/pullRequestFixtures.ts";
 
 const NOW = "2026-08-28T12:00:00.000Z";
+// The first background tick boundary after NOW; tests that count polls start on it, where the poll
+// and the retry sweep run a whole and a half tick after start.
+const TICK_MS = Duration.toMillis(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
+const TICK_START_MS = Math.ceil(Date.parse(NOW) / TICK_MS) * TICK_MS;
 const PROJECT_ID = ProjectId.make("sync-project");
 
 type SyncCommand = Extract<
@@ -335,7 +339,7 @@ const pollAgain = Effect.fn("pollPullRequestSyncHarness")(function* (
   yield* Queue.clear(fixture.snapshotReads);
 });
 
-// Sweeps run every half tick from startup: the retry sweep between polls, then the poll.
+// Sweeps run every half tick, from a tick boundary: the retry sweep between polls, then the poll.
 const HALF_TICK = Duration.millis(Duration.toMillis(BACKGROUND_PULL_REQUEST_POLL_INTERVAL) / 2);
 
 const sweepAgain = Effect.fn("sweepPullRequestSyncHarness")(function* (
@@ -920,7 +924,7 @@ describe("PullRequestSyncReactor", () => {
         const reactor = yield* startAndSweep(fixture);
         assert.deepStrictEqual(yield* Ref.get(fixture.syncCommands), []);
 
-        // The fork reads every linked PR on the next poll tick (#29552).
+        // The fork reads every linked PR on the next poll tick.
         yield* pollAgain(fixture, reactor);
         assert.strictEqual((yield* Ref.get(fixture.summaryCalls)).length, 2);
 
@@ -1061,7 +1065,7 @@ describe("PullRequestSyncReactor", () => {
 
   it.effect("stops reading a pull request a day after it closed, until a refresh asks", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(Date.parse(NOW));
+      yield* TestClock.setTime(TICK_START_MS);
       const closed = (closedAt: string | null) => ({ state: "closed" as const, closedAt });
       const fixture = yield* makeHarness({
         snapshot: makeSnapshot([
@@ -1679,7 +1683,7 @@ describe("PullRequestSyncReactor", () => {
 
   it.effect("reads past the cache when a sibling flags a member during its summary read", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(Date.parse(NOW));
+      yield* TestClock.setTime(TICK_START_MS);
       const stack = makeGrowingStack();
       const synced83 = yield* Deferred.make<void>();
       let holdSummary = false;
@@ -1766,7 +1770,7 @@ describe("PullRequestSyncReactor", () => {
   it.effect("reads every linked pull request in one poll and none between polls", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
+        yield* TestClock.setTime(TICK_START_MS);
         const polled = yield* Ref.make<ReadonlyArray<boolean>>([]);
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([
@@ -1808,10 +1812,41 @@ describe("PullRequestSyncReactor", () => {
     ),
   );
 
+  it.effect("polls on the next tick boundary, not a whole tick after start", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // NOW is thirty seconds before a boundary, so every server polls in the same window.
+        yield* TestClock.setTime(Date.parse(NOW));
+        const fixture = yield* makeHarness({
+          snapshot: makeSnapshot([
+            makeThread("busy", { pullRequests: [makeLink(1, { state: "open" })] }),
+          ]),
+        });
+
+        yield* Effect.gen(function* () {
+          const reactor = yield* startAndSweep(fixture);
+          yield* Ref.set(fixture.summaryCalls, []);
+
+          // MUST-SAY-NO: a second before the boundary nothing has swept.
+          yield* TestClock.adjust("29 seconds");
+          assert.strictEqual(yield* Queue.size(fixture.snapshotReads), 0);
+
+          yield* TestClock.adjust("1 second");
+          yield* Queue.take(fixture.snapshotReads);
+          yield* reactor.drain;
+          assert.deepStrictEqual(
+            (yield* Ref.get(fixture.summaryCalls)).map((call) => call.number),
+            [1],
+          );
+        }).pipe(Effect.provide(fixture.layer));
+      }),
+    ),
+  );
+
   it.effect("retries a read the poll lost instead of waiting for the next poll", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
+        yield* TestClock.setTime(TICK_START_MS);
         const failing = yield* Ref.make(false);
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([
@@ -1970,7 +2005,7 @@ describe("PullRequestSyncReactor", () => {
     "retries missing links every fifteen minutes and resumes normal reads after recovery",
     () =>
       Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
+        yield* TestClock.setTime(TICK_START_MS);
         const found = yield* Ref.make(false);
         const fixture = yield* makeHarness({
           snapshot: makeSnapshot([
@@ -2003,7 +2038,7 @@ describe("PullRequestSyncReactor", () => {
             [9],
           );
           yield* Ref.update(fixture.snapshots, (snapshot) => applySync(snapshot, commands));
-          // Recovered open pull requests return to the fork's poll tick (#29552).
+          // Recovered open pull requests return to the fork's poll tick.
           yield* pollAgain(fixture, reactor);
           assert.deepStrictEqual(
             (yield* Ref.get(fixture.summaryCalls))
@@ -2153,7 +2188,7 @@ describe("PullRequestSyncReactor", () => {
     () =>
       Effect.scoped(
         Effect.gen(function* () {
-          yield* TestClock.setTime(Date.parse(NOW));
+          yield* TestClock.setTime(TICK_START_MS);
           const failing = yield* Ref.make(true);
           const fixture = yield* makeHarness({
             snapshot: makeSnapshot([makeThread("one", { pullRequests: [failingGitLabLink] })]),

@@ -16,6 +16,7 @@ import {
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
@@ -25,12 +26,15 @@ import * as FiberSet from "effect/FiberSet";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
-import { isIdleThread } from "../git/backgroundPullRequestPoll.ts";
+import {
+  backgroundReadTick,
+  isIdleThread,
+  untilNextBackgroundTick,
+} from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -332,8 +336,7 @@ export function autoSettlementSettingsKey(
   ]);
 }
 
-// Bound idle misses to one batch per window while keeping active branches eligible every sweep.
-const IDLE_SETTLEMENT_BATCH_INTERVAL_MS = 570_000;
+// Bound no-PR rechecks to one batch per background tick, in the sweep on its boundary.
 const IDLE_SETTLEMENT_AFTER_MS = Duration.toMillis(Duration.hours(2));
 const IDLE_SETTLEMENT_BATCH_LIMIT = 25;
 
@@ -728,9 +731,10 @@ export const make = Effect.gen(function* () {
     // A merge, a shell close and a thread's own events read at once; only scheduled sweeps wait.
     const scheduledLookups = (() => {
       if (mergedPullRequest !== null || threadId !== undefined) return null;
-      // Keep processing local settlement every minute. Batch unknown idle branches once per
-      // 9.5-minute window so small misses do not open a new document each minute.
-      const idleBatchTick = Math.floor(nowMs / IDLE_SETTLEMENT_BATCH_INTERVAL_MS);
+      // Keep processing local settlement every minute. Recheck branches with no known pull request,
+      // active or idle, once per 9.5-minute window, in the sweep on the window's boundary, so they
+      // share the tick's scheduled-poll document instead of opening one each minute.
+      const idleBatchTick = backgroundReadTick(nowMs);
       const runIdleBatch = idleBatchTick !== lastIdleBatchTick;
       if (runIdleBatch) lastIdleBatchTick = idleBatchTick;
       return noPullRequestRechecks.select(
@@ -747,6 +751,7 @@ export const make = Effect.gen(function* () {
         {
           activityCutoffMs: nowMs - IDLE_SETTLEMENT_AFTER_MS,
           limit: runIdleBatch ? IDLE_SETTLEMENT_BATCH_LIMIT : 0,
+          activeLimit: runIdleBatch ? IDLE_SETTLEMENT_BATCH_LIMIT : 0,
         },
       );
     })();
@@ -980,7 +985,10 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         yield* enqueueFullSweep();
         yield* fullSweeps.drain;
-      }).pipe(Effect.repeat(Schedule.spaced("1 minute")), Effect.asVoid),
+        // Every minute, and on each tick boundary, where the batch sweep reads with the others.
+        const nowMs = yield* Clock.currentTimeMillis;
+        yield* Effect.sleep(Duration.min(Duration.minutes(1), untilNextBackgroundTick(nowMs)));
+      }).pipe(Effect.forever),
     );
     yield* forkParked(
       Stream.runForEach(settingsChanges, (settings) => {

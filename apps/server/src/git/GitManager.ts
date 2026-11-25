@@ -93,9 +93,11 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
 import { detachStackFrame } from "./detachStackFrame.ts";
 import {
+  backgroundReadTick,
   IDLE_BACKGROUND_READ_MAX_AGE,
   isBackgroundReadFresh,
   isIdleBackgroundReadFresh,
+  sleepUntilNextBackgroundTick,
 } from "./backgroundPullRequestPoll.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import type { GitManagerServiceError } from "@t3tools/contracts";
@@ -122,6 +124,11 @@ export interface GitLocalStatusOptions {
 
 export interface GitRemoteStatusOptions extends GitVcsDriver.GitRemoteStatusOptions {
   readonly refreshMissingPullRequest?: boolean;
+  /**
+   * A poll's read, not a person's: the PR lookup takes the background tick rule, so it is reread at
+   * most once a tick, at the tick boundary with every other background lookup.
+   */
+  readonly backgroundPullRequest?: boolean;
   /** Details the caller just read without fetching; used instead of reading them again. */
   readonly statusDetails?: GitVcsDriver.GitRemoteStatusDetails;
 }
@@ -245,7 +252,9 @@ const PR_LOOKUP_GIT_STATE_TTL = Duration.minutes(5);
 const LOCAL_STATUS_GIT_READS_HANDOFF_TTL = Duration.seconds(5);
 const SETTLED_PR_LOOKUP_RECHECK_INTERVAL = Duration.minutes(15);
 // Shared by every background caller (backfill, settlement, cleanup), so startup discovery
-// cannot fill the git and forge process slots that foreground work also needs.
+// cannot fill the git and forge process slots that foreground work also needs. A scheduled poll on
+// the background git lane skips it: that lane already caps its git processes, and its forge reads
+// are one batched document.
 const BRANCH_PR_LOOKUP_CONCURRENCY = 4;
 const PR_THREAD_CONTEXT_BYTES = 16_000;
 const NO_THREAD_CONTEXT = { history: undefined, producedBy: undefined };
@@ -1564,13 +1573,54 @@ export const make = Effect.gen(function* () {
     },
   );
   const readPrLookup = (key: string) => detachStackFrame(Cache.get(prLookupCache, key));
+  // Keys a non-idle background reader asked for, by the tick it last asked in. The boundary
+  // refresher rereads last tick's keys together at the next boundary, in one scheduled-poll document,
+  // instead of each going stale and costing its own document when its reader next comes by.
+  const backgroundWantTickByKey = new Map<string, number>();
+  let backgroundRefillTick = -1;
+  // Keys this boundary's refill has taken and not yet reread.
+  const backgroundRefilling = new Set<string>();
+  // Last tick's read of each key the refill is rereading: the cache already holds the pending
+  // reread, so a background reader meanwhile is answered from here instead of waiting on it.
+  const backgroundRefillPrevious = new Map<
+    string,
+    Effect.Success<ReturnType<typeof readPrLookup>>
+  >();
   const getPrLookup = (
     key: string,
     options?: { readonly background?: boolean; readonly idle?: boolean },
   ) =>
-    readPrLookup(key).pipe(
+    Effect.flatMap(Clock.currentTimeMillis, (startMs) => {
+      const previous =
+        options?.background === true && options.idle !== true
+          ? backgroundRefillPrevious.get(key)
+          : undefined;
+      if (previous === undefined) return readPrLookup(key);
+      backgroundWantTickByKey.delete(key);
+      backgroundWantTickByKey.set(key, backgroundReadTick(startMs));
+      return Effect.succeed(previous);
+    }).pipe(
       Effect.flatMap((entry) =>
         Effect.flatMap(Clock.currentTimeMillis, (nowMs) => {
+          const tick = backgroundReadTick(nowMs);
+          const boundaryRefillOwed =
+            options?.background === true &&
+            options.idle !== true &&
+            (backgroundRefilling.has(key) ||
+              (backgroundRefillTick < tick && backgroundWantTickByKey.get(key) === tick - 1));
+          if (options?.background === true && options.idle !== true) {
+            backgroundWantTickByKey.delete(key);
+            backgroundWantTickByKey.set(key, tick);
+          }
+          // Read last tick and owed to this boundary's refill, which has not reread it yet: answer
+          // from last tick's read (at most one tick old) and let the refill read it with the others.
+          if (
+            boundaryRefillOwed &&
+            !isBackgroundReadFresh(entry.readAtMs, nowMs) &&
+            backgroundReadTick(entry.readAtMs) === tick - 1
+          ) {
+            return Effect.succeed(entry);
+          }
           // Background readers share tick-aligned expiry so one sweep refills them in one document;
           // idle threads share a window of several ticks, so most ticks read none of them.
           const fresh =
@@ -1594,6 +1644,69 @@ export const make = Effect.gen(function* () {
         }),
       ),
     );
+  const refillBackgroundPrLookups = Effect.gen(function* () {
+    const nowMs = yield* Clock.currentTimeMillis;
+    const tick = backgroundReadTick(nowMs);
+    backgroundRefillTick = tick;
+    const owed: Array<string> = [];
+    for (const [key, wantTick] of backgroundWantTickByKey) {
+      if (wantTick < tick - 1) {
+        backgroundWantTickByKey.delete(key);
+        continue;
+      }
+      if (wantTick !== tick - 1) continue;
+      const parts = key.split("\u0000");
+      // A newer epoch (a person's refresh, a push) already moved readers to a new key.
+      if (parts[6] !== String(prLookupEpoch(parts[0] ?? ""))) {
+        backgroundWantTickByKey.delete(key);
+        continue;
+      }
+      owed.push(key);
+      backgroundRefilling.add(key);
+    }
+    yield* Effect.forEach(
+      owed,
+      (key) =>
+        Cache.getOption(prLookupCache, key).pipe(
+          Effect.orElseSucceed(() => Option.none()),
+          Effect.flatMap((cached) =>
+            Option.isSome(cached) && isBackgroundReadFresh(cached.value.readAtMs, nowMs)
+              ? Effect.void
+              : Effect.sync(() => {
+                  if (
+                    Option.isSome(cached) &&
+                    backgroundReadTick(cached.value.readAtMs) === tick - 1
+                  ) {
+                    backgroundRefillPrevious.set(key, cached.value);
+                  }
+                }).pipe(
+                  Effect.andThen(
+                    Cache.invalidateWhen(prLookupCache, key, (current) =>
+                      Option.isNone(cached) ? true : current.readAtMs === cached.value.readAtMs,
+                    ),
+                  ),
+                  Effect.andThen(readPrLookup(key)),
+                  Effect.asVoid,
+                ),
+          ),
+          Effect.ignore,
+          Effect.ensuring(
+            Effect.sync(() => {
+              backgroundRefilling.delete(key);
+              backgroundRefillPrevious.delete(key);
+            }),
+          ),
+        ),
+      { concurrency: "unbounded", discard: true },
+    );
+  }).pipe(
+    Effect.withSpan("GitManager.refillBackgroundPrLookups"),
+    Effect.provideService(SourceControlRateLimit.ScheduledPoll, true),
+    Effect.provideService(GitVcsDriver.BackgroundGitWork, true),
+  );
+  yield* Effect.forever(
+    sleepUntilNextBackgroundTick.pipe(Effect.andThen(refillBackgroundPrLookups)),
+  ).pipe(Effect.forkScoped);
   interface LastKnownPr {
     readonly pr: ReturnType<typeof toStatusPr> | null;
     readonly headSha: string | null;
@@ -1649,6 +1762,7 @@ export const make = Effect.gen(function* () {
       isDefaultBranch: boolean;
     },
     refreshMissingPullRequest = false,
+    backgroundPullRequest = false,
   ) {
     // Upstream changes must not orphan the same branch's fallback value.
     const branchKey = `${cwd}\u0000${details.branch}`;
@@ -1661,7 +1775,10 @@ export const make = Effect.gen(function* () {
         yield* Cache.invalidate(prLookupCache, cacheKey);
       }
     }
-    return yield* getPrLookup(cacheKey).pipe(
+    return yield* getPrLookup(
+      cacheKey,
+      backgroundPullRequest ? { background: true } : undefined,
+    ).pipe(
       Effect.map(({ latest, headContext }) => {
         if (!latest) return { pr: null, headSha: null, headContext };
         // Merged/closed matches are usually reverse-merge history, not the thread's PR context.
@@ -1746,6 +1863,7 @@ export const make = Effect.gen(function* () {
               isDefaultBranch: details.isDefaultBranch,
             },
             options?.refreshMissingPullRequest,
+            options?.backgroundPullRequest,
           )
         : { pr: null, headSha: null };
     // Squash and rebase merges land new commits, so HEAD never becomes reachable from the base.
@@ -3219,7 +3337,11 @@ export const make = Effect.gen(function* () {
   const remoteStatus: GitManager["Service"]["remoteStatus"] = Effect.fn("remoteStatus")(
     function* (input, options) {
       const cacheKey = yield* normalizeStatusCacheKey(input.cwd);
-      if (options?.refreshUpstream === false || options?.refreshMissingPullRequest) {
+      if (
+        options?.refreshUpstream === false ||
+        options?.refreshMissingPullRequest ||
+        options?.backgroundPullRequest
+      ) {
         return yield* readRemoteStatus(cacheKey, options);
       }
       return yield* Cache.get(remoteStatusResultCache, cacheKey);
@@ -3562,63 +3684,73 @@ export const make = Effect.gen(function* () {
 
   const branchPullRequest: GitManager["Service"]["branchPullRequest"] = Effect.fn(
     "branchPullRequest",
-  )(function* ({ cwd, branch }, options) {
-    const cacheCwd = yield* normalizeStatusCacheKey(cwd);
-    const refresh = options?.refresh === true;
-    const freshGitState = refresh || options?.freshGitState === true;
-    const background = options?.background === true;
-    const idle = background && options?.idle === true;
-    const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
-      refresh,
-      freshGitState,
-      includeHeadRepository: options?.includeHeadRepository,
-      background,
-      idle,
-    });
-    if (
-      pullRequest === null ||
-      pullRequest.state === "open" ||
-      freshGitState ||
-      options?.confirmTerminal === false
-    ) {
-      return pullRequest;
-    }
-    // A confirmed closed or merged result stays final until the branch or remotes change,
-    // with a periodic fresh lookup so a new PR from a reused branch still shows up.
-    const settledKey = `${cacheCwd}\u0000${branch}`;
-    const now = yield* Clock.currentTimeMillis;
-    const settled = settledPrLookupByBranchKey.get(settledKey);
-    // Read before any fresh lookup, so a change made during it forces another one.
-    const fingerprint = yield* readSettledPrLookupFingerprint(cacheCwd, branch);
-    if (
-      settled !== undefined &&
-      settled.url === pullRequest.url &&
-      settled.fingerprint === fingerprint &&
-      now - settled.confirmedAtMs < Duration.toMillis(SETTLED_PR_LOOKUP_RECHECK_INTERVAL)
-    ) {
-      return pullRequest;
-    }
-    const confirmed = yield* lookupBranchPullRequest(cacheCwd, branch, {
-      refresh: false,
-      freshGitState: true,
-      includeHeadRepository: options?.includeHeadRepository,
-      background,
-      idle,
-    });
-    settledPrLookupByBranchKey.delete(settledKey);
-    if (confirmed !== null && confirmed.state !== "open") {
-      if (settledPrLookupByBranchKey.size >= PR_LOOKUP_CACHE_CAPACITY) {
-        const oldestKey = settledPrLookupByBranchKey.keys().next().value;
-        if (oldestKey !== undefined) settledPrLookupByBranchKey.delete(oldestKey);
-      }
-      settledPrLookupByBranchKey.set(settledKey, {
-        url: confirmed.url,
-        fingerprint,
-        confirmedAtMs: now,
+  )(
+    function* ({ cwd, branch }, options) {
+      const cacheCwd = yield* normalizeStatusCacheKey(cwd);
+      const refresh = options?.refresh === true;
+      const freshGitState = refresh || options?.freshGitState === true;
+      const background = options?.background === true;
+      const idle = background && options?.idle === true;
+      const pullRequest = yield* lookupBranchPullRequest(cacheCwd, branch, {
+        refresh,
+        freshGitState,
+        includeHeadRepository: options?.includeHeadRepository,
+        background,
+        idle,
       });
-    }
-    return confirmed;
-  }, branchPrLookups.withPermits(1));
+      if (
+        pullRequest === null ||
+        pullRequest.state === "open" ||
+        freshGitState ||
+        options?.confirmTerminal === false
+      ) {
+        return pullRequest;
+      }
+      // A confirmed closed or merged result stays final until the branch or remotes change,
+      // with a periodic fresh lookup so a new PR from a reused branch still shows up.
+      const settledKey = `${cacheCwd}\u0000${branch}`;
+      const now = yield* Clock.currentTimeMillis;
+      const settled = settledPrLookupByBranchKey.get(settledKey);
+      // Read before any fresh lookup, so a change made during it forces another one.
+      const fingerprint = yield* readSettledPrLookupFingerprint(cacheCwd, branch);
+      if (
+        settled !== undefined &&
+        settled.url === pullRequest.url &&
+        settled.fingerprint === fingerprint &&
+        now - settled.confirmedAtMs < Duration.toMillis(SETTLED_PR_LOOKUP_RECHECK_INTERVAL)
+      ) {
+        return pullRequest;
+      }
+      const confirmed = yield* lookupBranchPullRequest(cacheCwd, branch, {
+        refresh: false,
+        freshGitState: true,
+        includeHeadRepository: options?.includeHeadRepository,
+        background,
+        idle,
+      });
+      settledPrLookupByBranchKey.delete(settledKey);
+      if (confirmed !== null && confirmed.state !== "open") {
+        if (settledPrLookupByBranchKey.size >= PR_LOOKUP_CACHE_CAPACITY) {
+          const oldestKey = settledPrLookupByBranchKey.keys().next().value;
+          if (oldestKey !== undefined) settledPrLookupByBranchKey.delete(oldestKey);
+        }
+        settledPrLookupByBranchKey.set(settledKey, {
+          url: confirmed.url,
+          fingerprint,
+          confirmedAtMs: now,
+        });
+      }
+      return confirmed;
+    },
+    (lookup) =>
+      Effect.flatMap(
+        Effect.all([SourceControlRateLimit.ScheduledPoll, GitVcsDriver.BackgroundGitWork]),
+        ([scheduledPoll, backgroundGitWork]) =>
+          // A scheduled poll's lookups share one forge document only if they enter its batch window
+          // together; four permits would split 25 into seven. The background git lane bounds them.
+          scheduledPoll && backgroundGitWork ? lookup : branchPrLookups.withPermits(1)(lookup),
+      ),
+  );
 
   const checkedOutPullRequest: GitManager["Service"]["checkedOutPullRequest"] = Effect.fn(
     "checkedOutPullRequest",

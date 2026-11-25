@@ -714,6 +714,8 @@ export const make = Effect.gen(function* () {
       readonly policyCwds?: ReadonlyArray<string>;
       /** Refs seen by this caller's last local read; skips the re-read while they hold. */
       readonly refsAtLocalRead?: Ref.Ref<string | null>;
+      /** A poll's read: the PR lookup is reread once a tick, at the tick boundary. */
+      readonly backgroundPullRequest?: boolean;
     },
   ) {
     return yield* withRemoteWriteLock(
@@ -829,9 +831,11 @@ export const make = Effect.gen(function* () {
           // Turn completion must update divergence even when background polling is paused.
           const statusDetails = upstreamReads.get(cwd);
           upstreamReads.delete(cwd);
+          // The PR lookup takes the tick rule: a PR the turn opened shows by the next tick boundary,
+          // when the thread's owed activity read finds it, rather than costing a document per turn.
           const remoteRead = yield* readRemoteStatus(cwd, {
             refreshUpstream: false,
-            refreshMissingPullRequest: true,
+            backgroundPullRequest: true,
             ...(statusDetails ? { statusDetails } : {}),
           });
           return yield* updateCachedRemoteStatus(cwd, remoteRead, { publish: true });
@@ -878,6 +882,10 @@ export const make = Effect.gen(function* () {
         refreshUpstream: !Duration.isZero(configuredInterval),
         policyCwds: [...demandCwds.keys()],
         refsAtLocalRead: refsAtLocalReadRef,
+        // Fetches stay on the configured interval; the forge read behind them waits for the tick
+        // boundary, so a watched thread costs one batched lookup per tick, not one per minute.
+        // A new subscription's first read is a person opening the thread and reads as before.
+        backgroundPullRequest: !needsInitialRefresh,
       }).pipe(Effect.exit);
       if (Exit.isSuccess(exit)) {
         yield* Ref.set(needsInitialRefreshRef, false);

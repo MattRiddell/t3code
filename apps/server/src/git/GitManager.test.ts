@@ -2300,8 +2300,9 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
-  // Staggered expiry sent one nearly empty GraphQL document per settlement sweep.
-  it.effect("expires background branch lookups together at the poll-tick boundary", () =>
+  // Staggered expiry sent one nearly empty GraphQL document per settlement sweep, and each reader
+  // past the boundary then reread its own branch in a document of its own.
+  it.effect("rereads last tick's background lookups together at the poll-tick boundary", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
@@ -2322,14 +2323,13 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         state: "open" as const,
         updatedAt: "2026-04-06T15:00:00Z",
       });
-      const { manager, providerCalls } = yield* makeManager({
-        providerScenario: {
-          prListSequence: Array.from({ length: 4 }, () => [
-            openPullRequest(401, "feature/tick-early"),
-            openPullRequest(402, "feature/tick-late"),
-          ]),
-        },
-      });
+      const providerScenario: FakeProviderScenario = {
+        prListSequence: Array.from({ length: 4 }, () => [
+          openPullRequest(401, "feature/tick-early"),
+          openPullRequest(402, "feature/tick-late"),
+        ]),
+      };
+      const { manager, providerCalls } = yield* makeManager({ providerScenario });
       const early = { cwd: repoDir, branch: "feature/tick-early" };
       const late = { cwd: repoDir, branch: "feature/tick-late" };
       const tickMs = 570_000;
@@ -2350,13 +2350,29 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* manager.branchPullRequest(late, { background: true });
       expect(listed(providerCalls)).toHaveLength(afterLate);
 
-      // MUST-SAY-NO: the later read is only 4.5 minutes old, yet it is not reused past the boundary.
+      // The boundary's refill rereads both, the later one too although it is only 4.5 minutes old.
+      const gate = {
+        started: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      providerScenario.prListGate = gate;
       yield* TestClock.setTime(tickStart + tickMs);
-      yield* manager.branchPullRequest(late, { background: true });
-      const afterBoundaryLate = listed(providerCalls).length;
-      expect(afterBoundaryLate).toBeGreaterThan(afterLate);
-      yield* manager.branchPullRequest(early, { background: true });
-      expect(listed(providerCalls).length).toBeGreaterThan(afterBoundaryLate);
+      yield* Deferred.await(gate.started);
+      // MUST-SAY-NO: a reader during the refill is answered from last tick's read; a read of its own
+      // would wait on the held provider and never return.
+      const duringRefill = yield* manager.branchPullRequest(late, { background: true });
+      expect(duringRefill?.number).toBe(402);
+      yield* Deferred.succeed(gate.release, undefined);
+      delete providerScenario.prListGate;
+
+      // MUST-SAY-NO: readers through the rest of the tick add no reads of their own.
+      yield* TestClock.adjust("5 minutes");
+      expect((yield* manager.branchPullRequest(early, { background: true }))?.number).toBe(401);
+      expect((yield* manager.branchPullRequest(late, { background: true }))?.number).toBe(402);
+      expect(listedSelectors(providerCalls).slice(afterLate).toSorted()).toEqual([
+        "feature/tick-early",
+        "feature/tick-late",
+      ]);
     }),
   );
 
