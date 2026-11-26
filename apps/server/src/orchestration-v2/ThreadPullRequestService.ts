@@ -17,17 +17,13 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
-import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
-import {
-  BACKGROUND_PULL_REQUEST_POLL_INTERVAL,
-  isIdleThread,
-} from "../git/backgroundPullRequestPoll.ts";
+import { isIdleThread, sleepUntilNextBackgroundTick } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -560,8 +556,9 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-  // A thread nobody is viewing waits for the next poll, where its branch shares the poll's
-  // document. Thread ids are grouped by branch: one read answers every thread on it.
+  // Activity waits for the next poll, at the tick boundary, where its branch shares the poll's
+  // document; viewed or not, the badge is at most a tick behind. Thread ids are grouped by branch:
+  // one read answers every thread on it.
   const owedRefreshes = new Map<string, Set<ThreadId>>();
 
   const refreshAfterActivity = Effect.fn("ThreadPullRequestServiceV2.refreshAfterActivity")(
@@ -576,10 +573,7 @@ export const make = Effect.gen(function* () {
           cwd: thread.worktreePath ?? project.value.workspaceRoot,
         };
       }).pipe(Effect.orElseSucceed(() => null));
-      if (
-        placement === null ||
-        (yield* backgroundPolicy.shouldRunScopeWork({ type: "vcs-status", cwd: placement.cwd }))
-      ) {
+      if (placement === null) {
         return yield* refresh({ threadId, refresh: true });
       }
       const owed = owedRefreshes.get(placement.branchKey) ?? new Set();
@@ -719,14 +713,14 @@ export const make = Effect.gen(function* () {
           request: { threadId: null, refresh: false, backfill: true },
         });
         yield* worker.drain;
-        yield* Effect.gen(function* () {
+        // On the tick boundary, with the settlement sweep and GitManager's refill of last tick's
+        // lookups, so all of them share one scheduled-poll document.
+        return yield* Effect.gen(function* () {
+          yield* sleepUntilNextBackgroundTick;
           yield* worker.enqueue({ type: "poll" });
           yield* worker.drain;
-        }).pipe(
-          Effect.repeat(Schedule.spaced(BACKGROUND_PULL_REQUEST_POLL_INTERVAL)),
-          Effect.delay(BACKGROUND_PULL_REQUEST_POLL_INTERVAL),
-        );
-      }).pipe(Effect.asVoid),
+        }).pipe(Effect.forever);
+      }),
     );
   });
 

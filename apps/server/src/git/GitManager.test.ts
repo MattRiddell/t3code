@@ -9,6 +9,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -143,6 +144,14 @@ const listed = (calls: ReadonlyArray<FakeProviderCall>) =>
 
 const listedSelectors = (calls: ReadonlyArray<FakeProviderCall>) =>
   listed(calls).map((call) => call.headSelector);
+
+// The manager's boundary refill wakes on every tick a TestClock jump crosses, so tests start on the
+// next period boundary after the shared clock's time instead of jumping millions of ticks ahead.
+const nextBoundaryAfterNow = (periodMs: number, periodsAhead = 1) =>
+  Effect.map(
+    Clock.currentTimeMillis,
+    (nowMs) => (Math.floor(nowMs / periodMs) + periodsAhead) * periodMs,
+  );
 
 const created = (calls: ReadonlyArray<FakeProviderCall>) =>
   calls.flatMap((call) =>
@@ -2276,7 +2285,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
 
       // Background reads expire at the 570 s poll tick, and this layer's tests share one TestClock
       // that an earlier test may leave mid-tick: start on a tick boundary so 9 minutes stays inside it.
-      yield* TestClock.setTime(570_000 * 2_000_000);
+      yield* TestClock.setTime(yield* nextBoundaryAfterNow(570_000));
       yield* manager.branchPullRequest(branch);
       const hostReads = listed(providerCalls).length;
       expect(hostReads).toBeGreaterThan(0);
@@ -2300,8 +2309,9 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
-  // Staggered expiry sent one nearly empty GraphQL document per settlement sweep.
-  it.effect("expires background branch lookups together at the poll-tick boundary", () =>
+  // Staggered expiry sent one nearly empty GraphQL document per settlement sweep, and each reader
+  // past the boundary then reread its own branch in a document of its own.
+  it.effect("rereads last tick's background lookups together at the poll-tick boundary", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
@@ -2322,18 +2332,17 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         state: "open" as const,
         updatedAt: "2026-04-06T15:00:00Z",
       });
-      const { manager, providerCalls } = yield* makeManager({
-        providerScenario: {
-          prListSequence: Array.from({ length: 4 }, () => [
-            openPullRequest(401, "feature/tick-early"),
-            openPullRequest(402, "feature/tick-late"),
-          ]),
-        },
-      });
+      const providerScenario: FakeProviderScenario = {
+        prListSequence: Array.from({ length: 4 }, () => [
+          openPullRequest(401, "feature/tick-early"),
+          openPullRequest(402, "feature/tick-late"),
+        ]),
+      };
+      const { manager, providerCalls } = yield* makeManager({ providerScenario });
       const early = { cwd: repoDir, branch: "feature/tick-early" };
       const late = { cwd: repoDir, branch: "feature/tick-late" };
       const tickMs = 570_000;
-      const tickStart = tickMs * 3_000_000;
+      const tickStart = yield* nextBoundaryAfterNow(tickMs);
 
       yield* TestClock.setTime(tickStart);
       yield* manager.branchPullRequest(early, { background: true });
@@ -2350,13 +2359,103 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* manager.branchPullRequest(late, { background: true });
       expect(listed(providerCalls)).toHaveLength(afterLate);
 
-      // MUST-SAY-NO: the later read is only 4.5 minutes old, yet it is not reused past the boundary.
+      // The boundary's refill rereads both, the later one too although it is only 4.5 minutes old.
+      const gate = {
+        started: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      providerScenario.prListGate = gate;
       yield* TestClock.setTime(tickStart + tickMs);
-      yield* manager.branchPullRequest(late, { background: true });
-      const afterBoundaryLate = listed(providerCalls).length;
-      expect(afterBoundaryLate).toBeGreaterThan(afterLate);
-      yield* manager.branchPullRequest(early, { background: true });
-      expect(listed(providerCalls).length).toBeGreaterThan(afterBoundaryLate);
+      yield* Deferred.await(gate.started);
+      // MUST-SAY-NO: a reader during the refill is answered from last tick's read; a read of its own
+      // would wait on the held provider and never return.
+      const duringRefill = yield* manager.branchPullRequest(late, { background: true });
+      expect(duringRefill?.number).toBe(402);
+      yield* Deferred.succeed(gate.release, undefined);
+      delete providerScenario.prListGate;
+
+      // MUST-SAY-NO: readers through the rest of the tick add no reads of their own.
+      yield* TestClock.adjust("5 minutes");
+      expect((yield* manager.branchPullRequest(early, { background: true }))?.number).toBe(401);
+      expect((yield* manager.branchPullRequest(late, { background: true }))?.number).toBe(402);
+      expect(listedSelectors(providerCalls).slice(afterLate).toSorted()).toEqual([
+        "feature/tick-early",
+        "feature/tick-late",
+      ]);
+    }),
+  );
+
+  // A reader that woke on the boundary before the refill moved its key to the new tick, so the
+  // refill skipped it and the tick's next reader read that branch in a document of its own.
+  it.effect("keeps a key read before the boundary's refill in that refill", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/race-first"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/race-first"]);
+      yield* runGit(repoDir, ["checkout", "main"]);
+      const providerScenario: FakeProviderScenario = {
+        prListOtherwise: [
+          {
+            number: 502,
+            title: "feature/race-first",
+            url: "https://github.com/acme/web/pull/502",
+            baseRefName: "main",
+            headRefName: "feature/race-first",
+            state: "open",
+            updatedAt: "2026-04-06T15:00:00Z",
+          },
+        ],
+      };
+      const { manager, providerCalls } = yield* makeManager({ providerScenario });
+      const first = { cwd: repoDir, branch: "feature/race-first" };
+      const tickMs = 570_000;
+      const tickStart = yield* nextBoundaryAfterNow(tickMs);
+      const boundaryMs = tickStart + tickMs;
+      // The reader's clock is on the boundary while the refill's has not reached it yet: the order
+      // in which fibers woken on the same boundary reach the lookup is not fixed.
+      const testClock = yield* Clock.Clock;
+      const onBoundary: Clock.Clock = {
+        currentTimeMillisUnsafe: () => boundaryMs,
+        currentTimeMillis: Effect.succeed(boundaryMs),
+        currentTimeNanosUnsafe: () => BigInt(boundaryMs) * 1_000_000n,
+        currentTimeNanos: Effect.succeed(BigInt(boundaryMs) * 1_000_000n),
+        monotonicTimeNanosUnsafe: () => testClock.monotonicTimeNanosUnsafe(),
+        monotonicTimeNanos: testClock.monotonicTimeNanos,
+        sleep: (duration) => testClock.sleep(duration),
+      };
+
+      yield* TestClock.setTime(tickStart + 60_000);
+      expect((yield* manager.branchPullRequest(first, { background: true }))?.number).toBe(502);
+      const lastTickReads = listed(providerCalls).length;
+      yield* TestClock.setTime(boundaryMs - 1_000);
+      // MUST-SAY-NO: answered from last tick's read, owed to the refill, with no read of its own.
+      const beforeRefill = yield* manager
+        .branchPullRequest(first, { background: true })
+        .pipe(Effect.provideService(Clock.Clock, onBoundary));
+      expect(beforeRefill?.number).toBe(502);
+      expect(listed(providerCalls)).toHaveLength(lastTickReads);
+
+      // MUST-SAY-NO: the refill still rereads the key that reader moved to the new tick. The gate
+      // holds the clock until the refill's git reads finish, so their timeouts do not fire first.
+      const gate = {
+        started: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      };
+      providerScenario.prListGate = gate;
+      yield* TestClock.setTime(boundaryMs);
+      yield* Deferred.await(gate.started);
+      yield* Deferred.succeed(gate.release, undefined);
+      delete providerScenario.prListGate;
+      yield* TestClock.adjust("1 minute");
+      expect(listedSelectors(providerCalls).slice(lastTickReads)).toEqual(["feature/race-first"]);
+      // MUST-SAY-NO: the tick's later reader is served the refill's read, not a read of its own.
+      yield* TestClock.adjust("4 minutes");
+      expect((yield* manager.branchPullRequest(first, { background: true }))?.number).toBe(502);
+      expect(listed(providerCalls)).toHaveLength(lastTickReads + 1);
     }),
   );
 
@@ -2389,7 +2488,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       const idle = { cwd: repoDir, branch: "feature/idle" };
       const tickMs = 570_000;
       const windowMs = tickMs * 6;
-      const windowStart = windowMs * 500_000;
+      const windowStart = yield* nextBoundaryAfterNow(windowMs);
 
       yield* TestClock.setTime(windowStart);
       yield* manager.branchPullRequest(idle, { background: true, idle: true });

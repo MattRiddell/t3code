@@ -117,7 +117,6 @@ describe("ThreadPullRequestServiceV2 reads", () => {
 
   const runDiscovery = (options: {
     readonly threads: ReadonlyArray<OrchestrationV2ThreadShell>;
-    readonly viewedCwd?: string;
     readonly clientConnected: boolean;
     readonly scenario: (harness: {
       readonly service: Effect.Success<typeof ThreadPullRequestService.make>;
@@ -131,7 +130,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     Effect.gen(function* () {
       const activation = yield* Deferred.make<void>();
       const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
-      const scopeChecks = yield* Queue.unbounded<void>();
+      const activityReads = yield* Queue.unbounded<void>();
       const startupSweep = yield* Deferred.make<void>();
       const pollLookup = yield* Queue.unbounded<void>();
       const lookups: Array<LookupRecord> = [];
@@ -153,7 +152,9 @@ describe("ThreadPullRequestServiceV2 reads", () => {
                   }),
                 ),
           getThreadShell: (threadId) =>
-            Effect.succeed(options.threads.find((thread) => thread.id === threadId) ?? null),
+            Queue.offer(activityReads, undefined).pipe(
+              Effect.as(options.threads.find((thread) => thread.id === threadId) ?? null),
+            ),
         }),
         Layer.mock(ProjectStore.ProjectStoreV2)({
           listShells: () => Effect.succeed([project]),
@@ -191,10 +192,6 @@ describe("ThreadPullRequestServiceV2 reads", () => {
             }),
         }),
         Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-          shouldRunScopeWork: (scope) =>
-            Queue.offer(scopeChecks, undefined).pipe(
-              Effect.as(scope.type === "vcs-status" && scope.cwd === options.viewedCwd),
-            ),
           shouldRunOpportunisticWork: Effect.succeed(options.clientConnected),
         }),
         Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
@@ -217,8 +214,8 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           service,
           lookups,
           offer: (event) => Queue.offer(domainEvents, event).pipe(Effect.asVoid),
-          // The policy check is the first thing a thread's activity does.
-          settle: Queue.take(scopeChecks).pipe(Effect.andThen(service.drain)),
+          // Reading the thread's shell is the first thing a thread's activity does.
+          settle: Queue.take(activityReads).pipe(Effect.andThen(service.drain)),
           // A read that skips the policy check, such as a metadata event's.
           lookup: Queue.take(pollLookup).pipe(Effect.andThen(service.drain)),
           reachPoll: TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL).pipe(
@@ -260,18 +257,22 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     },
   );
 
-  it.effect("refreshes a viewed thread's turn at once, outside the poll", () => {
+  it.effect("holds a viewed thread's turn for the poll too, within a tick", () => {
     const thread = branchThread("viewed-thread", "feature/viewed");
     return runDiscovery({
       threads: [thread],
-      viewedCwd: project.workspaceRoot,
       clientConnected: true,
-      scenario: ({ lookups, offer, settle }) =>
+      scenario: ({ lookups, offer, settle, reachPoll }) =>
         Effect.gen(function* () {
+          // MUST-SAY-NO: the finished turn opens no document of its own.
           yield* offer(checkpointCaptured(thread));
           yield* settle;
+          expect(lookups).toEqual([]);
+
+          // The poll on the tick boundary reads it with the scheduled sweep's document.
+          yield* reachPoll;
           expect(lookups).toEqual([
-            { branch: "feature/viewed", refresh: true, background: false, scheduled: false },
+            { branch: "feature/viewed", refresh: true, background: false, scheduled: true },
           ]);
         }),
     });
@@ -357,9 +358,8 @@ describe("ThreadPullRequestServiceV2 reads", () => {
     const thread = branchThread("renamed-thread", "feature/renamed");
     return runDiscovery({
       threads: [thread],
-      viewedCwd: project.workspaceRoot,
       clientConnected: true,
-      scenario: ({ lookups, offer, settle, lookup, service }) =>
+      scenario: ({ lookups, offer, settle, lookup, reachPoll }) =>
         Effect.gen(function* () {
           yield* offer({
             type: "thread.metadata-updated",
@@ -370,10 +370,10 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           yield* lookup;
           yield* offer(checkpointCaptured(thread));
           yield* settle;
-          yield* service.drain;
+          yield* reachPoll;
           expect(lookups).toEqual([
             { branch: "feature/renamed", refresh: false, background: true, scheduled: false },
-            { branch: "feature/renamed", refresh: true, background: false, scheduled: false },
+            { branch: "feature/renamed", refresh: true, background: false, scheduled: true },
           ]);
         }),
     });
@@ -490,6 +490,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const turnEndQueued = yield* Deferred.make<void>();
       const lookupStarted = yield* Deferred.make<void>();
       const followUpQueued = yield* Deferred.make<void>();
+      const followUpLookup = yield* Deferred.make<void>();
       const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
       const dependencies = Layer.mergeAll(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -530,6 +531,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           branchPullRequest: (input, options) =>
             Effect.gen(function* () {
               lookups.push({ branch: input.branch, refresh: options?.refresh ?? false });
+              if (lookups.length === 5) yield* Deferred.succeed(followUpLookup, undefined);
               if (!(yield* Deferred.isDone(turnEndQueued))) {
                 yield* Deferred.succeed(sweepStarted, undefined);
                 yield* Deferred.await(turnEndQueued);
@@ -576,19 +578,29 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const service = yield* ThreadPullRequestService.make;
         yield* service.start();
         yield* Deferred.succeed(activation, undefined);
+        yield* Deferred.await(turnEndQueued);
+        yield* service.drain;
+        // MUST-SAY-NO: the turn-end batch reads nothing yet; it is owed to the tick's poll.
+        expect(lookups).toEqual([
+          { branch: thread.branch, refresh: false },
+          { branch: otherThread.branch, refresh: false },
+        ]);
+
+        // One refresh lookup per thread for its whole turn-end batch, on the tick boundary.
+        yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
         yield* Deferred.await(followUpQueued);
         yield* service.drain;
-      }).pipe(Effect.provide(dependencies));
+        expect(lookups.slice(2)).toEqual([
+          { branch: thread.branch, refresh: true },
+          { branch: otherThread.branch, refresh: true },
+        ]);
 
-      // The startup sweep, one refresh lookup per thread for its turn-end batch, then one
-      // follow-up refresh for the events that arrived during the thread's lookup.
-      expect(lookups).toEqual([
-        { branch: thread.branch, refresh: false },
-        { branch: otherThread.branch, refresh: false },
-        { branch: thread.branch, refresh: true },
-        { branch: otherThread.branch, refresh: true },
-        { branch: thread.branch, refresh: true },
-      ]);
+        // The events that arrived during the thread's lookup get one follow-up, on the next poll.
+        yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
+        yield* Deferred.await(followUpLookup);
+        yield* service.drain;
+        expect(lookups.slice(4)).toEqual([{ branch: thread.branch, refresh: true }]);
+      }).pipe(Effect.provide(dependencies));
     }),
   );
 
@@ -746,13 +758,15 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const activation = yield* Deferred.make<void>();
           const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
           const lookedUp = yield* Queue.unbounded<void>();
-          const scopeChecked = yield* Queue.unbounded<void>();
+          const shellReads = yield* Queue.unbounded<void>();
           const lookups: Array<{ readonly cwd: string; readonly branch: string }> = [];
           const dispatched: Array<OrchestrationV2ServerCommand> = [];
           const dependencies = Layer.mergeAll(
             Layer.mock(Orchestrator.OrchestratorV2)({
               streamDomainEvents: Stream.fromQueue(domainEvents),
-              getThreadShell: () => Effect.sync(() => thread),
+              // Reading the thread's shell is the first thing a thread's activity does.
+              getThreadShell: () =>
+                Queue.offer(shellReads, undefined).pipe(Effect.map(() => thread)),
               getPullRequestSnapshot: () =>
                 Effect.sync(() => ({
                   schemaVersion: 2,
@@ -816,7 +830,6 @@ describe("ThreadPullRequestServiceV2 reads", () => {
               resolve: () => Effect.succeed(null),
             }),
             Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-              shouldRunScopeWork: () => Queue.offer(scopeChecked, undefined).pipe(Effect.as(false)),
               shouldRunOpportunisticWork: Effect.succeed(false),
             }),
             Layer.succeed(ServerActivation.ServerActivation, Deferred.await(activation)),
@@ -841,10 +854,11 @@ describe("ThreadPullRequestServiceV2 reads", () => {
             } as OrchestrationV2DomainEvent;
             const discover = Effect.gen(function* () {
               yield* Queue.offer(domainEvents, turnEnd);
+              yield* Queue.take(shellReads);
               if (thread.branch !== null) {
-                // A headless worktree waits for the next coalesced branch poll.
-                yield* Queue.take(scopeChecked);
+                // A worktree, viewed or not, waits for the next coalesced branch poll.
                 yield* service.drain;
+                expect(yield* Queue.size(lookedUp)).toBe(0);
                 yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
               }
               yield* Queue.take(lookedUp);
@@ -918,6 +932,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
       const sweeps = yield* Queue.unbounded<void>();
       const childLookup = yield* Deferred.make<void>();
+      const shellReads = yield* Queue.unbounded<void>();
       const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
       const dependencies = Layer.mergeAll(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -933,9 +948,11 @@ describe("ThreadPullRequestServiceV2 reads", () => {
                     archivedThreads: [],
                   }),
                 ),
-          // The fork's activity refresh (#29552) places a thread from its shell.
+          // The fork's activity refresh places a thread from its shell.
           getThreadShell: (threadId) =>
-            Effect.succeed([parent, child].find((thread) => thread.id === threadId) ?? null),
+            Queue.offer(shellReads, undefined).pipe(
+              Effect.map(() => [parent, child].find((thread) => thread.id === threadId) ?? null),
+            ),
         }),
         Layer.mock(ProjectStore.ProjectStoreV2)({
           listShells: () => Effect.succeed([project]),
@@ -986,7 +1003,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         yield* service.start();
         yield* Deferred.succeed(activation, undefined);
 
-        // Startup backfill sweep, then the fork's poll (#29552): a branch without a pull request
+        // Startup backfill sweep, then the fork's poll: a branch without a pull request
         // is reread after half an hour, on the first poll past it, not on every poll.
         yield* Queue.take(sweeps);
         yield* service.drain;
@@ -1006,11 +1023,16 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         yield* service.drain;
         const sweepLookups = lookups.map((lookup) => lookup.branch).toSorted();
 
-        // The child's own turn still discovers its pull request.
+        // The child's own turn still discovers its pull request, on the next poll.
         yield* Queue.offer(domainEvents, {
           type: "checkpoint.captured",
           threadId: child.id,
         } as OrchestrationV2DomainEvent);
+        yield* Queue.take(shellReads);
+        yield* service.drain;
+        // MUST-SAY-NO: the turn reads nothing before the tick boundary.
+        expect(lookups).toHaveLength(sweepLookups.length);
+        yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
         yield* Deferred.await(childLookup);
         yield* service.drain;
 
@@ -1496,7 +1518,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         yield* Deferred.succeed(activation, undefined);
         yield* Queue.take(sweeps);
         yield* service.drain;
-        // The fork sweeps on the poll tick (#29552), not every minute.
+        // The fork sweeps on the poll tick, not every minute.
         yield* TestClock.adjust(BACKGROUND_PULL_REQUEST_POLL_INTERVAL);
         yield* Queue.take(sweeps);
         yield* service.drain;

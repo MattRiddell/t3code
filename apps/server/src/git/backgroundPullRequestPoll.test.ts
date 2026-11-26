@@ -1,11 +1,14 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 
 import {
+  backgroundReadTick,
   IDLE_BACKGROUND_READ_TICKS,
   isBackgroundReadFresh,
   isIdleBackgroundReadFresh,
   isIdleThread,
+  untilNextBackgroundTick,
 } from "./backgroundPullRequestPoll.ts";
 
 const TICK_MS = 570_000;
@@ -61,5 +64,27 @@ describe("isIdleThread", () => {
       expect(isIdleThread({ createdAt: created, [field]: recent }, now), field).toBe(false);
     }
     expect(isIdleThread({ createdAt: recent }, now)).toBe(false);
+  });
+});
+
+describe("untilNextBackgroundTick", () => {
+  it("sleeps to the next wall-clock tick boundary, so every reader wakes in one window", () => {
+    expect(Duration.toMillis(untilNextBackgroundTick(WINDOW_START + 1))).toBe(TICK_MS - 1);
+    expect(Duration.toMillis(untilNextBackgroundTick(WINDOW_START + TICK_MS - 30_000))).toBe(
+      30_000,
+    );
+    expect(backgroundReadTick(WINDOW_START + TICK_MS - 1)).toBe(backgroundReadTick(WINDOW_START));
+    expect(backgroundReadTick(WINDOW_START + TICK_MS)).toBe(backgroundReadTick(WINDOW_START) + 1);
+  });
+
+  it("MUST-SAY-NO: on a boundary it waits a whole tick, never zero, so a loop cannot spin", () => {
+    expect(Duration.toMillis(untilNextBackgroundTick(WINDOW_START))).toBe(TICK_MS);
+    expect(Duration.toMillis(untilNextBackgroundTick(0))).toBe(TICK_MS);
+  });
+
+  it("MUST-SAY-NO: a clock before the epoch still lands on a boundary inside one tick", () => {
+    expect(Duration.toMillis(untilNextBackgroundTick(-1))).toBe(1);
+    expect(Duration.toMillis(untilNextBackgroundTick(-TICK_MS))).toBe(TICK_MS);
+    expect(backgroundReadTick(-1)).toBe(-1);
   });
 });

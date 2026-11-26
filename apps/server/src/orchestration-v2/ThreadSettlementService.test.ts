@@ -1,5 +1,6 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { assert, describe, expect, it } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -27,6 +28,7 @@ import {
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -41,6 +43,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 
+import { BACKGROUND_PULL_REQUEST_POLL_INTERVAL } from "../git/backgroundPullRequestPoll.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
@@ -467,6 +470,9 @@ describe("resolveAutoSettlementAt", () => {
 });
 
 const NOW = "2026-08-28T12:00:00.000Z";
+const TICK_MS = BACKGROUND_PULL_REQUEST_POLL_INTERVAL.pipe(Duration.toMillis);
+// The first background tick boundary after NOW, where batch rechecks share the poll's document.
+const TICK_START_MS = Math.ceil(Date.parse(NOW) / TICK_MS) * TICK_MS;
 const PROJECT_ID = ProjectId.make("settlement-project");
 
 describe("autoSettlementSettingsKey", () => {
@@ -823,6 +829,24 @@ const startHarness = Effect.fn("startThreadSettlementHarness")(function* (
   yield* Deferred.succeed(activation, undefined);
   yield* Queue.take(snapshotReads);
   yield* reactor.drain;
+});
+
+// Runs each scheduled sweep through `untilMs`: every minute, and on each background tick boundary.
+const sweepThrough = Effect.fn("sweepThreadSettlementHarness")(function* (
+  reactor: ThreadSettlementService.ThreadSettlementServiceV2["Service"],
+  snapshotReads: Queue.Queue<number>,
+  untilMs: number,
+) {
+  const nextSweepMs = (nowMs: number) =>
+    Math.min(nowMs + 60_000, (Math.floor(nowMs / TICK_MS) + 1) * TICK_MS);
+  let nowMs = yield* Clock.currentTimeMillis;
+  while (nextSweepMs(nowMs) <= untilMs) {
+    const nextMs = nextSweepMs(nowMs);
+    yield* TestClock.adjust(Duration.millis(nextMs - nowMs));
+    yield* Queue.take(snapshotReads);
+    yield* reactor.drain;
+    nowMs = nextMs;
+  }
 });
 
 const projectionStoreSql = ProjectionStore.layer.pipe(
@@ -2094,7 +2118,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
 
   it.effect("reads a quiet open branch pull request every 5 minutes", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(Date.parse(NOW));
+      yield* TestClock.setTime(TICK_START_MS);
       const fixture = yield* makeHarness({
         snapshot: makeSnapshot([
           makeThread("active-branch", {
@@ -2210,7 +2234,7 @@ describe("ThreadSettlementServiceV2 worker", () => {
 
   it.effect("rereads a branch without a pull request less often the longer its thread idles", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(Date.parse(NOW));
+      yield* TestClock.setTime(TICK_START_MS);
       const recent = makeThread("recent-branch", {
         branch: "recent-feature",
         latestUserMessageAt: DateTime.makeUnsafe(Date.parse(NOW) - 30 * 60 * 1_000),
@@ -2227,16 +2251,13 @@ describe("ThreadSettlementServiceV2 worker", () => {
       yield* Effect.gen(function* () {
         const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
         yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
-        for (let minute = 1; minute <= 29; minute += 1) {
-          yield* TestClock.adjust("1 minute");
-          yield* Queue.take(fixture.snapshotReads);
-          yield* reactor.drain;
-        }
+        // The recent branch is due again after thirty minutes and waits for the next tick's batch
+        // sweep, the fourth after this one; the old branch is not due for hours.
+        // MUST-SAY-NO: the minute sweeps between the thirtieth minute and that boundary read nothing.
+        yield* sweepThrough(reactor, fixture.snapshotReads, TICK_START_MS + 4 * TICK_MS - 1);
         assert.deepStrictEqual(yield* branches, ["old-feature", "recent-feature"]);
 
-        yield* TestClock.adjust("1 minute");
-        yield* Queue.take(fixture.snapshotReads);
-        yield* reactor.drain;
+        yield* sweepThrough(reactor, fixture.snapshotReads, TICK_START_MS + 4 * TICK_MS);
         assert.deepStrictEqual(yield* branches, [
           "old-feature",
           "recent-feature",
@@ -2263,10 +2284,10 @@ describe("ThreadSettlementServiceV2 worker", () => {
     }),
   );
 
-  it.effect("a sweep looks up a few branches without a pull request, not every one", () =>
+  it.effect("rechecks branches without a pull request in one batch a tick, not every sweep", () =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(Date.parse(NOW));
-      const threads = Array.from({ length: 10 }, (_, index) =>
+      yield* TestClock.setTime(TICK_START_MS);
+      const threads = Array.from({ length: 30 }, (_, index) =>
         makeThread(`idle-${index}`, {
           branch: `idle-${index}`,
           latestUserMessageAt: DateTime.makeUnsafe(Date.parse(NOW) - (index + 10) * 60 * 1_000),
@@ -2274,23 +2295,23 @@ describe("ThreadSettlementServiceV2 worker", () => {
       );
       const fixture = yield* makeHarness({ snapshot: makeSnapshot(threads) });
       const branches = Ref.get(fixture.branchCalls).pipe(
-        Effect.map((calls) => calls.map((call) => call.branch).sort()),
+        Effect.map((calls) => calls.map((call) => call.branch)),
       );
+      const names = (from: number, to: number) =>
+        threads.slice(from, to).map((thread) => thread.branch);
 
       yield* Effect.gen(function* () {
         const reactor = yield* ThreadSettlementService.ThreadSettlementServiceV2;
         yield* startHarness(reactor, fixture.activation, fixture.snapshotReads);
-        // The most recently active first, then the rest in turn, each once.
-        assert.deepStrictEqual(yield* branches, ["idle-0", "idle-1", "idle-2", "idle-3"]);
-        for (let minute = 1; minute <= 5; minute += 1) {
-          yield* TestClock.adjust("1 minute");
-          yield* Queue.take(fixture.snapshotReads);
-          yield* reactor.drain;
-        }
-        assert.deepStrictEqual(
-          yield* branches,
-          threads.map((thread) => thread.branch),
-        );
+        // The batch reads the 25 most recently active, so they share one scheduled-poll document.
+        assert.deepStrictEqual((yield* branches).toSorted(), names(0, 25).toSorted());
+
+        // MUST-SAY-NO: the minute sweeps before the next boundary read none of the other five.
+        yield* sweepThrough(reactor, fixture.snapshotReads, TICK_START_MS + TICK_MS - 1);
+        assert.deepStrictEqual((yield* branches).length, 25);
+
+        yield* sweepThrough(reactor, fixture.snapshotReads, TICK_START_MS + TICK_MS);
+        assert.deepStrictEqual((yield* branches).slice(25).toSorted(), names(25, 30).toSorted());
       }).pipe(Effect.provide(fixture.layer));
     }),
   );
